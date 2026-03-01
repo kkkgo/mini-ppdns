@@ -1,6 +1,6 @@
 module github.com/kkkgo/mini-ppdns
 
-go 1.25.6
+go 1.25.0
 
 require (
 	github.com/IrineSistiana/go-bytes-pool v0.0.0-20230918115058-c72bd9761c57
