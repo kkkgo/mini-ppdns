@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.uname_m }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        include:
+          - goarch: amd64
+            uname_m: x86_64
+          - goarch: arm64
+            uname_m: aarch64
+          - goarch: arm
+            goarm: "7"
+            uname_m: armv7l
+          - goarch: arm
+            goarm: "6"
+            uname_m: armv6l
+          - goarch: mips
+            gomips: softfloat
+            uname_m: mips
+          - goarch: mipsle
+            gomips: softfloat
+            uname_m: mipsel
+          - goarch: mips64
+            uname_m: mips64
+          - goarch: mips64le
+            uname_m: mips64el
+          - goarch: 386
+            uname_m: i686
+          - goarch: riscv64
+            uname_m: riscv64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+          CGO_ENABLED: "0"
+        run: |
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o release/mini-ppdns_${{ matrix.uname_m }} \
+            .
+
+      - name: Install UPX
+        uses: crazy-max/ghaction-upx@v3
+        with:
+          install-only: true
+
+      - name: Compress with UPX
+        run: |
+          cp release/mini-ppdns_${{ matrix.uname_m }} \
+             release/mini-ppdns_${{ matrix.uname_m }}_upx
+          upx --best --lzma release/mini-ppdns_${{ matrix.uname_m }}_upx || true
+
+      - name: Commit binaries to release/
+        uses: EndBug/add-and-commit@v9
+        with:
+          add: 'release/'
+          message: 'release: ${{ github.ref_name }} ${{ matrix.uname_m }}'
+          default_author: github_actions
+          pull: '--rebase --autostash'
+          push: true

@@ -1,0 +1,28 @@
+name: Update deps.
+
+on:
+  schedule:
+     - cron: '30 01 * * 2'
+  push:
+    paths-ignore:
+      - 'README.md'
+      - '.github/**'
+      - 'LICENSE'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  dep-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build test
+        run: docker build -t dep .
+      - name: update dep
+        run: docker run --name dep -v $(pwd):/src dep
+      - uses: EndBug/add-and-commit@v9
+        with:
+          author_name: Github Actions
+          author_email: actions@github.com
+          committer_email: actions@github.com
+          message: 'Update dependencies'

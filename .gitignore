@@ -1,0 +1,48 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Environment variables
+.env
+
+# mini-ppdns / mosdns build outputs
+mini-ppdns
+mosdns
+
+# Log files (e.g., from test.sh)
+*.log
+server_*.log
+*.txt
+# Temporary configuration files (e.g., from test.sh)
+*.ini
+test_config.ini
+
+# Release and old test directories
+testutils/
+
+# Databases
+*.mmdb
+
+# IDEs
+.vscode/
+.idea/
+
+# Custom build scripts from old project
+buildlocal*.sh
+buildlocal*.yaml
