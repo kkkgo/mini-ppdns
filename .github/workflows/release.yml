@@ -1,5 +1,4 @@
 name: Release
-
 on:
   workflow_dispatch:
   push:
@@ -15,14 +14,14 @@ jobs:
   release:
     name: Build and commit binaries
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
       - name: Build all architectures in Docker
         run: |
           GIT_HASH=$(git rev-parse --short HEAD)
-          BUILD_DATE=$(date -u +%Y%m%d)
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          BUILD_DATE=$(date -u -d "@${SOURCE_DATE_EPOCH}" +%Y%m%d)
           VERSION="kkkgo/mosdns:mini-ppdns ${BUILD_DATE} ${GIT_HASH}"
 
           build_one() {
@@ -30,7 +29,6 @@ jobs:
             local GOARM=$2
             local GOMIPS=$3
             local UNAME_M=$4
-
             echo "=== Building ${UNAME_M} ==="
             docker run --rm \
               -v "$(pwd)":/src \
@@ -40,13 +38,13 @@ jobs:
               -e GOARM="${GOARM}" \
               -e GOMIPS="${GOMIPS}" \
               -e CGO_ENABLED=0 \
+              -e SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \
               golang:alpine \
               go build \
                 -trimpath \
-                -ldflags="-s -w -X 'main.version=${VERSION}'" \
+                -ldflags="-s -w -buildid= -X 'main.version=${VERSION}'" \
                 -o "release/mini-ppdns_${UNAME_M}" \
                 .
-
             cp "release/mini-ppdns_${UNAME_M}" "release/mini-ppdns_${UNAME_M}_upx"
           }
 
