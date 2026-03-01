@@ -10,79 +10,73 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build ${{ matrix.uname_m }}
+  release:
+    name: Build and commit binaries
     runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        include:
-          - goarch: amd64
-            uname_m: x86_64
-          - goarch: arm64
-            uname_m: aarch64
-          - goarch: arm
-            goarm: "7"
-            uname_m: armv7l
-          - goarch: arm
-            goarm: "6"
-            uname_m: armv6l
-          - goarch: mips
-            gomips: softfloat
-            uname_m: mips
-          - goarch: mipsle
-            gomips: softfloat
-            uname_m: mipsel
-          - goarch: mips64
-            uname_m: mips64
-          - goarch: mips64le
-            uname_m: mips64el
-          - goarch: 386
-            uname_m: i686
-          - goarch: riscv64
-            uname_m: riscv64
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Build
-        env:
-          GOOS: linux
-          GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm }}
-          GOMIPS: ${{ matrix.gomips }}
-          CGO_ENABLED: "0"
+      - name: Build all architectures in Docker
         run: |
           GIT_HASH=$(git rev-parse --short HEAD)
           BUILD_DATE=$(date -u +%Y%m%d)
-          go build \
-            -trimpath \
-            -ldflags="-s -w -X 'main.version=kkkgo/mosdns:mini-ppdns ${BUILD_DATE} ${GIT_HASH}'" \
-            -o release/mini-ppdns_${{ matrix.uname_m }} \
-            .
+          VERSION="kkkgo/mosdns:mini-ppdns ${BUILD_DATE} ${GIT_HASH}"
+
+          build_one() {
+            local GOARCH=$1
+            local GOARM=$2
+            local GOMIPS=$3
+            local UNAME_M=$4
+
+            echo "=== Building ${UNAME_M} ==="
+            docker run --rm \
+              -v "$(pwd)":/src \
+              -w /src \
+              -e GOOS=linux \
+              -e GOARCH="${GOARCH}" \
+              -e GOARM="${GOARM}" \
+              -e GOMIPS="${GOMIPS}" \
+              -e CGO_ENABLED=0 \
+              golang:alpine \
+              go build \
+                -trimpath \
+                -ldflags="-s -w -X 'main.version=${VERSION}'" \
+                -o "release/mini-ppdns_${UNAME_M}" \
+                .
+
+            cp "release/mini-ppdns_${UNAME_M}" "release/mini-ppdns_${UNAME_M}_upx"
+          }
+
+          build_one amd64    ""  ""          x86_64
+          build_one arm64    ""  ""          aarch64
+          build_one arm      7   ""          armv7l
+          build_one arm      6   ""          armv6l
+          build_one mips     ""  softfloat   mips
+          build_one mipsle   ""  softfloat   mipsel
+          build_one mips64   ""  ""          mips64
+          build_one mips64le ""  ""          mips64el
+          build_one 386      ""  ""          i686
+          build_one riscv64  ""  ""          riscv64
 
       - name: Install UPX
         uses: crazy-max/ghaction-upx@v3
         with:
           install-only: true
 
-      - name: Compress with UPX
+      - name: Compress all _upx binaries
         run: |
-          cp release/mini-ppdns_${{ matrix.uname_m }} \
-             release/mini-ppdns_${{ matrix.uname_m }}_upx
-          upx --best --lzma release/mini-ppdns_${{ matrix.uname_m }}_upx || true
+          for f in release/*_upx; do
+            echo "Compressing $f ..."
+            upx --best --lzma "$f" || true
+          done
 
       - name: Commit binaries to release/
         uses: EndBug/add-and-commit@v9
         with:
           add: 'release/'
-          message: 'release: ${{ github.ref_name }} ${{ matrix.uname_m }}'
-          default_author: github_actions
-          pull: '--rebase --autostash'
+          message: 'release: ${{ github.ref_name }}'
+          author_name: Github Actions
+          author_email: actions@github.com
+          committer_email: actions@github.com
           push: true
