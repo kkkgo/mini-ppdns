@@ -60,6 +60,8 @@ jobs:
           build_one 386      ""  ""          i686
           build_one riscv64  ""  ""          riscv64
 
+          echo "LAST_GO_COMMIT=${LAST_GO_COMMIT}" >> "$GITHUB_ENV"
+
       - name: Install UPX
         uses: crazy-max/ghaction-upx@v3
         with:
@@ -76,7 +78,7 @@ jobs:
         uses: EndBug/add-and-commit@v9
         with:
           add: 'release/'
-          message: 'release: ${{ github.ref_name }}'
+          message: 'release: ${{ env.LAST_GO_COMMIT }}'
           author_name: Github Actions
           author_email: actions@github.com
           committer_email: actions@github.com

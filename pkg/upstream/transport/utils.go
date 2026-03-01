@@ -26,9 +26,14 @@ import (
 	"github.com/kkkgo/mini-ppdns/mlog"
 	"github.com/kkkgo/mini-ppdns/pkg/pool"
 	"github.com/miekg/dns"
-
-	"golang.org/x/exp/constraints"
 )
+
+// Numeric constraint for integer and float types.
+type Numeric interface {
+	~int | ~int8 | ~int16 | ~int32 | ~int64 |
+		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr |
+		~float32 | ~float64
+}
 
 const (
 	dnsHeaderLen = 12 // minimum dns msg size
@@ -55,24 +60,21 @@ func copyMsg(m []byte) *[]byte {
 // It uses a 4kb rx buffer and ignores any payload that is too small for a dns msg.
 // If no error, the length of payload always >= 12 bytes.
 func readMsgUdp(r io.Reader) (*[]byte, error) {
-	// TODO: Make this configurable?
-	// 4kb should be enough.
-	payload := pool.GetBuf(4095)
-
-readAgain:
-	n, err := r.Read(*payload)
-	if err != nil {
-		pool.ReleaseBuf(payload)
-		return nil, err
+	payload := pool.GetBuf(4096)
+	for {
+		n, err := r.Read(*payload)
+		if err != nil {
+			pool.ReleaseBuf(payload)
+			return nil, err
+		}
+		if n >= dnsHeaderLen {
+			*payload = (*payload)[:n]
+			return payload, nil
+		}
 	}
-	if n < dnsHeaderLen {
-		goto readAgain
-	}
-	*payload = (*payload)[:n]
-	return payload, err
 }
 
-func setDefaultGZ[T constraints.Float | constraints.Integer](i *T, s, d T) {
+func setDefaultGZ[T Numeric](i *T, s, d T) {
 	if s > 0 {
 		*i = s
 	} else {
