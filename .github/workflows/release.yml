@@ -3,8 +3,10 @@ name: Release
 on:
   workflow_dispatch:
   push:
-    tags:
-      - 'v*'
+    paths-ignore:
+      - 'README.md'
+      - '.github/**'
+      - 'LICENSE'
 
 permissions:
   contents: write
