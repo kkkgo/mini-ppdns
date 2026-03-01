@@ -3,7 +3,6 @@ module github.com/kkkgo/mini-ppdns
 go 1.25.0
 
 require (
-	github.com/IrineSistiana/go-bytes-pool v0.0.0-20230918115058-c72bd9761c57
 	github.com/miekg/dns v1.1.72
 	golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa
 	golang.org/x/net v0.51.0

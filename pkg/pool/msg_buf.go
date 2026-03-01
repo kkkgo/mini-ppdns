@@ -1,39 +1,20 @@
-/*
- * Copyright (C) 2020-2022, IrineSistiana
- *
- * This file is part of mosdns.
- *
- * mosdns is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * mosdns is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
-
 package pool
 
 import (
 	"encoding/binary"
-	"fmt"
+	"errors"
 
 	"github.com/miekg/dns"
 )
 
-// No way to give dns.Msg.PackBuffer() a buffer
-// with a proper size.
-// Just give it a big buf and hope the buf is reused in most scenes.
-const packBufferSize = 8191
+// DNS messages rarely exceed 4KB (UDP) or 64KB (TCP).
+// Use 64KB as default pack buffer to cover dns.MaxMsgSize.
+const packBufferSize = 1 << 16 // 65536
+
+var errPayloadTooLarge = errors.New("dns payload too large")
 
 // Pack the dns msg m to wire format.
-// Callers should release the buf by calling ReleaseBuf after they have done
-// with the wire []byte.
+// Callers should release the buf by calling ReleaseBuf after done.
 func PackBuffer(m *dns.Msg) (*[]byte, error) {
 	packBuf := GetBuf(packBufferSize)
 	wire, err := m.PackBuffer(*packBuf)
@@ -41,15 +22,18 @@ func PackBuffer(m *dns.Msg) (*[]byte, error) {
 		ReleaseBuf(packBuf)
 		return nil, err
 	}
-
-	// Zero-copy shortcut: the underlying capacity in pool still tracks 8191
-	// but the slice length is resized to the exact wire size!
+	// If dns lib re-allocated (message > buffer), release pool buf.
+	if cap(wire) != cap(*packBuf) {
+		ReleaseBuf(packBuf)
+		b := wire
+		return &b, nil
+	}
 	*packBuf = wire
 	return packBuf, nil
 }
 
-// Pack the dns msg m to wire format, with to bytes length header.
-// Callers should release the buf by calling ReleaseBuf.
+// Pack the dns msg m to wire format with 2-byte TCP length header.
+// Callers should release the buf by calling ReleaseBuf after done.
 func PackTCPBuffer(m *dns.Msg) (*[]byte, error) {
 	packBuf := GetBuf(packBufferSize)
 	wire, err := m.PackBuffer((*packBuf)[2:])
@@ -61,10 +45,18 @@ func PackTCPBuffer(m *dns.Msg) (*[]byte, error) {
 	l := len(wire)
 	if l > dns.MaxMsgSize {
 		ReleaseBuf(packBuf)
-		return nil, fmt.Errorf("dns payload size %d is too large", l)
+		return nil, errPayloadTooLarge
 	}
 
-	// Truncate to the exact size of headers + wire
+	// If dns lib re-allocated, release pool buf and build new one.
+	if cap(wire) != cap((*packBuf)[2:]) {
+		ReleaseBuf(packBuf)
+		b := make([]byte, 2+l)
+		binary.BigEndian.PutUint16(b, uint16(l))
+		copy(b[2:], wire)
+		return &b, nil
+	}
+
 	*packBuf = (*packBuf)[:2+l]
 	binary.BigEndian.PutUint16(*packBuf, uint16(l))
 	return packBuf, nil
