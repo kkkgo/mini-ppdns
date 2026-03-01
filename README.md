@@ -71,7 +71,7 @@ exit 0
 ```
 或者写一个守护脚本加计划任务或者修改服务，此处提供了一个参考脚本：
 https://github.com/kkkgo/mini-ppdns/blob/main/mini-ppdns.sh  
-使用方法，把脚本上传到`/usr/sbin`加执行权限，`crontab -e`编辑计划任务：`* * * * * /usr/sbin/mini-ppdns.sh`即可。脚本启动之前检测是否已经存在mini-ppdns进程，如果存在就直接退出，因此可以直接让计划任务每分钟执行来作为守护。执行`mini-ppdns.sh restart`可以重载配置。
+使用方法，把脚本上传到`/usr/sbin`重命名为`/usr/sbin/mini-ppdns`加执行权限，`crontab -e`编辑计划任务：`* * * * * /usr/sbin/mini-ppdns.sh`即可。脚本启动之前检测是否已经存在mini-ppdns进程，如果存在就直接退出，因此可以直接让计划任务每分钟执行来作为守护。执行`mini-ppdns.sh restart`可以重载配置。
 - 普通linux到这里已经弄完了，但一些linux安装过程中会自带DNS服务器导致占用监听端口，比如Ubuntu，可以禁用自带的DNS解析器：
 ```
 sudo systemctl stop systemd-resolved
