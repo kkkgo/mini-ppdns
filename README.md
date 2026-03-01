@@ -19,8 +19,9 @@ mini-ppdns -dns 10.10.10.8:53,10.10.10.9:53 -fall 223.5.5.5:53,119.29.29.29:53
 - `mini-ppdns -dns 10.10.10.8 -fall 223.5.5.5 -listen 127.0.0.1:53`  
 - `-aaaa`可以指定是否开启IPv6的aaaa记录（默认为no，屏蔽aaaa）：  
 `mini-ppdns -dns 10.10.10.8 -fall 223.5.5.5 -aaaa=yes`  
-- `-force_fall`可以指定某些IP段总是走运营商/故障转移的DNS：  
+- `-force_fall`可以指定某些IP段总是走运营商/故障转移的DNS。：  
 `mini-ppdns -dns 10.10.10.8 -fall 223.5.5.5 -force_fall=192.168.1.10,192.168.2.0/24`  
+*注：FakeIP场景可以利用这个功能，间接实现某些设备不走代理*
 - `-qtime`可以指定故障转移的延迟阈值（默认为250ms，一般不需要调整）:  
 `mini-ppdns -dns 10.10.10.8 -fall 223.5.5.5 -qtime=250`  
 - `-debug`输出详细的调试日志。  
