@@ -24,7 +24,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-var version = "kkkgo/mosdns:mini-ppdns native-20260226"
+var version = "kkkgo/mosdns:mini-ppdns dev"
 
 type ConfigArgs struct {
 	DNS       []string

@@ -59,9 +59,11 @@ jobs:
           GOMIPS: ${{ matrix.gomips }}
           CGO_ENABLED: "0"
         run: |
+          GIT_HASH=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +%Y%m%d)
           go build \
             -trimpath \
-            -ldflags="-s -w" \
+            -ldflags="-s -w -X 'main.version=kkkgo/mosdns:mini-ppdns ${BUILD_DATE} ${GIT_HASH}'" \
             -o release/mini-ppdns_${{ matrix.uname_m }} \
             .
 
