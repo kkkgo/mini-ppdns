@@ -82,10 +82,9 @@ jobs:
           git config user.name "Github Actions"
           git config user.email "actions@github.com"
           TMP=$(mktemp -d)
-          cp release/* "$TMP/"
+          cp release/mini-ppdns_* "$TMP/"
 
           git fetch origin release 2>/dev/null && git checkout release || git checkout --orphan release
-          # 保留 release 分支已有的 README.md
           cp README.md "$TMP/" 2>/dev/null || true
           git rm -rf . 2>/dev/null || true
           cp "$TMP"/* .
