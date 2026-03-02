@@ -81,13 +81,16 @@ jobs:
         run: |
           git config user.name "Github Actions"
           git config user.email "actions@github.com"
-          TMP=$(mktemp -d)
-          cp release/mini-ppdns_* "$TMP/"
 
-          git fetch origin release 2>/dev/null && git checkout release || git checkout --orphan release
-          cp README.md "$TMP/" 2>/dev/null || true
-          git rm -rf . 2>/dev/null || true
-          cp "$TMP"/* .
+          git clone --branch release --single-branch "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/kkkgo/mini-ppdns.git" release_branch || \
+          git clone --single-branch "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/kkkgo/mini-ppdns.git" release_branch && \
+          cd release_branch && git checkout --orphan release && git rm -rf . && cd ..
+
+          cp release/mini-ppdns_* release_branch/
+
+          cd release_branch
+          git config user.name "Github Actions"
+          git config user.email "actions@github.com"
           git add .
           git commit -m "release: ${LAST_GO_COMMIT}" || echo "Nothing to commit"
           git push origin release --force
