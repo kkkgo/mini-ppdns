@@ -1,4 +1,5 @@
 # https://blog.03k.org/post/mini-ppdns.html
+###  [release下载](https://github.com/kkkgo/mini-ppdns/tree/release)
 # mini-ppdns 
 专注于 DNS 故障转移的迷你DNS转发器。
 `mini-ppdns` 是从`PaoPaoDNS`项目精简修改而来的纯粹转发器，致力于提供极致轻量化且高效的平滑 DNS 故障转移体验。
@@ -61,7 +62,7 @@ aaaa=no
 ---
 # 在openwrt路由器上部署
 在openwrt上部署说起来简单也复杂，因为很多openwrt里面有各种神神秘秘的插件互相干扰。其中不少会劫持DNS，此处部署过程仅包含一些常见的坑和注意事项。当然部分过程也适用于其他linux系统。  
-- 去[release](https://github.com/kkkgo/mini-ppdns/tree/main/release)下载适合你的硬件架构的二进制文件。如果不清楚自己的硬件是什么架构，可以在终端输入`uname -m`。其中release名字带UPX的是为了给一些储存空间紧张的设备用的，如果你的设备空间充足下正常版本即可。
+- 去[release](https://github.com/kkkgo/mini-ppdns/tree/release)下载适合你的硬件架构的二进制文件。如果不清楚自己的硬件是什么架构，可以在终端输入`uname -m`。其中release名字带UPX的是为了给一些储存空间紧张的设备用的，如果你的设备空间充足下正常版本即可。
 - 把`mini-ppdns`上传到你的设备，为了方便你可以上传到`/usr/sbin/mini-ppdns`,加执行权限`chmod +x /usr/sbin/mini-ppdns`。将你的配置文件储存在`/etc/mini-ppdns.ini`，然后执行`mini-ppdns -config /etc/mini-ppdns.ini`看看是否输出正常（比如提示某个端口已经被监听）。
 - 添加自启动脚本。在openwrt上最简单的是编辑 `/etc/rc.local`，在 `exit 0` 之前添加你的启动命令，带上 `-d` 参数，程序会自动到后台，不会阻塞启动。当你修改了局域网的IP段或者配置，你需要重新启动`mini-ppdns`。
 
