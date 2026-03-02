@@ -21,6 +21,7 @@ jobs:
 
       - name: Build all architectures in Docker
         run: |
+          mkdir -p release
           LAST_GO_COMMIT=$(git log -1 --format=%H -- '*.go' go.mod go.sum)
           GIT_HASH=$(git rev-parse --short "${LAST_GO_COMMIT}")
           SOURCE_DATE_EPOCH=$(git log -1 --format=%ct "${LAST_GO_COMMIT}")
