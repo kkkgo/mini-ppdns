@@ -82,9 +82,15 @@ jobs:
           git config user.name "Github Actions"
           git config user.email "actions@github.com"
 
-          git clone --branch release --single-branch "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/kkkgo/mini-ppdns.git" release_branch || \
-          git clone --single-branch "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/kkkgo/mini-ppdns.git" release_branch && \
-          cd release_branch && git checkout --orphan release && git rm -rf . && cd ..
+          if git clone --branch release --single-branch "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/kkkgo/mini-ppdns.git" release_branch; then
+            echo "Cloned existing release branch"
+          else
+            git clone --single-branch "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/kkkgo/mini-ppdns.git" release_branch
+            cd release_branch
+            git checkout --orphan release
+            git rm -rf .
+            cd ..
+          fi
 
           cp release/mini-ppdns_* release_branch/
 
