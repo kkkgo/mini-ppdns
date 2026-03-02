@@ -16,6 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Build all architectures in Docker
         run: |
@@ -74,12 +76,12 @@ jobs:
             upx --best --lzma "$f" || true
           done
 
-      - name: Commit binaries to release/
-        uses: EndBug/add-and-commit@v9
-        with:
-          add: 'release/'
-          message: 'release: ${{ env.LAST_GO_COMMIT }}'
-          author_name: Github Actions
-          author_email: actions@github.com
-          committer_email: actions@github.com
-          push: true
+      - name: Push binaries to release branch
+        run: |
+          git config user.name "Github Actions"
+          git config user.email "actions@github.com"
+          git fetch origin release 2>/dev/null && git checkout release || git checkout --orphan release
+          git checkout HEAD -- release/
+          git add release/
+          git commit -m "release: ${LAST_GO_COMMIT}" || echo "Nothing to commit"
+          git push origin release --force
