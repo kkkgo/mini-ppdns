@@ -92,9 +92,11 @@ jobs:
             cd ..
           fi
 
-          cp release/mini-ppdns_* release_branch/
-
           cd release_branch
+          cp README.md /tmp/README.md 2>/dev/null || true
+          git rm -rf .
+          cp /tmp/README.md . 2>/dev/null || true
+          cp ../release/mini-ppdns_* .
           git config user.name "Github Actions"
           git config user.email "actions@github.com"
           git add .
