@@ -35,6 +35,7 @@ test_config.ini
 
 # Release and old test directories
 testutils/
+release/
 
 # Databases
 *.mmdb
