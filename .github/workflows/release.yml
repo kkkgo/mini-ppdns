@@ -80,9 +80,12 @@ jobs:
         run: |
           git config user.name "Github Actions"
           git config user.email "actions@github.com"
-          CURRENT_SHA=$(git rev-parse HEAD)
+          TMP=$(mktemp -d)
+          cp release/* "$TMP/"
+
           git fetch origin release 2>/dev/null && git checkout release || git checkout --orphan release
-          git checkout "${CURRENT_SHA}" -- release/
-          git add release/
+          git rm -rf . 2>/dev/null || true
+          cp "$TMP"/* .
+          git add .
           git commit -m "release: ${LAST_GO_COMMIT}" || echo "Nothing to commit"
           git push origin release --force
