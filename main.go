@@ -118,7 +118,135 @@ func (k CacheKey) Sum() uint64 {
 	return hash
 }
 
-// Implement server.Handler.
+// forceFallMatcher implements the force_fall matching logic.
+// Include rules (without ^) use OR logic: any match triggers force_fall.
+// Negate rules (with ^) use AND logic: all negate conditions must be satisfied
+// (i.e. client IP must NOT be in ANY negated prefix) for force_fall to trigger.
+type forceFallMatcher struct {
+	includePrefixes []netip.Prefix // OR logic: any match → force_fall
+	negatePrefixes  []netip.Prefix // AND logic: must NOT match any → force_fall
+}
+
+func (m *forceFallMatcher) Match(addr netip.Addr) bool {
+	if len(m.includePrefixes) == 0 && len(m.negatePrefixes) == 0 {
+		return false
+	}
+	// Check include rules (OR): any match → true
+	for _, p := range m.includePrefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	// Check negate rules (AND): ALL negate prefixes must NOT contain addr
+	if len(m.negatePrefixes) > 0 {
+		for _, p := range m.negatePrefixes {
+			if p.Contains(addr) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// ipToUint32 converts a 4-byte IPv4 address to uint32.
+func ipToUint32(addr netip.Addr) uint32 {
+	b := addr.As4()
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+// uint32ToIP converts a uint32 to a netip.Addr (IPv4).
+func uint32ToIP(n uint32) netip.Addr {
+	return netip.AddrFrom4([4]byte{
+		byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n),
+	})
+}
+
+// rangeToPrefix converts an IP range [start, end] to the minimal set of CIDR prefixes.
+func rangeToPrefix(start, end netip.Addr) []netip.Prefix {
+	if !start.Is4() || !end.Is4() {
+		return nil
+	}
+	s := ipToUint32(start)
+	e := ipToUint32(end)
+	if s > e {
+		return nil
+	}
+	var result []netip.Prefix
+	for s <= e {
+		// Find the largest block (smallest prefix bits) starting at s that fits within [s, e]
+		maxBits := 32
+		for maxBits > 0 {
+			// Check alignment: s must be aligned to 2^(32-maxBits+1)
+			mask := uint32(1) << (32 - maxBits + 1)
+			if s%mask != 0 {
+				break
+			}
+			// Check that the block end doesn't exceed e
+			blockEnd := s + (1 << (32 - maxBits + 1)) - 1
+			if blockEnd > e {
+				break
+			}
+			maxBits--
+		}
+		result = append(result, netip.PrefixFrom(uint32ToIP(s), maxBits))
+		blockSize := uint32(1) << (32 - maxBits)
+		if s+blockSize-1 == 0xFFFFFFFF {
+			break // Prevent overflow for 255.255.255.255
+		}
+		s += blockSize
+	}
+	return result
+}
+
+// parseForceFallEntry parses a single force_fall entry string.
+// Returns the parsed prefixes, whether it's negated, and any error.
+// Supports: single IP, CIDR, IP range (start-end), with optional ^ prefix.
+func parseForceFallEntry(s string) (prefixes []netip.Prefix, negated bool, err error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, false, nil
+	}
+	if strings.HasPrefix(s, "^") {
+		negated = true
+		s = s[1:]
+	}
+	if strings.Contains(s, "-") {
+		// IP range: start-end
+		parts := strings.SplitN(s, "-", 2)
+		start, err := netip.ParseAddr(strings.TrimSpace(parts[0]))
+		if err != nil {
+			return nil, negated, fmt.Errorf("invalid range start IP %s: %w", parts[0], err)
+		}
+		end, err := netip.ParseAddr(strings.TrimSpace(parts[1]))
+		if err != nil {
+			return nil, negated, fmt.Errorf("invalid range end IP %s: %w", parts[1], err)
+		}
+		prefixes = rangeToPrefix(start, end)
+		if len(prefixes) == 0 {
+			return nil, negated, fmt.Errorf("invalid IP range %s-%s", parts[0], parts[1])
+		}
+		return prefixes, negated, nil
+	}
+	if strings.Contains(s, "/") {
+		// CIDR
+		prefix, err := netip.ParsePrefix(s)
+		if err != nil {
+			return nil, negated, fmt.Errorf("invalid CIDR %s: %w", s, err)
+		}
+		return []netip.Prefix{prefix}, negated, nil
+	}
+	// Single IP
+	addr, err := netip.ParseAddr(s)
+	if err != nil {
+		return nil, negated, fmt.Errorf("invalid IP %s: %w", s, err)
+	}
+	bits := 32
+	if addr.Is6() {
+		bits = 128
+	}
+	return []netip.Prefix{netip.PrefixFrom(addr, bits)}, negated, nil
+}
 
 type miniHandler struct {
 	logger *mlog.Logger
@@ -127,8 +255,8 @@ type miniHandler struct {
 	cnForward    *miniForwarder
 	dnsCache     *cache.Cache[CacheKey, *dns.Msg]
 
-	forceFallPrefixes []netip.Prefix
-	allowAAAA         bool
+	forceFallMatcher *forceFallMatcher
+	allowAAAA        bool
 }
 
 type miniForwarder struct {
@@ -297,13 +425,8 @@ func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) 
 
 	// Determine route for logging
 	forceFall := false
-	if len(h.forceFallPrefixes) > 0 {
-		for _, prefix := range h.forceFallPrefixes {
-			if prefix.Contains(qCtx.ServerMeta.ClientAddr) {
-				forceFall = true
-				break
-			}
-		}
+	if h.forceFallMatcher != nil {
+		forceFall = h.forceFallMatcher.Match(qCtx.ServerMeta.ClientAddr)
 	}
 
 	ffStr := ""
@@ -596,41 +719,31 @@ func main() {
 
 	cachePlug := cache.New[CacheKey, *dns.Msg](cache.Opts{Size: 102400})
 
-	// Parse force fall prefixes
-	var forceFallPrefixes []netip.Prefix
+	// Parse force fall rules
+	ffMatcher := &forceFallMatcher{}
 	for _, s := range args.ForceFall {
-		s = strings.TrimSpace(s)
-		if s == "" {
+		prefixes, negated, err := parseForceFallEntry(s)
+		if err != nil {
+			fmt.Printf("Invalid force_fall entry %s: %v\n", s, err)
+			os.Exit(1)
+		}
+		if len(prefixes) == 0 {
 			continue
 		}
-		if !strings.ContainsRune(s, '/') {
-			addr, err := netip.ParseAddr(s)
-			if err != nil {
-				fmt.Printf("Invalid force_fall IP %s: %v\n", s, err)
-				os.Exit(1)
-			}
-			bits := 32
-			if addr.Is6() {
-				bits = 128
-			}
-			forceFallPrefixes = append(forceFallPrefixes, netip.PrefixFrom(addr, bits))
+		if negated {
+			ffMatcher.negatePrefixes = append(ffMatcher.negatePrefixes, prefixes...)
 		} else {
-			prefix, err := netip.ParsePrefix(s)
-			if err != nil {
-				fmt.Printf("Invalid force_fall CIDR %s: %v\n", s, err)
-				os.Exit(1)
-			}
-			forceFallPrefixes = append(forceFallPrefixes, prefix)
+			ffMatcher.includePrefixes = append(ffMatcher.includePrefixes, prefixes...)
 		}
 	}
 
 	handler := &miniHandler{
-		logger:            logger,
-		localForward:      localFwd,
-		cnForward:         cnFwd,
-		dnsCache:          cachePlug,
-		forceFallPrefixes: forceFallPrefixes,
-		allowAAAA:         args.AAAA == "yes",
+		logger:           logger,
+		localForward:     localFwd,
+		cnForward:        cnFwd,
+		dnsCache:         cachePlug,
+		forceFallMatcher: ffMatcher,
+		allowAAAA:        args.AAAA == "yes",
 	}
 
 	// Start servers manually
