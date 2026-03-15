@@ -418,17 +418,22 @@ func shuffleAnswers(qtype uint16, answers []dns.RR) {
 	if len(answers) <= 1 {
 		return
 	}
-	rand.Shuffle(len(answers), func(i, j int) {
-		answers[i], answers[j] = answers[j], answers[i]
-	})
-
-	insertIdx := 0
-	for i := 0; i < len(answers); i++ {
-		if answers[i].Header().Rrtype == qtype {
-			answers[i], answers[insertIdx] = answers[insertIdx], answers[i]
-			insertIdx++
+	// Separate CNAME and non-CNAME records (RFC 1034: CNAME must precede resolved records)
+	var cnameRecords, otherRecords []dns.RR
+	for _, rr := range answers {
+		if rr.Header().Rrtype == dns.TypeCNAME {
+			cnameRecords = append(cnameRecords, rr)
+		} else {
+			otherRecords = append(otherRecords, rr)
 		}
 	}
+	// Only shuffle non-CNAME records
+	rand.Shuffle(len(otherRecords), func(i, j int) {
+		otherRecords[i], otherRecords[j] = otherRecords[j], otherRecords[i]
+	})
+	// Reassemble: CNAME first, then others
+	copy(answers, cnameRecords)
+	copy(answers[len(cnameRecords):], otherRecords)
 }
 
 // pplogReport sends a query log entry if pplog is enabled.

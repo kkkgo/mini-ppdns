@@ -628,6 +628,93 @@ func TestLocalFailFallNodata(t *testing.T) {
 	}
 }
 
+func TestShuffleAnswers(t *testing.T) {
+	t.Run("CNAME before A records", func(t *testing.T) {
+		// Simulate connect.rom.miui.com response: 1 CNAME + 3 A records
+		cname, _ := dns.NewRR("connect.rom.miui.com. 398 IN CNAME extranet.alb.xiaomi.com.")
+		a1, _ := dns.NewRR("extranet.alb.xiaomi.com. 21 IN A 118.26.253.153")
+		a2, _ := dns.NewRR("extranet.alb.xiaomi.com. 21 IN A 220.181.106.14")
+		a3, _ := dns.NewRR("extranet.alb.xiaomi.com. 21 IN A 220.181.52.24")
+
+		for i := 0; i < 50; i++ {
+			answers := []dns.RR{cname, a1, a2, a3}
+			shuffleAnswers(dns.TypeA, answers)
+
+			if answers[0].Header().Rrtype != dns.TypeCNAME {
+				t.Fatalf("iteration %d: first record should be CNAME, got %s", i, dns.TypeToString[answers[0].Header().Rrtype])
+			}
+			for j := 1; j < len(answers); j++ {
+				if answers[j].Header().Rrtype != dns.TypeA {
+					t.Fatalf("iteration %d: record[%d] should be A, got %s", i, j, dns.TypeToString[answers[j].Header().Rrtype])
+				}
+			}
+		}
+	})
+
+	t.Run("multiple CNAME chain before A", func(t *testing.T) {
+		cname1, _ := dns.NewRR("example.com. 300 IN CNAME alias1.example.com.")
+		cname2, _ := dns.NewRR("alias1.example.com. 300 IN CNAME alias2.example.com.")
+		a1, _ := dns.NewRR("alias2.example.com. 60 IN A 1.2.3.4")
+
+		for i := 0; i < 50; i++ {
+			answers := []dns.RR{a1, cname2, cname1}
+			shuffleAnswers(dns.TypeA, answers)
+
+			for j := 0; j < 2; j++ {
+				if answers[j].Header().Rrtype != dns.TypeCNAME {
+					t.Fatalf("iteration %d: record[%d] should be CNAME, got %s", i, j, dns.TypeToString[answers[j].Header().Rrtype])
+				}
+			}
+			if answers[2].Header().Rrtype != dns.TypeA {
+				t.Fatalf("iteration %d: last record should be A, got %s", i, dns.TypeToString[answers[2].Header().Rrtype])
+			}
+		}
+	})
+
+	t.Run("A only records are shuffled", func(t *testing.T) {
+		a1, _ := dns.NewRR("example.com. 60 IN A 1.1.1.1")
+		a2, _ := dns.NewRR("example.com. 60 IN A 2.2.2.2")
+		a3, _ := dns.NewRR("example.com. 60 IN A 3.3.3.3")
+
+		sawDifferentOrder := false
+		firstOrder := ""
+		for i := 0; i < 50; i++ {
+			answers := []dns.RR{
+				dns.Copy(a1), dns.Copy(a2), dns.Copy(a3),
+			}
+			shuffleAnswers(dns.TypeA, answers)
+
+			order := answers[0].(*dns.A).A.String() + answers[1].(*dns.A).A.String() + answers[2].(*dns.A).A.String()
+			if i == 0 {
+				firstOrder = order
+			} else if order != firstOrder {
+				sawDifferentOrder = true
+			}
+		}
+		if !sawDifferentOrder {
+			t.Fatal("A-only records should be shuffled for load balancing")
+		}
+	})
+
+	t.Run("single record unchanged", func(t *testing.T) {
+		a1, _ := dns.NewRR("example.com. 60 IN A 1.1.1.1")
+		answers := []dns.RR{a1}
+		shuffleAnswers(dns.TypeA, answers)
+		if answers[0].(*dns.A).A.String() != "1.1.1.1" {
+			t.Fatal("single record should be unchanged")
+		}
+	})
+
+	t.Run("CNAME only", func(t *testing.T) {
+		cname, _ := dns.NewRR("example.com. 300 IN CNAME other.example.com.")
+		answers := []dns.RR{cname}
+		shuffleAnswers(dns.TypeA, answers)
+		if answers[0].Header().Rrtype != dns.TypeCNAME {
+			t.Fatal("single CNAME should be unchanged")
+		}
+	})
+}
+
 func TestCalculateCacheSize(t *testing.T) {
 	tests := []struct {
 		name     string
