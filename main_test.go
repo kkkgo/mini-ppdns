@@ -546,6 +546,88 @@ func TestNodataLocalFallTimeout(t *testing.T) {
 	}
 }
 
+// TestLocalFailFallNodata: local fails (SERVFAIL), fall returns NODATA.
+// Expected: use fall NODATA result with TTL=1 override.
+func TestLocalFailFallNodata(t *testing.T) {
+	// Local server returns SERVFAIL
+	localAddr, localSrv, _ := mockServer(func(w dns.ResponseWriter, r *dns.Msg) {
+		resp := new(dns.Msg)
+		resp.SetReply(r)
+		resp.Rcode = dns.RcodeServerFailure
+		w.WriteMsg(resp)
+	})
+	defer localSrv.Shutdown()
+
+	// Fallback server returns NODATA with SOA
+	fallAddr, fallSrv, _ := mockServer(func(w dns.ResponseWriter, r *dns.Msg) {
+		resp := new(dns.Msg)
+		resp.SetReply(r)
+		resp.Rcode = dns.RcodeSuccess
+		soa, _ := dns.NewRR("example.com. 300 IN SOA ns2.example.com. admin2.example.com. 2024010101 3600 900 604800 86400")
+		resp.Ns = append(resp.Ns, soa)
+		w.WriteMsg(resp)
+	})
+	defer fallSrv.Shutdown()
+
+	logger, _ := mlog.NewLogger(mlog.LogConfig{Level: "error"})
+
+	uLocal, _ := upstream.NewUpstream("udp://"+localAddr, upstream.Opt{Logger: logger})
+	localFwd := &miniForwarder{
+		upstreams: []upstream.Upstream{uLocal},
+		addresses: []string{"udp://" + localAddr},
+		qtime:     time.Second,
+		logger:    logger,
+	}
+
+	uFall, _ := upstream.NewUpstream("udp://"+fallAddr, upstream.Opt{Logger: logger})
+	fallbackFwd := &miniForwarder{
+		upstreams: []upstream.Upstream{uFall},
+		addresses: []string{"udp://" + fallAddr},
+		qtime:     time.Second,
+		logger:    logger,
+	}
+
+	handler := &miniHandler{
+		logger:       logger,
+		localForward: localFwd,
+		cnForward:    fallbackFwd,
+		dnsCache:     cache.New[CacheKey, *dns.Msg](cache.Opts{Size: 10}),
+	}
+
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+	ctx := query_context.NewContext(q)
+	ctx.ServerMeta.ClientAddr, _ = netip.ParseAddr("127.0.0.1")
+
+	err := handler.process(context.Background(), ctx)
+	if err != nil {
+		t.Fatalf("process error: %v", err)
+	}
+
+	r := ctx.R()
+	if r == nil {
+		t.Fatal("expected response, got nil")
+	}
+	if r.Rcode != dns.RcodeSuccess {
+		t.Fatalf("expected NOERROR from fall, got %s", dns.RcodeToString[r.Rcode])
+	}
+	// Should have SOA from fall (ns2.example.com.)
+	if len(r.Ns) == 0 {
+		t.Fatal("expected SOA from fall result")
+	}
+	soa, ok := r.Ns[0].(*dns.SOA)
+	if !ok {
+		t.Fatalf("expected SOA record, got %T", r.Ns[0])
+	}
+	if soa.Ns != "ns2.example.com." {
+		t.Fatalf("expected SOA from fall (ns2.example.com.), got %s", soa.Ns)
+	}
+	// TTL should be overridden to 1 for fallback results
+	if soa.Hdr.Ttl != 1 {
+		t.Fatalf("expected overridden TTL 1 for fallback result, got %d", soa.Hdr.Ttl)
+	}
+}
+
 func TestCalculateCacheSize(t *testing.T) {
 	tests := []struct {
 		name     string
