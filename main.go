@@ -418,22 +418,30 @@ func shuffleAnswers(qtype uint16, answers []dns.RR) {
 	if len(answers) <= 1 {
 		return
 	}
-	// Separate CNAME and non-CNAME records (RFC 1034: CNAME must precede resolved records)
-	var cnameRecords, otherRecords []dns.RR
+	// Three-bucket sort per RFC 1034:
+	//   1. CNAME records (must precede the records they resolve to)
+	//   2. Records matching the queried qtype (shuffled for load balancing)
+	//   3. Everything else (shuffled)
+	var cnameRecords, qtypeRecords, restRecords []dns.RR
 	for _, rr := range answers {
-		if rr.Header().Rrtype == dns.TypeCNAME {
+		switch {
+		case rr.Header().Rrtype == dns.TypeCNAME:
 			cnameRecords = append(cnameRecords, rr)
-		} else {
-			otherRecords = append(otherRecords, rr)
+		case rr.Header().Rrtype == qtype:
+			qtypeRecords = append(qtypeRecords, rr)
+		default:
+			restRecords = append(restRecords, rr)
 		}
 	}
-	// Only shuffle non-CNAME records
-	rand.Shuffle(len(otherRecords), func(i, j int) {
-		otherRecords[i], otherRecords[j] = otherRecords[j], otherRecords[i]
+	rand.Shuffle(len(qtypeRecords), func(i, j int) {
+		qtypeRecords[i], qtypeRecords[j] = qtypeRecords[j], qtypeRecords[i]
 	})
-	// Reassemble: CNAME first, then others
-	copy(answers, cnameRecords)
-	copy(answers[len(cnameRecords):], otherRecords)
+	rand.Shuffle(len(restRecords), func(i, j int) {
+		restRecords[i], restRecords[j] = restRecords[j], restRecords[i]
+	})
+	pos := copy(answers, cnameRecords)
+	pos += copy(answers[pos:], qtypeRecords)
+	copy(answers[pos:], restRecords)
 }
 
 // pplogReport sends a query log entry if pplog is enabled.

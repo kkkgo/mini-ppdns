@@ -713,7 +713,53 @@ func TestShuffleAnswers(t *testing.T) {
 			t.Fatal("single CNAME should be unchanged")
 		}
 	})
+
+	t.Run("three-tier order: CNAME then qtype then rest", func(t *testing.T) {
+		// Mixed response: CNAME + A (qtype) + TXT (other)
+		cname, _ := dns.NewRR("example.com. 300 IN CNAME alias.example.com.")
+		a1, _ := dns.NewRR("alias.example.com. 60 IN A 1.2.3.4")
+		a2, _ := dns.NewRR("alias.example.com. 60 IN A 5.6.7.8")
+		txt, _ := dns.NewRR("alias.example.com. 60 IN TXT \"v=spf1\"")
+
+		for i := 0; i < 50; i++ {
+			answers := []dns.RR{txt, a1, cname, a2}
+			shuffleAnswers(dns.TypeA, answers)
+
+			// Position 0: must be CNAME
+			if answers[0].Header().Rrtype != dns.TypeCNAME {
+				t.Fatalf("iter %d: answers[0] must be CNAME, got %s", i, dns.TypeToString[answers[0].Header().Rrtype])
+			}
+			// Positions 1-2: must be A (qtype)
+			for j := 1; j <= 2; j++ {
+				if answers[j].Header().Rrtype != dns.TypeA {
+					t.Fatalf("iter %d: answers[%d] must be A, got %s", i, j, dns.TypeToString[answers[j].Header().Rrtype])
+				}
+			}
+			// Position 3: must be TXT (rest)
+			if answers[3].Header().Rrtype != dns.TypeTXT {
+				t.Fatalf("iter %d: answers[3] must be TXT, got %s", i, dns.TypeToString[answers[3].Header().Rrtype])
+			}
+		}
+	})
+
+	t.Run("qtype records before rest when no CNAME", func(t *testing.T) {
+		a1, _ := dns.NewRR("example.com. 60 IN A 1.1.1.1")
+		txt, _ := dns.NewRR("example.com. 60 IN TXT \"info\"")
+
+		for i := 0; i < 20; i++ {
+			answers := []dns.RR{txt, a1}
+			shuffleAnswers(dns.TypeA, answers)
+
+			if answers[0].Header().Rrtype != dns.TypeA {
+				t.Fatalf("iter %d: A record must come before TXT", i)
+			}
+			if answers[1].Header().Rrtype != dns.TypeTXT {
+				t.Fatalf("iter %d: TXT must be last", i)
+			}
+		}
+	})
 }
+
 
 func TestCalculateCacheSize(t *testing.T) {
 	tests := []struct {
