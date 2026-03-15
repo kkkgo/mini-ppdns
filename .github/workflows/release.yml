@@ -15,7 +15,7 @@ jobs:
     name: Build and commit binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@main
         with:
           fetch-depth: 0
 
@@ -66,7 +66,7 @@ jobs:
           echo "LAST_GO_COMMIT=${LAST_GO_COMMIT}" >> "$GITHUB_ENV"
 
       - name: Install UPX
-        uses: crazy-max/ghaction-upx@v3
+        uses: crazy-max/ghaction-upx@master
         with:
           install-only: true
 

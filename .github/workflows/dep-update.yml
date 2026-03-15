@@ -15,12 +15,12 @@ jobs:
   dep-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@main
       - name: build test
         run: docker build -t dep .
       - name: update dep
         run: docker run --name dep -v $(pwd):/src dep
-      - uses: EndBug/add-and-commit@v9
+      - uses: EndBug/add-and-commit@main
         with:
           author_name: Github Actions
           author_email: actions@github.com
