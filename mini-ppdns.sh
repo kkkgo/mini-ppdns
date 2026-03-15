@@ -29,8 +29,8 @@ read_pidfile() {
 write_pidfile() {
 	_pid=$(get_cur_pid)
 	_time=$(date "+%Y-%m-%d %H:%M:%S")
-	echo "$_pid" > "$PIDFILE"
-	echo "$_time" >> "$PIDFILE"
+	echo "$_pid" >"$PIDFILE"
+	echo "$_time" >>"$PIDFILE"
 }
 
 remove_pidfile() {

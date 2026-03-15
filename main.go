@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/kkkgo/mini-ppdns/pkg/query_context"
 	"github.com/kkkgo/mini-ppdns/pkg/server"
 	"github.com/kkkgo/mini-ppdns/pkg/upstream"
+	"github.com/kkkgo/mini-ppdns/pplog"
 	"github.com/miekg/dns"
 )
 
@@ -35,6 +37,10 @@ type ConfigArgs struct {
 	AAAA      string
 	Daemon    bool
 	Debug     bool
+
+	PPLogUUID   string
+	PPLogServer string
+	PPLogLevel  int
 }
 
 func getPrivateIPs() []string {
@@ -100,6 +106,20 @@ func parseINI(filename string, m *ConfigArgs) error {
 					fmt.Sscanf(v, "%d", &m.QTime)
 				} else if k == "aaaa" {
 					m.AAAA = v
+				}
+			}
+		case "pplog":
+			kv := strings.SplitN(line, "=", 2)
+			if len(kv) == 2 {
+				k := strings.TrimSpace(kv[0])
+				v := strings.TrimSpace(kv[1])
+				switch k {
+				case "uuid":
+					m.PPLogUUID = v
+				case "server":
+					m.PPLogServer = v
+				case "level":
+					fmt.Sscanf(v, "%d", &m.PPLogLevel)
 				}
 			}
 		}
@@ -257,6 +277,9 @@ type miniHandler struct {
 
 	forceFallMatcher *forceFallMatcher
 	allowAAAA        bool
+
+	pplogReporter *pplog.Reporter
+	pplogLevel    int
 }
 
 type miniForwarder struct {
@@ -408,6 +431,30 @@ func shuffleAnswers(qtype uint16, answers []dns.RR) {
 	}
 }
 
+// pplogReport sends a query log entry if pplog is enabled.
+func (h *miniHandler) pplogReport(qCtx *query_context.Context, route byte, rcode byte, durMs uint16, upstream string, resp *dns.Msg) {
+	if h.pplogReporter == nil {
+		return
+	}
+	q := qCtx.QQuestion()
+	entry := &pplog.QueryEntry{
+		ClientIP:  qCtx.ServerMeta.ClientAddr,
+		QType:     q.Qtype,
+		Rcode:     rcode,
+		Route:     route,
+		Duration:  durMs,
+		QueryName: q.Name,
+		Upstream:  upstream,
+	}
+	if resp != nil && h.pplogLevel >= 3 {
+		entry.AnswerRRs = resp.Answer
+	}
+	if resp != nil && h.pplogLevel >= 4 {
+		entry.ExtraRRs = resp.Extra
+	}
+	h.pplogReporter.Report(entry)
+}
+
 func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) error {
 	q := qCtx.QQuestion()
 
@@ -466,6 +513,7 @@ func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) 
 
 		qCtx.SetResponse(resp)
 		h.logger.Debugf("\033[36m%s\033[0m use \033[33mcache\033[0m query \033[36m%s\033[0m \033[36m%s\033[0m \033[32mNOERROR\033[0m 0ms%s", qCtx.ServerMeta.ClientAddr.String(), dns.TypeToString[q.Qtype], q.Name, ffStr)
+		h.pplogReport(qCtx, pplog.RouteCache, byte(resp.Rcode), 0, "", resp)
 		return nil
 	}
 
@@ -473,6 +521,7 @@ func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) 
 	var upstreamUsed string
 	var queryDur time.Duration
 	var execErr error
+	var localNoData *dns.Msg // saved localForward NODATA result
 
 	// 3. Main sequence
 	if !forceFall {
@@ -488,15 +537,22 @@ func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) 
 					h.dnsCache.Store(cacheKey, r.Copy(), time.Now().Add(time.Duration(ttl)*time.Second))
 				}
 				h.logger.Debugf("\033[36m%s\033[0m use \033[33m%s\033[0m local query \033[36m%s\033[0m \033[36m%s\033[0m \033[32mNOERROR\033[0m %v%s", qCtx.ServerMeta.ClientAddr.String(), upstreamUsed, dns.TypeToString[q.Qtype], q.Name, queryDur, ffStr)
+				h.pplogReport(qCtx, pplog.RouteLocal, byte(r.Rcode), uint16(queryDur.Milliseconds()), upstreamUsed, r)
 				return nil
 			} else {
 				rcodeStr := dns.RcodeToString[r.Rcode]
 				if r.Rcode == dns.RcodeSuccess && len(r.Answer) == 0 {
 					rcodeStr = "\033[33mNODATA\033[0m"
+					localNoData = r // save NODATA result for possible later use
 				} else {
 					rcodeStr = "\033[31m" + rcodeStr + "\033[0m"
 				}
 				h.logger.Debugf("\033[36m%s\033[0m use \033[33m%s\033[0m local query \033[36m%s\033[0m \033[36m%s\033[0m %s %v%s", qCtx.ServerMeta.ClientAddr.String(), upstreamUsed, dns.TypeToString[q.Qtype], q.Name, rcodeStr, queryDur, ffStr)
+				rcodeByte := byte(r.Rcode)
+				if r.Rcode == dns.RcodeSuccess && len(r.Answer) == 0 {
+					rcodeByte = pplog.RcodeNoData
+				}
+				h.pplogReport(qCtx, pplog.RouteLocal, rcodeByte, uint16(queryDur.Milliseconds()), upstreamUsed, r)
 			}
 		} else {
 			errStr := "timeout/error"
@@ -504,6 +560,7 @@ func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) 
 				errStr = execErr.Error()
 			}
 			h.logger.Debugf("\033[36m%s\033[0m use \033[33m%s\033[0m local query \033[36m%s\033[0m \033[36m%s\033[0m \033[31m%s\033[0m %v%s", qCtx.ServerMeta.ClientAddr.String(), upstreamUsed, dns.TypeToString[q.Qtype], q.Name, errStr, queryDur, ffStr)
+			h.pplogReport(qCtx, pplog.RouteLocal, pplog.RcodeTimeout, uint16(queryDur.Milliseconds()), upstreamUsed, nil)
 		}
 	}
 
@@ -513,7 +570,17 @@ func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) 
 		upFall = "timeout/err"
 	}
 
-	if rFall != nil {
+	fallIsNoData := rFall != nil && rFall.Rcode == dns.RcodeSuccess && len(rFall.Answer) == 0
+
+	// If both local and fall returned NODATA, prefer localForward result
+	// (it may contain useful SOA/CNAME records with original TTL)
+	if localNoData != nil && (fallIsNoData || rFall == nil) {
+		qCtx.SetResponse(localNoData)
+		ttl := getMsgTTL(localNoData)
+		if ttl > 0 {
+			h.dnsCache.Store(cacheKey, localNoData.Copy(), time.Now().Add(time.Duration(ttl)*time.Second))
+		}
+	} else if rFall != nil {
 		qCtx.SetResponse(rFall)
 		for _, ans := range qCtx.R().Answer {
 			ans.Header().Ttl = 1
@@ -545,7 +612,20 @@ func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) 
 	if errFall != nil && rFall == nil {
 		rcodeStr = "\033[31m" + errFall.Error() + "\033[0m"
 	}
-	h.logger.Debugf("\033[36m%s\033[0m use \033[33m%s\033[0m fall query \033[36m%s\033[0m \033[36m%s\033[0m %s %v%s", qCtx.ServerMeta.ClientAddr.String(), upFall, dns.TypeToString[q.Qtype], q.Name, rcodeStr, durFall, ffStr)
+	if localNoData != nil && (fallIsNoData || rFall == nil) {
+		h.logger.Debugf("\033[36m%s\033[0m use \033[33m%s\033[0m fall query \033[36m%s\033[0m \033[36m%s\033[0m \033[33mNODATA\033[0m %v, prefer \033[33mlocal NODATA\033[0m%s", qCtx.ServerMeta.ClientAddr.String(), upFall, dns.TypeToString[q.Qtype], q.Name, durFall, ffStr)
+	} else {
+		h.logger.Debugf("\033[36m%s\033[0m use \033[33m%s\033[0m fall query \033[36m%s\033[0m \033[36m%s\033[0m %s %v%s", qCtx.ServerMeta.ClientAddr.String(), upFall, dns.TypeToString[q.Qtype], q.Name, rcodeStr, durFall, ffStr)
+	}
+	if rFall != nil {
+		rcodeByteFall := byte(rFall.Rcode)
+		if fallIsNoData {
+			rcodeByteFall = pplog.RcodeNoData
+		}
+		h.pplogReport(qCtx, pplog.RouteFall, rcodeByteFall, uint16(durFall.Milliseconds()), upFall, rFall)
+	} else {
+		h.pplogReport(qCtx, pplog.RouteFall, pplog.RcodeTimeout, uint16(durFall.Milliseconds()), upFall, nil)
+	}
 
 	return nil
 }
@@ -573,6 +653,69 @@ func getMsgTTL(m *dns.Msg) uint32 {
 	return ttl
 }
 
+const (
+	estimatedEntrySize = 512    // estimated bytes per cache entry
+	maxCacheSize       = 102400 // absolute upper limit
+	minCacheSize       = 1024   // minimum cache entries
+)
+
+// getAvailableMemory reads /proc/meminfo and returns available memory in bytes.
+// Returns 0 if /proc/meminfo is not readable (non-Linux).
+func getAvailableMemory() uint64 {
+	f, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	var memAvailable, memFree, buffers, cached uint64
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		val, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		val *= 1024 // /proc/meminfo values are in kB
+		switch fields[0] {
+		case "MemAvailable:":
+			memAvailable = val
+		case "MemFree:":
+			memFree = val
+		case "Buffers:":
+			buffers = val
+		case "Cached:":
+			cached = val
+		}
+	}
+	if memAvailable > 0 {
+		return memAvailable
+	}
+	// Fallback for older kernels without MemAvailable
+	return memFree + buffers + cached
+}
+
+// calculateCacheSize returns the optimal cache size based on available memory.
+// The result is capped at maxCacheSize and floored at minCacheSize.
+// If availableBytes is 0 (non-Linux or read failure), returns maxCacheSize.
+func calculateCacheSize(availableBytes uint64) int {
+	if availableBytes == 0 {
+		return maxCacheSize
+	}
+	memBased := int(availableBytes / 5 / estimatedEntrySize) // 20% of available / entry size
+	if memBased > maxCacheSize {
+		memBased = maxCacheSize
+	}
+	if memBased < minCacheSize {
+		memBased = minCacheSize
+	}
+	return memBased
+}
+
 func main() {
 	var (
 		dnsStr       = flag.String("dns", "", "Local DNS upstreams (comma separated)")
@@ -585,6 +728,10 @@ func main() {
 		debugPtr     = flag.Bool("debug", false, "Enable debug logging")
 		configStr    = flag.String("config", "", "Path to config.ini file")
 		versionCmd   = flag.Bool("version", false, "Print out version info and exit")
+
+		pplogServer = flag.String("pplog_server", "", "PPLog UDP server address (e.g. 192.168.1.100:9999)")
+		pplogUUID   = flag.String("pplog_uuid", "", "PPLog authentication UUID")
+		pplogLevel  = flag.Int("pplog_level", 0, "PPLog detail level (1-5, 0=disabled)")
 	)
 
 	flag.Parse()
@@ -619,6 +766,15 @@ func main() {
 	}
 	if *forceFallStr != "" {
 		args.ForceFall = append(args.ForceFall, strings.Split(*forceFallStr, ",")...)
+	}
+	if *pplogServer != "" {
+		args.PPLogServer = *pplogServer
+	}
+	if *pplogUUID != "" {
+		args.PPLogUUID = *pplogUUID
+	}
+	if *pplogLevel > 0 {
+		args.PPLogLevel = *pplogLevel
 	}
 
 	// Ensure upstreams use udp:// or tcp://
@@ -717,7 +873,10 @@ func main() {
 		logger:    logger,
 	}
 
-	cachePlug := cache.New[CacheKey, *dns.Msg](cache.Opts{Size: 102400})
+	availMem := getAvailableMemory()
+	cacheSize := calculateCacheSize(availMem)
+	logger.Infof("cache size=\033[36m%d\033[0m (available memory: %d MB)", cacheSize, availMem/1024/1024)
+	cachePlug := cache.New[CacheKey, *dns.Msg](cache.Opts{Size: cacheSize})
 
 	// Parse force fall rules
 	ffMatcher := &forceFallMatcher{}
@@ -737,6 +896,22 @@ func main() {
 		}
 	}
 
+	// Initialize pplog reporter if configured
+	var pplogReporter *pplog.Reporter
+	if args.PPLogServer != "" && args.PPLogUUID != "" && args.PPLogLevel > 0 {
+		var err error
+		pplogReporter, err = pplog.NewReporter(pplog.Config{
+			UUID:   args.PPLogUUID,
+			Server: args.PPLogServer,
+			Level:  args.PPLogLevel,
+		})
+		if err != nil {
+			logger.Warnf("pplog init failed: %v (log reporting disabled)", err)
+		} else {
+			logger.Infof("pplog enabled server=\033[36m%s\033[0m level=\033[36m%d\033[0m", args.PPLogServer, args.PPLogLevel)
+		}
+	}
+
 	handler := &miniHandler{
 		logger:           logger,
 		localForward:     localFwd,
@@ -744,6 +919,8 @@ func main() {
 		dnsCache:         cachePlug,
 		forceFallMatcher: ffMatcher,
 		allowAAAA:        args.AAAA == "yes",
+		pplogReporter:    pplogReporter,
+		pplogLevel:       args.PPLogLevel,
 	}
 
 	// Start servers manually
@@ -786,6 +963,11 @@ func main() {
 		// Serve routines
 		go server.ServeUDP(uconn, handler, server.UDPServerOpts{Logger: logger})
 		go server.ServeTCP(tconn, handler, server.TCPServerOpts{Logger: logger, IdleTimeout: 3 * time.Second})
+
+		// Report server start event
+		if pplogReporter != nil {
+			pplogReporter.ReportEvent(pplog.SeverityInfo, fmt.Sprintf("server started addr=%s", addr))
+		}
 	}
 
 	// Graceful shutdown
@@ -808,5 +990,9 @@ func main() {
 		u.Close()
 	}
 	cachePlug.Close()
+	if pplogReporter != nil {
+		pplogReporter.ReportEvent(pplog.SeverityInfo, "server shutting down")
+		pplogReporter.Close()
+	}
 	logger.Infof("shutdown complete")
 }
