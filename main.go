@@ -436,9 +436,6 @@ func shuffleAnswers(qtype uint16, answers []dns.RR) {
 	rand.Shuffle(len(qtypeRecords), func(i, j int) {
 		qtypeRecords[i], qtypeRecords[j] = qtypeRecords[j], qtypeRecords[i]
 	})
-	rand.Shuffle(len(restRecords), func(i, j int) {
-		restRecords[i], restRecords[j] = restRecords[j], restRecords[i]
-	})
 	pos := copy(answers, cnameRecords)
 	pos += copy(answers[pos:], qtypeRecords)
 	copy(answers[pos:], restRecords)
