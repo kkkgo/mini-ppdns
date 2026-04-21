@@ -1,0 +1,107 @@
+name: Release
+on:
+  workflow_dispatch:
+  push:
+    paths-ignore:
+      - 'README.md'
+      - '.github/**'
+      - 'LICENSE'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and commit binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+        with:
+          fetch-depth: 0
+
+      - name: Build all architectures in Docker
+        run: |
+          mkdir -p release
+          LAST_GO_COMMIT=$(git log -1 --format=%H -- '*.go' go.mod go.sum)
+          GIT_HASH=$(git rev-parse --short "${LAST_GO_COMMIT}")
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct "${LAST_GO_COMMIT}")
+          BUILD_DATE=$(date -u -d "@${SOURCE_DATE_EPOCH}" +%Y%m%d)
+          VERSION="kkkgo/ppdns:mini-ppdns ${BUILD_DATE} ${GIT_HASH}"
+
+          build_one() {
+            local GOARCH=$1
+            local GOARM=$2
+            local GOMIPS=$3
+            local UNAME_M=$4
+            echo "=== Building ${UNAME_M} ==="
+            docker run --rm \
+              -v "$(pwd)":/src \
+              -w /src \
+              -e GOOS=linux \
+              -e GOARCH="${GOARCH}" \
+              -e GOARM="${GOARM}" \
+              -e GOMIPS="${GOMIPS}" \
+              -e CGO_ENABLED=0 \
+              -e SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \
+              golang:alpine \
+              go build \
+                -trimpath \
+                -ldflags="-s -w -buildid= -X 'main.version=${VERSION}'" \
+                -o "release/mini-ppdns_${UNAME_M}" \
+                .
+            cp "release/mini-ppdns_${UNAME_M}" "release/mini-ppdns_${UNAME_M}_upx"
+          }
+
+          build_one amd64    ""  ""          x86_64
+          build_one arm64    ""  ""          aarch64
+          build_one arm      7   ""          armv7l
+          build_one arm      6   ""          armv6l
+          build_one mips     ""  softfloat   mips
+          build_one mipsle   ""  softfloat   mipsel
+          build_one mips64   ""  ""          mips64
+          build_one mips64le ""  ""          mips64el
+          build_one 386      ""  ""          i686
+          build_one riscv64  ""  ""          riscv64
+
+          echo "LAST_GO_COMMIT=${LAST_GO_COMMIT}" >> "$GITHUB_ENV"
+
+      - name: Install UPX
+        uses: crazy-max/ghaction-upx@master
+        with:
+          install-only: true
+
+      - name: Compress all _upx binaries
+        run: |
+          for f in release/*_upx; do
+            echo "Compressing $f ..."
+            upx --best --lzma "$f" || true
+          done
+
+      - name: Push binaries to release branch
+        run: |
+          git config user.name "Github Actions"
+          git config user.email "actions@github.com"
+
+          if git clone --branch release --single-branch "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/kkkgo/mini-ppdns.git" release_branch; then
+            echo "Cloned existing release branch"
+          else
+            git clone --single-branch "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/kkkgo/mini-ppdns.git" release_branch
+            cd release_branch
+            git checkout --orphan release
+            git rm -rf .
+            cd ..
+          fi
+
+          cp release_branch/README.md /tmp/README.md 2>/dev/null || true
+          cp release/mini-ppdns_* /tmp/
+
+          cd release_branch
+          git checkout --orphan release_new
+          git rm -rf .
+          cp /tmp/README.md . 2>/dev/null || true
+          cp /tmp/mini-ppdns_* .
+          git config user.name "Github Actions"
+          git config user.email "actions@github.com"
+          git add .
+          git commit -m "release: ${LAST_GO_COMMIT}"
+          git push origin release_new:release --force
