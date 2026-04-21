@@ -1,0 +1,10 @@
+services:
+  mini-ppdns:
+    image: public.ecr.aws/docker/library/busybox
+    container_name: mini-ppdns
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - .:/app:ro
+    working_dir: /app
+    command: [ "./mini-ppdns", "-config", "config.ini" ]
