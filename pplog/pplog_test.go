@@ -573,3 +573,33 @@ func TestFitPayload_ManyRRsWithAdditional(t *testing.T) {
 		t.Fatal("fitPayload returned 0")
 	}
 }
+
+// The skip-check must survive a
+// wall-clock rollback. Before the fix, any negative diff satisfied `< interval`
+// and silenced the heartbeat until real time caught up.
+func TestShouldSkipHeartbeat(t *testing.T) {
+	interval := 30 * time.Second
+	base := time.Unix(1_700_000_000, 0)
+
+	tests := []struct {
+		name     string
+		last     int64
+		now      time.Time
+		wantSkip bool
+	}{
+		{"no prior report", 0, base, false},
+		{"recent report within interval", base.UnixNano(), base.Add(5 * time.Second), true},
+		{"old report outside interval", base.UnixNano(), base.Add(2 * interval), false},
+		{"clock rolled back (future last)", base.Add(time.Hour).UnixNano(), base, false},
+		{"boundary exactly at interval", base.UnixNano(), base.Add(interval), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldSkipHeartbeat(tt.last, tt.now, interval)
+			if got != tt.wantSkip {
+				t.Errorf("shouldSkipHeartbeat(last=%d, now=%v) = %v, want %v",
+					tt.last, tt.now, got, tt.wantSkip)
+			}
+		})
+	}
+}

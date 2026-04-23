@@ -1,11 +1,13 @@
 package main
 
 import (
+	crand "crypto/rand"
 	"context"
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,6 +30,21 @@ const (
 	fallbackTTL              = 1  // TTL for fallback DNS responses (short to allow fast switch back to main DNS)
 )
 
+// randPool hands out independently-seeded ChaCha8 generators so upstream
+// shuffle and answer shuffle don't contend on math/rand/v2's global source
+// lock under high QPS. Each caller Gets a *rand.Rand, uses it lock-free, and
+// Puts it back.
+var randPool = sync.Pool{
+	New: func() any {
+		var seed [32]byte
+		_, _ = crand.Read(seed[:])
+		return rand.New(rand.NewChaCha8(seed))
+	},
+}
+
+func getRand() *rand.Rand  { return randPool.Get().(*rand.Rand) }
+func putRand(r *rand.Rand) { randPool.Put(r) }
+
 type CacheKey struct {
 	Name   string
 	Qtype  uint16
@@ -46,6 +63,47 @@ func (k CacheKey) Sum() uint64 {
 	hash ^= uint64(k.Qclass)
 	hash *= 1099511628211
 	return hash
+}
+
+// lowerASCIIName returns a lower-cased copy of a DNS name, skipping the
+// copy entirely when the input is already lowercase. strings.ToLower
+// already short-circuits all-lowercase input, so the fast-path here
+// mostly saves the scan + branch inside stdlib on the dominant case.
+// DNS names only contain ASCII per RFC 1035, so a byte-wise lower is
+// correct and avoids the Unicode mapping cost of strings.ToLower.
+func lowerASCIIName(s string) string {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c >= 'A' && c <= 'Z' {
+			// Slow path: at least one uppercase byte. Build a lower
+			// copy. Using a stack buffer up to 255 (DNS max name
+			// length) keeps this allocation-free for all legal
+			// domains; overlong inputs fall through to a heap slice.
+			var stackBuf [255]byte
+			n := len(s)
+			if n <= len(stackBuf) {
+				copy(stackBuf[:n], s[:i])
+				for j := i; j < n; j++ {
+					b := s[j]
+					if b >= 'A' && b <= 'Z' {
+						b += 'a' - 'A'
+					}
+					stackBuf[j] = b
+				}
+				return string(stackBuf[:n])
+			}
+			buf := make([]byte, n)
+			copy(buf, s[:i])
+			for j := i; j < n; j++ {
+				b := s[j]
+				if b >= 'A' && b <= 'Z' {
+					b += 'a' - 'A'
+				}
+				buf[j] = b
+			}
+			return string(buf)
+		}
+	}
+	return s
 }
 
 type miniHandler struct {
@@ -123,10 +181,12 @@ func (f *miniForwarder) Exec(ctx context.Context, qCtx *query_context.Context) (
 	for i := 0; i < n; i++ {
 		indices[i] = i
 	}
+	rng := getRand()
 	for i := 0; i < concurrent; i++ {
-		j := i + rand.IntN(n-i)
+		j := i + rng.IntN(n-i)
 		indices[i], indices[j] = indices[j], indices[i]
 	}
+	putRand(rng)
 	for c := 0; c < concurrent; c++ {
 		idx := indices[c]
 		u := f.upstreams[idx]
@@ -143,6 +203,27 @@ func (f *miniForwarder) Exec(ctx context.Context, qCtx *query_context.Context) (
 
 		go func(up upstream.Upstream, upAddr string) {
 			defer pool.ReleaseBuf(qc)
+			// Recover from upstream panics (nil-deref in transport layers,
+			// miekg/dns decode edge cases) and funnel them into resChan as a
+			// normal error. A single bad response should never crash the
+			// resolver process.
+			defer func() {
+				if rec := recover(); rec != nil {
+					if f.logger != nil {
+						f.logger.Errorw("upstream exchange panic",
+							mlog.String("upstream", upAddr),
+							mlog.String("recover", fmt.Sprintf("%v", rec)))
+					}
+					select {
+					case resChan <- res{
+						err:      fmt.Errorf("upstream panic: %v", rec),
+						upstream: upAddr,
+						duration: time.Since(start),
+					}:
+					case <-done:
+					}
+				}
+			}()
 			upstreamCtx, cancel := context.WithTimeout(ctx, f.qtime)
 			defer cancel()
 
@@ -259,16 +340,22 @@ func shuffleAnswers(qtype uint16, answers []dns.RR) {
 		return dns.RRToType(rr) == qtype
 	})
 	qtypeSlice := rest[:qtypeEnd]
-	rand.Shuffle(len(qtypeSlice), func(i, j int) {
+	rng := getRand()
+	rng.Shuffle(len(qtypeSlice), func(i, j int) {
 		qtypeSlice[i], qtypeSlice[j] = qtypeSlice[j], qtypeSlice[i]
 	})
+	putRand(rng)
 }
+
+// partitionStackLimit is the largest answer-set size we can partition
+// without a heap allocation. DNS responses almost always fit in this
+// budget — larger ones fall back to a heap slice.
+const partitionStackLimit = 16
 
 // stablePartitionRR moves elements satisfying pred to the front of s,
 // preserving relative order. Returns the count of matching elements.
-// Runs in O(n) time with a single scratch allocation, replacing the
-// former in-place copy-shift whose worst case (matches clustered at
-// the tail) was O(n²).
+// Runs in O(n) time. For the common case (n ≤ partitionStackLimit) the
+// scratch buffer lives on the stack so the partition allocates nothing.
 func stablePartitionRR(s []dns.RR, pred func(dns.RR) bool) int {
 	n := len(s)
 	if n <= 1 {
@@ -286,7 +373,13 @@ func stablePartitionRR(s []dns.RR, pred func(dns.RR) bool) int {
 	if matches == 0 || matches == n {
 		return matches
 	}
-	tmp := make([]dns.RR, n)
+	var stackBuf [partitionStackLimit]dns.RR
+	var tmp []dns.RR
+	if n <= partitionStackLimit {
+		tmp = stackBuf[:n]
+	} else {
+		tmp = make([]dns.RR, n)
+	}
 	hi, lo := 0, matches
 	for _, rr := range s {
 		if pred(rr) {
@@ -318,9 +411,11 @@ func cacheSnapshot(r *dns.Msg) *dns.Msg {
 	}
 	snap := &dns.Msg{
 		MsgHeader: r.MsgHeader,
-		Question:  r.Question,
 		Pseudo:    r.Pseudo,
 		Data:      r.Data,
+	}
+	if n := len(r.Question); n > 0 {
+		snap.Question = append(make([]dns.RR, 0, n), r.Question...)
 	}
 	if n := len(r.Answer); n > 0 {
 		snap.Answer = append(make([]dns.RR, 0, n), r.Answer...)
@@ -484,7 +579,38 @@ func (h *miniHandler) applyLiteMode(r *dns.Msg, qtype uint16, qname string) {
 	r.Extra = filteredExtra
 }
 
+// requestRoute captures the routing decision for a single query:
+// whether the main DNS is bypassed in favor of the fallback, and which
+// label should appear in the fall-path log line / pplog route byte.
+type requestRoute struct {
+	forceFall     bool
+	fallRoute     string
+	fallRouteByte byte
+}
+
 func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) error {
+	if h.tryStaticRewrite(qCtx) {
+		return nil
+	}
+	route := h.resolveRoute(qCtx)
+	q := qCtx.QQuestion()
+	// DNS names are case-insensitive; normalize so Example.COM and example.com share a cache entry.
+	cacheKey := CacheKey{Name: lowerASCIIName(q.Name), Qtype: q.Qtype, Qclass: q.Qclass}
+	if h.tryCacheHit(qCtx, cacheKey) {
+		return nil
+	}
+	localResp, localNoData, handled := h.execLocal(ctx, qCtx, route, cacheKey)
+	if handled {
+		return nil
+	}
+	h.execFallbackAndFinalize(ctx, qCtx, route, cacheKey, localResp, localNoData)
+	return nil
+}
+
+// tryStaticRewrite answers queries that need no upstream dialing: AAAA
+// blocks, SVCB/HTTPS rejection, hosts-file lookups, local PTR, and
+// bogus-priv. Returns true when the response has been written to qCtx.
+func (h *miniHandler) tryStaticRewrite(qCtx *query_context.Context) bool {
 	q := qCtx.QQuestion()
 
 	// Reject AAAA, SVCB, HTTPS queries
@@ -502,7 +628,7 @@ func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) 
 		dnsutil.SetReply(r, qCtx.Q())
 		r.Rcode = dns.RcodeSuccess
 		qCtx.SetResponse(r)
-		return nil
+		return true
 	}
 
 	// Forward lookup from hosts files and [hosts] config
@@ -536,7 +662,7 @@ func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) 
 					rcode:  "NOERROR",
 				})
 				h.pplogReport(qCtx, pplog.RouteHosts, byte(dns.RcodeSuccess), 0, "hosts", r)
-				return nil
+				return true
 			}
 		}
 	}
@@ -566,7 +692,7 @@ func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) 
 				extra:  hostname,
 			})
 			h.pplogReport(qCtx, pplog.RouteHosts, byte(dns.RcodeSuccess), 0, "local-ptr", r)
-			return nil
+			return true
 		}
 		// bogus-priv: private PTR not found locally -> NXDOMAIN, don't forward upstream
 		if h.bogusPriv && isPrivatePTR(q.Name) {
@@ -582,7 +708,7 @@ func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) 
 				rcode:  "NXDOMAIN",
 			})
 			h.pplogReport(qCtx, pplog.RouteHosts, byte(dns.RcodeNameError), 0, "bogus-priv", r)
-			return nil
+			return true
 		}
 	}
 	// bogus-priv without ptrResolver: still block private PTR from going upstream
@@ -597,28 +723,29 @@ func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) 
 			mlog.String("domain", q.Name),
 			mlog.String("rcode", "NXDOMAIN"))
 		h.pplogReport(qCtx, pplog.RouteHosts, byte(dns.RcodeNameError), 0, "bogus-priv", r)
-		return nil
+		return true
 	}
+	return false
+}
 
-	// Determine route for logging
+// resolveRoute folds forceFall matcher, hook failure state, and the
+// paopao.dns special-case into a requestRoute used by the remaining stages.
+func (h *miniHandler) resolveRoute(qCtx *query_context.Context) requestRoute {
+	q := qCtx.QQuestion()
 	forceFall := false
 	if h.forceFallMatcher != nil {
 		forceFall = h.forceFallMatcher.Match(qCtx.ServerMeta.ClientAddr)
 	}
-
 	hookDown := false
 	if h.hookFailed != nil && h.hookFailed.Load() {
 		hookDown = true
 		forceFall = true
 	}
-
 	// paopao.dns: always use primary DNS unless hosts already handled it
 	if forceFall && isPaopaoDNS(q.Name) {
 		forceFall = false
 		hookDown = false
 	}
-
-	// Route label used for the fall-path log line and pplog route byte.
 	fallRoute := "fall"
 	fallRouteByte := pplog.RouteFall
 	if forceFall {
@@ -630,129 +757,152 @@ func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) 
 			fallRouteByte = pplog.RouteForceFall
 		}
 	}
+	return requestRoute{
+		forceFall:     forceFall,
+		fallRoute:     fallRoute,
+		fallRouteByte: fallRouteByte,
+	}
+}
 
-	// 2. Cache
-	// DNS names are case-insensitive; normalize so Example.COM and example.com share a cache entry.
-	cacheKey := CacheKey{Name: strings.ToLower(q.Name), Qtype: q.Qtype, Qclass: q.Qclass}
-	if cachedMsg, expTime, ok := h.dnsCache.Get(cacheKey); ok && cachedMsg != nil {
-		// TOCTOU: cache.Get checked expiration, but the entry may have just
-		// expired. time.Until can be negative — convert via int64 first so the
-		// uint32 cast doesn't wrap to ~136 years.
-		secsLeft := int64(time.Until(expTime) / time.Second)
-		ttlLeft := uint32(1)
-		if secsLeft > 1 {
-			ttlLeft = uint32(secsLeft)
-		}
-
-		// codeberg.org/miekg/dns Msg.Copy is a shallow copy: RRs are shared
-		// by pointer and slice headers point into the same backing arrays.
-		// Deep-clone each RR into a fresh slice so the TTL rewrite below and
-		// the downstream shuffleAnswers cannot mutate the cached entry (which
-		// concurrent hits may be reading). Question/Pseudo/Data are treated
-		// as immutable after Store and shared by reference.
-		resp := &dns.Msg{
-			MsgHeader: cachedMsg.MsgHeader,
-			Question:  cachedMsg.Question,
-			Pseudo:    cachedMsg.Pseudo,
-			Data:      cachedMsg.Data,
-			Answer:    cloneRRsWithTTL(cachedMsg.Answer, ttlLeft),
-			Ns:        cloneRRsWithTTL(cachedMsg.Ns, ttlLeft),
-			Extra:     cloneExtraWithTTL(cachedMsg.Extra, ttlLeft),
-		}
-		resp.ID = qCtx.Q().ID
-
-		qCtx.SetResponse(resp)
-		rcodeLabel := "NOERROR"
-		if resp.Rcode == dns.RcodeSuccess && len(resp.Answer) == 0 {
-			rcodeLabel = "NODATA"
-		} else if resp.Rcode != dns.RcodeSuccess {
-			rcodeLabel = dns.RcodeToString[resp.Rcode]
-		}
-		logQuery(h.logger, &queryLog{
-			route:  "cache",
-			client: qCtx.ServerMeta.ClientAddr,
-			qtype:  q.Qtype,
-			domain: q.Name,
-			rcode:  rcodeLabel,
-		})
-		h.pplogReport(qCtx, pplog.RouteCache, byte(resp.Rcode), 0, "", resp)
-		return nil
+// tryCacheHit serves a cached response when one is available, deep-cloning
+// RRs with the remaining TTL so concurrent hits can't race on shared slices.
+// Returns true when the response has been written to qCtx.
+func (h *miniHandler) tryCacheHit(qCtx *query_context.Context, cacheKey CacheKey) bool {
+	cachedMsg, expTime, ok := h.dnsCache.Get(cacheKey)
+	if !ok || cachedMsg == nil {
+		return false
+	}
+	q := qCtx.QQuestion()
+	// TOCTOU: cache.Get checked expiration, but the entry may have just
+	// expired. time.Until can be negative — convert via int64 first so the
+	// uint32 cast doesn't wrap to ~136 years.
+	secsLeft := int64(time.Until(expTime) / time.Second)
+	ttlLeft := uint32(1)
+	if secsLeft > 1 {
+		ttlLeft = uint32(secsLeft)
 	}
 
-	var r *dns.Msg
-	var upstreamUsed string
-	var queryDur time.Duration
-	var execErr error
-	var localNoData *dns.Msg // saved localForward NODATA result
-
-	// 3. Main sequence
-	if !forceFall {
-		r, upstreamUsed, queryDur, execErr = h.localForward.Exec(ctx, qCtx)
-		if upstreamUsed == "" {
-			upstreamUsed = "timeout/err"
-		}
-		if execErr == nil && r != nil {
-			if h.lite {
-				h.applyLiteMode(r, q.Qtype, q.Name)
-			}
-			// trust_rcode: if the main DNS rcode is in the trusted set, accept the
-			// response directly (even without answer records) and skip fallback.
-			if len(h.trustRcodes) > 0 && h.trustRcodes[int(r.Rcode)] {
-				qCtx.SetResponse(r)
-				ttl := dnsutils.GetMinimalTTL(r)
-				if ttl == 0 {
-					ttl = 1
-				}
-				h.dnsCache.Store(cacheKey, cacheSnapshot(r), time.Now().Add(time.Duration(ttl)*time.Second))
-				rcodeLabel := dns.RcodeToString[r.Rcode]
-				if len(r.Answer) == 0 {
-					rcodeLabel += "(trusted)"
-				}
-				logLocalQuery(h.logger, qCtx.ServerMeta.ClientAddr, upstreamUsed, q.Qtype, q.Name, rcodeLabel, queryDur, nil)
-				rcodeByte := byte(r.Rcode)
-				if r.Rcode == dns.RcodeSuccess && len(r.Answer) == 0 {
-					rcodeByte = pplog.RcodeNoData
-				}
-				h.pplogReport(qCtx, pplog.RouteLocal, rcodeByte, durToMs(queryDur), upstreamUsed, r)
-				return nil
-			}
-			if r.Rcode == dns.RcodeSuccess && len(r.Answer) > 0 {
-				qCtx.SetResponse(r)
-				ttl := dnsutils.GetMinimalTTL(r)
-				if ttl > 0 {
-					h.dnsCache.Store(cacheKey, cacheSnapshot(r), time.Now().Add(time.Duration(ttl)*time.Second))
-				}
-				logLocalQuery(h.logger, qCtx.ServerMeta.ClientAddr, upstreamUsed, q.Qtype, q.Name, "NOERROR", queryDur, nil)
-				h.pplogReport(qCtx, pplog.RouteLocal, byte(r.Rcode), durToMs(queryDur), upstreamUsed, r)
-				return nil
-			} else if r.Rcode == dns.RcodeSuccess && len(r.Answer) == 0 {
-				// aaaa=noerror: trust the NOERROR+empty answer from main DNS directly,
-				// skip fallback. Cache with original TTL (or TTL=1 if no NS record TTL).
-				if h.aaaaMode == "noerror" && q.Qtype == dns.TypeAAAA {
-					qCtx.SetResponse(r)
-					ttl := dnsutils.GetMinimalTTL(r)
-					if ttl == 0 {
-						ttl = 1
-					}
-					h.dnsCache.Store(cacheKey, cacheSnapshot(r), time.Now().Add(time.Duration(ttl)*time.Second))
-					logLocalQuery(h.logger, qCtx.ServerMeta.ClientAddr, upstreamUsed, q.Qtype, q.Name, "NODATA(trusted)", queryDur, nil)
-					h.pplogReport(qCtx, pplog.RouteLocal, pplog.RcodeNoData, durToMs(queryDur), upstreamUsed, r)
-					return nil
-				}
-				logLocalQuery(h.logger, qCtx.ServerMeta.ClientAddr, upstreamUsed, q.Qtype, q.Name, "NODATA", queryDur, nil)
-				h.pplogReport(qCtx, pplog.RouteLocal, pplog.RcodeNoData, durToMs(queryDur), upstreamUsed, r)
-				localNoData = r // save NODATA result for possible later use
-			} else {
-				logLocalQuery(h.logger, qCtx.ServerMeta.ClientAddr, upstreamUsed, q.Qtype, q.Name, dns.RcodeToString[r.Rcode], queryDur, nil)
-				h.pplogReport(qCtx, pplog.RouteLocal, byte(r.Rcode), durToMs(queryDur), upstreamUsed, r)
-			}
-		} else {
-			logLocalQuery(h.logger, qCtx.ServerMeta.ClientAddr, upstreamUsed, q.Qtype, q.Name, "timeout/error", queryDur, execErr)
-			h.pplogReport(qCtx, pplog.RouteLocal, pplog.RcodeTimeout, durToMs(queryDur), upstreamUsed, nil)
-		}
+	// codeberg.org/miekg/dns Msg.Copy is a shallow copy: RRs are shared
+	// by pointer and slice headers point into the same backing arrays.
+	// Deep-clone each RR into a fresh slice so the TTL rewrite below and
+	// the downstream shuffleAnswers cannot mutate the cached entry (which
+	// concurrent hits may be reading). Question/Pseudo/Data are treated
+	// as immutable after Store and shared by reference.
+	resp := &dns.Msg{
+		MsgHeader: cachedMsg.MsgHeader,
+		Question:  cachedMsg.Question,
+		Pseudo:    cachedMsg.Pseudo,
+		Data:      cachedMsg.Data,
+		Answer:    cloneRRsWithTTL(cachedMsg.Answer, ttlLeft),
+		Ns:        cloneRRsWithTTL(cachedMsg.Ns, ttlLeft),
+		Extra:     cloneExtraWithTTL(cachedMsg.Extra, ttlLeft),
 	}
+	resp.ID = qCtx.Q().ID
 
-	// 4. Fallback execution
+	qCtx.SetResponse(resp)
+	rcodeLabel := "NOERROR"
+	if resp.Rcode == dns.RcodeSuccess && len(resp.Answer) == 0 {
+		rcodeLabel = "NODATA"
+	} else if resp.Rcode != dns.RcodeSuccess {
+		rcodeLabel = dns.RcodeToString[resp.Rcode]
+	}
+	logQuery(h.logger, &queryLog{
+		route:  "cache",
+		client: qCtx.ServerMeta.ClientAddr,
+		qtype:  q.Qtype,
+		domain: q.Name,
+		rcode:  rcodeLabel,
+	})
+	h.pplogReport(qCtx, pplog.RouteCache, byte(resp.Rcode), 0, "", resp)
+	return true
+}
+
+// execLocal runs the main DNS forwarder when the route isn't forced to
+// fallback. Returns:
+//   - localResp:   any main-DNS response (used as fallback if cnForward fails)
+//   - localNoData: the subset of localResp that was NODATA (used for NODATA preference)
+//   - handled:     true if the response has already been written to qCtx
+//     (trust_rcode path, NOERROR+answer path, or aaaa=noerror+NODATA path)
+func (h *miniHandler) execLocal(ctx context.Context, qCtx *query_context.Context, route requestRoute, cacheKey CacheKey) (localResp, localNoData *dns.Msg, handled bool) {
+	if route.forceFall {
+		return nil, nil, false
+	}
+	q := qCtx.QQuestion()
+	r, upstreamUsed, queryDur, execErr := h.localForward.Exec(ctx, qCtx)
+	if upstreamUsed == "" {
+		upstreamUsed = "timeout/err"
+	}
+	if execErr != nil || r == nil {
+		logLocalQuery(h.logger, qCtx.ServerMeta.ClientAddr, upstreamUsed, q.Qtype, q.Name, "timeout/error", queryDur, execErr)
+		h.pplogReport(qCtx, pplog.RouteLocal, pplog.RcodeTimeout, durToMs(queryDur), upstreamUsed, nil)
+		return nil, nil, false
+	}
+	if h.lite {
+		h.applyLiteMode(r, q.Qtype, q.Name)
+	}
+	// trust_rcode: if the main DNS rcode is in the trusted set, accept the
+	// response directly (even without answer records) and skip fallback.
+	if len(h.trustRcodes) > 0 && h.trustRcodes[int(r.Rcode)] {
+		qCtx.SetResponse(r)
+		ttl := dnsutils.GetMinimalTTL(r)
+		if ttl == 0 {
+			ttl = 1
+		}
+		h.dnsCache.Store(cacheKey, cacheSnapshot(r), time.Now().Add(time.Duration(ttl)*time.Second))
+		rcodeLabel := dns.RcodeToString[r.Rcode]
+		if len(r.Answer) == 0 {
+			rcodeLabel += "(trusted)"
+		}
+		logLocalQuery(h.logger, qCtx.ServerMeta.ClientAddr, upstreamUsed, q.Qtype, q.Name, rcodeLabel, queryDur, nil)
+		rcodeByte := byte(r.Rcode)
+		if r.Rcode == dns.RcodeSuccess && len(r.Answer) == 0 {
+			rcodeByte = pplog.RcodeNoData
+		}
+		h.pplogReport(qCtx, pplog.RouteLocal, rcodeByte, durToMs(queryDur), upstreamUsed, r)
+		return nil, nil, true
+	}
+	if r.Rcode == dns.RcodeSuccess && len(r.Answer) > 0 {
+		qCtx.SetResponse(r)
+		ttl := dnsutils.GetMinimalTTL(r)
+		if ttl > 0 {
+			h.dnsCache.Store(cacheKey, cacheSnapshot(r), time.Now().Add(time.Duration(ttl)*time.Second))
+		}
+		logLocalQuery(h.logger, qCtx.ServerMeta.ClientAddr, upstreamUsed, q.Qtype, q.Name, "NOERROR", queryDur, nil)
+		h.pplogReport(qCtx, pplog.RouteLocal, byte(r.Rcode), durToMs(queryDur), upstreamUsed, r)
+		return nil, nil, true
+	}
+	if r.Rcode == dns.RcodeSuccess && len(r.Answer) == 0 {
+		// aaaa=noerror: trust the NOERROR+empty answer from main DNS directly,
+		// skip fallback. Cache with original TTL (or TTL=1 if no NS record TTL).
+		if h.aaaaMode == "noerror" && q.Qtype == dns.TypeAAAA {
+			qCtx.SetResponse(r)
+			ttl := dnsutils.GetMinimalTTL(r)
+			if ttl == 0 {
+				ttl = 1
+			}
+			h.dnsCache.Store(cacheKey, cacheSnapshot(r), time.Now().Add(time.Duration(ttl)*time.Second))
+			logLocalQuery(h.logger, qCtx.ServerMeta.ClientAddr, upstreamUsed, q.Qtype, q.Name, "NODATA(trusted)", queryDur, nil)
+			h.pplogReport(qCtx, pplog.RouteLocal, pplog.RcodeNoData, durToMs(queryDur), upstreamUsed, r)
+			return nil, nil, true
+		}
+		logLocalQuery(h.logger, qCtx.ServerMeta.ClientAddr, upstreamUsed, q.Qtype, q.Name, "NODATA", queryDur, nil)
+		h.pplogReport(qCtx, pplog.RouteLocal, pplog.RcodeNoData, durToMs(queryDur), upstreamUsed, r)
+		// Save NODATA for the NODATA-preference rule + fallback-failure fallback.
+		return r, r, false
+	}
+	// Non-success rcode (NXDOMAIN/REFUSED/etc.) — preserve so a failed fallback
+	// doesn't collapse the response to SERVFAIL.
+	logLocalQuery(h.logger, qCtx.ServerMeta.ClientAddr, upstreamUsed, q.Qtype, q.Name, dns.RcodeToString[r.Rcode], queryDur, nil)
+	h.pplogReport(qCtx, pplog.RouteLocal, byte(r.Rcode), durToMs(queryDur), upstreamUsed, r)
+	return r, nil, false
+}
+
+// execFallbackAndFinalize runs the fallback forwarder, applies the NODATA
+// preference rule (primary NODATA beats fallback NODATA for its original
+// TTL), writes a response to qCtx if nothing else has, and emits the
+// fall-path log lines + pplog entry.
+func (h *miniHandler) execFallbackAndFinalize(ctx context.Context, qCtx *query_context.Context, route requestRoute, cacheKey CacheKey, localResp, localNoData *dns.Msg) {
+	q := qCtx.QQuestion()
 	rFall, upFall, durFall, errFall := h.cnForward.Exec(ctx, qCtx)
 	if upFall == "" {
 		upFall = "timeout/err"
@@ -777,7 +927,9 @@ func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) 
 		}
 		qCtx.SetResponse(rFall)
 		// TTL=1: fallback results are short-lived to allow fast switch back
-		// to main DNS once the hook monitor detects recovery.
+		// to main DNS once the hook monitor detects recovery. Every non-OPT
+		// TTL is overwritten below, so the post-rewrite minimum is trivially
+		// fallbackTTL — no need for a second GetMinimalTTL pass.
 		for _, ans := range qCtx.R().Answer {
 			ans.Header().TTL = fallbackTTL
 		}
@@ -789,40 +941,52 @@ func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) 
 				ext.Header().TTL = fallbackTTL
 			}
 		}
-		ttl := dnsutils.GetMinimalTTL(qCtx.R())
-		if ttl > 0 {
-			h.dnsCache.Store(cacheKey, cacheSnapshot(qCtx.R()), time.Now().Add(time.Duration(ttl)*time.Second))
+		h.dnsCache.Store(cacheKey, cacheSnapshot(qCtx.R()), time.Now().Add(time.Duration(fallbackTTL)*time.Second))
+	} else if errFall != nil && localResp != nil {
+		// Fallback failed entirely (timeout / network error). Surface the
+		// main-DNS response that was logged earlier (NXDOMAIN/REFUSED/NODATA)
+		// instead of letting Handle() synthesize SERVFAIL — the client
+		// deserves the explicit error code the main upstream already gave us.
+		if h.lite {
+			h.applyLiteMode(localResp, q.Qtype, q.Name)
 		}
-	} else if errFall != nil {
-		// Log error
+		qCtx.SetResponse(localResp)
+		ttl := dnsutils.GetMinimalTTL(localResp)
+		if ttl == 0 {
+			ttl = 1
+		}
+		h.dnsCache.Store(cacheKey, cacheSnapshot(localResp), time.Now().Add(time.Duration(ttl)*time.Second))
 	}
 
 	switch {
-	case rFall == nil && errFall != nil:
-		// Fallback itself failed (timeout / network error). Do not mask this
-		// as NODATA even if local previously returned NODATA — ops needs to
-		// see that the fallback upstream is unhealthy.
-		logFallQuery(h.logger, fallRoute, qCtx.ServerMeta.ClientAddr, upFall, q.Qtype, q.Name, "timeout/error", durFall, errFall)
 	case localNoData != nil && (fallIsNoData || rFall == nil):
-		logFallQuery(h.logger, fallRoute, qCtx.ServerMeta.ClientAddr, upFall, q.Qtype, q.Name, "NODATA", durFall, nil)
+		// Response written to the client is NODATA (from the local resolver).
+		// When the fallback also errored, surface both signals in the label so
+		// ops still sees the fallback upstream is unhealthy — without logging
+		// "timeout/error" for a request the client received as NODATA.
+		rcodeLabel := "NODATA"
+		if rFall == nil && errFall != nil {
+			rcodeLabel = "NODATA(fall-timeout)"
+		}
+		logFallQuery(h.logger, route.fallRoute, qCtx.ServerMeta.ClientAddr, upFall, q.Qtype, q.Name, rcodeLabel, durFall, errFall)
+	case rFall == nil && errFall != nil:
+		logFallQuery(h.logger, route.fallRoute, qCtx.ServerMeta.ClientAddr, upFall, q.Qtype, q.Name, "timeout/error", durFall, errFall)
 	default:
 		rcodeStr := "NXDOMAIN or timeout"
 		if rFall != nil {
 			rcodeStr = dns.RcodeToString[rFall.Rcode]
 		}
-		logFallQuery(h.logger, fallRoute, qCtx.ServerMeta.ClientAddr, upFall, q.Qtype, q.Name, rcodeStr, durFall, nil)
+		logFallQuery(h.logger, route.fallRoute, qCtx.ServerMeta.ClientAddr, upFall, q.Qtype, q.Name, rcodeStr, durFall, nil)
 	}
 	if rFall != nil {
 		rcodeByteFall := byte(rFall.Rcode)
 		if fallIsNoData {
 			rcodeByteFall = pplog.RcodeNoData
 		}
-		h.pplogReport(qCtx, fallRouteByte, rcodeByteFall, durToMs(durFall), upFall, rFall)
+		h.pplogReport(qCtx, route.fallRouteByte, rcodeByteFall, durToMs(durFall), upFall, rFall)
 	} else {
-		h.pplogReport(qCtx, fallRouteByte, pplog.RcodeTimeout, durToMs(durFall), upFall, nil)
+		h.pplogReport(qCtx, route.fallRouteByte, pplog.RcodeTimeout, durToMs(durFall), upFall, nil)
 	}
-
-	return nil
 }
 
 // durToMs clamps a duration's millisecond value to uint16 range so

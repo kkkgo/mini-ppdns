@@ -246,6 +246,18 @@ func (r *Reporter) Close() error {
 	return nil
 }
 
+// shouldSkipHeartbeat reports whether the ticker callback should skip the
+// heartbeat because a recent Report() already proves liveness. Returns false
+// when lastReport is zero, in the future (wall-clock rolled back), or older
+// than interval — in those cases the heartbeat must still fire.
+func shouldSkipHeartbeat(last int64, now time.Time, interval time.Duration) bool {
+	if last <= 0 {
+		return false
+	}
+	diff := now.UnixNano() - last
+	return diff >= 0 && time.Duration(diff) < interval
+}
+
 // heartbeat periodically emits a Level-5 liveness event. If a Report() has
 // occurred within the interval, the tick is skipped — any query log already
 // proves the process is alive.
@@ -258,8 +270,7 @@ func (r *Reporter) heartbeat() {
 	for {
 		select {
 		case now := <-ticker.C:
-			last := r.lastReport.Load()
-			if last > 0 && now.Sub(time.Unix(0, last)) < interval {
+			if shouldSkipHeartbeat(r.lastReport.Load(), now, interval) {
 				continue
 			}
 			r.ReportEvent(SeverityInfo, msg)

@@ -14,10 +14,24 @@ import (
 // behind a linear scan.
 const reserveProbeCap = 16
 
+// maxConnsDefault caps how many pipelined conns a single transport
+// can hold open concurrently. Each pipelined conn already multiplexes
+// many in-flight queries (64 for TCP, 4096 for UDP), so 32 conns is
+// far beyond any realistic single-host load while still placing a
+// ceiling on runaway fan-out during transient upstream misbehavior.
+const maxConnsDefault = 32
+
 type PipelineTransport struct {
 	m      sync.Mutex
 	closed bool
 	conns  map[*lazyDnsConn]struct{}
+
+	// sem is a buffered token channel sized to maxConns. Dialing a
+	// fresh conn takes one token; a conn being removed (dead or on
+	// Close) releases one. Callers wanting to dial past the cap block
+	// on sem until a slot frees or ctx cancels.
+	sem     chan struct{}
+	closeCh chan struct{}
 
 	dialFunc         func(ctx context.Context) (DnsConn, error)
 	dialTimeout      time.Duration
@@ -38,6 +52,11 @@ type PipelineOpts struct {
 	// turns out to have a smaller limit, excess queued queries fail.
 	MaxConcurrentQueryWhileDialing int
 
+	// MaxConns caps concurrent open conns. Zero means "use the
+	// package default" (see maxConnsDefault). Negative disables the
+	// cap entirely (not recommended in production).
+	MaxConns int
+
 	Logger *mlog.Logger
 }
 
@@ -47,10 +66,19 @@ func NewPipelineTransport(opt PipelineOpts) *PipelineTransport {
 	t := &PipelineTransport{
 		conns:    make(map[*lazyDnsConn]struct{}),
 		dialFunc: opt.DialContext,
+		closeCh:  make(chan struct{}),
 	}
 	setDefaultGZ(&t.dialTimeout, opt.DialTimeout, dialTimeoutDefault)
 	setDefaultGZ(&t.maxLazyConnQueue, opt.MaxConcurrentQueryWhileDialing, lazyConnQueueDefault)
 	setNonNilLogger(&t.logger, opt.Logger)
+
+	maxConns := opt.MaxConns
+	if maxConns == 0 {
+		maxConns = maxConnsDefault
+	}
+	if maxConns > 0 {
+		t.sem = make(chan struct{}, maxConns)
+	}
 	return t
 }
 
@@ -62,7 +90,7 @@ func (t *PipelineTransport) ExchangeContext(ctx context.Context, m []byte) (*[]b
 	retry := 0
 
 	for {
-		rx, isFresh, err := t.reserveExchanger()
+		rx, isFresh, err := t.reserveExchanger(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -85,22 +113,55 @@ func (t *PipelineTransport) ExchangeContext(ctx context.Context, m []byte) (*[]b
 // ExchangeContext calls return ErrClosedTransport.
 func (t *PipelineTransport) Close() error {
 	t.m.Lock()
-	defer t.m.Unlock()
 	if t.closed {
+		t.m.Unlock()
 		return nil
 	}
 	t.closed = true
+	// Signal anyone waiting for a semaphore slot before we start
+	// closing conns, so they bail out instead of racing with
+	// teardown.
+	close(t.closeCh)
 	for c := range t.conns {
 		c.Close()
 	}
+	t.m.Unlock()
 	return nil
 }
 
+// acquireSlot takes a semaphore token, blocking until one is free
+// or ctx/close fires. Returns nil if the cap is disabled.
+func (t *PipelineTransport) acquireSlot(ctx context.Context) error {
+	if t.sem == nil {
+		return nil
+	}
+	select {
+	case t.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.closeCh:
+		return ErrClosedTransport
+	}
+}
+
+// releaseSlot returns a token to the semaphore. Must be called with
+// t.m held or in a context where the caller is certain no other
+// goroutine will try to read from an already-empty channel.
+func (t *PipelineTransport) releaseSlot() {
+	if t.sem == nil {
+		return
+	}
+	select {
+	case <-t.sem:
+	default:
+	}
+}
+
 // reserveExchanger walks existing conns looking for one with a free
-// exchange slot, dialing a new one if no existing conn has capacity.
-// The probe is bounded by reserveProbeCap so a pile of saturated-but-
-// live connections can't starve us.
-func (t *PipelineTransport) reserveExchanger() (rx ReservedExchanger, isFresh bool, err error) {
+// exchange slot, dialing a new one (subject to maxConns) if no
+// existing conn has capacity.
+func (t *PipelineTransport) reserveExchanger(ctx context.Context) (rx ReservedExchanger, isFresh bool, err error) {
 	t.m.Lock()
 	if t.closed {
 		t.m.Unlock()
@@ -113,6 +174,7 @@ func (t *PipelineTransport) reserveExchanger() (rx ReservedExchanger, isFresh bo
 		exch, dead := c.ReserveNewQuery()
 		if dead {
 			delete(t.conns, c)
+			t.releaseSlot()
 			continue
 		}
 		if exch != nil {
@@ -123,15 +185,51 @@ func (t *PipelineTransport) reserveExchanger() (rx ReservedExchanger, isFresh bo
 			break
 		}
 	}
+	t.m.Unlock()
 
-	// No capacity on any existing conn — dial a fresh one and hand the
-	// caller its first exchange slot.
+	// No capacity on any existing conn — dial a fresh one. Respect
+	// the conn cap: if we're at the limit, block until a slot opens.
+	if err := t.acquireSlot(ctx); err != nil {
+		return nil, false, err
+	}
+
+	t.m.Lock()
+	if t.closed {
+		t.m.Unlock()
+		t.releaseSlot()
+		return nil, false, ErrClosedTransport
+	}
+	// Re-probe once under the held lock: another in-flight
+	// reserveExchanger may have dialed a fresh conn while we were
+	// blocked on acquireSlot, so a reuse slot may now exist. This
+	// prevents needlessly dialing past the useful working set.
+	for c := range t.conns {
+		exch, dead := c.ReserveNewQuery()
+		if dead {
+			delete(t.conns, c)
+			t.releaseSlot()
+			continue
+		}
+		if exch != nil {
+			t.m.Unlock()
+			t.releaseSlot() // didn't dial; hand the token back
+			return exch, false, nil
+		}
+		// One re-probe attempt is enough — we already hold a token.
+		break
+	}
 	fresh := newLazyDnsConn(t.dialFunc, t.dialTimeout, t.maxLazyConnQueue, t.logger)
 	t.conns[fresh] = struct{}{}
 	exch, _ := fresh.ReserveNewQuery()
 	t.m.Unlock()
 
 	if exch == nil {
+		// Dial-newborn failed to reserve even its first slot; drop
+		// it from the map and free the semaphore token.
+		t.m.Lock()
+		delete(t.conns, fresh)
+		t.m.Unlock()
+		t.releaseSlot()
 		return nil, false, ErrNewConnCannotReserveQueryExchanger
 	}
 	return exch, true, nil

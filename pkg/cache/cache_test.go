@@ -136,3 +136,76 @@ func TestCache_DefaultOpts(t *testing.T) {
 		t.Fatalf("Get(1) = %d, %v, want 42, true", v, ok)
 	}
 }
+
+func TestCache_EvictExpiredHeap(t *testing.T) {
+	c := New[testKey, int](Opts{Size: 1024, CleanerInterval: time.Hour})
+	defer c.Close()
+
+	now := time.Now()
+	// Mix of past and future expirations, out-of-order insertion to
+	// exercise heap ordering rather than insertion order.
+	c.Store(1, 1, now.Add(-2*time.Second)) // already expired (will be filtered by Store)
+	c.Store(2, 2, now.Add(time.Hour))      // alive
+	c.Store(3, 3, now.Add(10*time.Minute)) // alive
+	c.Store(4, 4, now.Add(time.Hour*2))    // alive
+
+	// Simulate tick "slightly after now": key 1 wasn't actually stored
+	// (past exp), so the alive entries should stay untouched.
+	c.evictExpired(now.Add(time.Second))
+
+	for _, k := range []testKey{2, 3, 4} {
+		if _, _, ok := c.Get(k); !ok {
+			t.Fatalf("alive key %d missing after evict", k)
+		}
+	}
+}
+
+func TestCache_HeapStaleEntryIgnored(t *testing.T) {
+	c := New[testKey, int](Opts{Size: 1024, CleanerInterval: time.Hour})
+	defer c.Close()
+
+	base := time.Now()
+	// Store with short expiration, then immediately refresh with a
+	// longer one. The first heap entry is stale; when the janitor
+	// later pops it, it must see the refreshed (later) expiration and
+	// skip deletion instead of clobbering live data.
+	c.Store(1, 100, base.Add(50*time.Millisecond))
+	c.Store(1, 200, base.Add(time.Hour))
+
+	// Tick "after the original expiration" — the stale heap entry has
+	// key 1, exp=base+50ms; cur exp is base+1h > tick time, so evict
+	// must leave the entry alone.
+	c.evictExpired(base.Add(time.Second))
+
+	v, _, ok := c.Get(1)
+	if !ok || v != 200 {
+		t.Fatalf("after stale-heap-entry sweep: got (%d, %v), want (200, true)", v, ok)
+	}
+}
+
+func TestCache_EvictExpiredPopsInOrder(t *testing.T) {
+	c := New[testKey, int](Opts{Size: 1024, CleanerInterval: time.Hour})
+	defer c.Close()
+
+	now := time.Now()
+	// Deliberately insert with later expirations first so heap
+	// ordering (not insertion order) determines pop sequence.
+	c.Store(3, 3, now.Add(3*time.Second))
+	c.Store(1, 1, now.Add(1*time.Second))
+	c.Store(2, 2, now.Add(2*time.Second))
+	c.Store(4, 4, now.Add(time.Hour)) // alive
+
+	// Tick at now+2.5s: keys 1 and 2 must be evicted; 3 and 4 remain.
+	c.evictExpired(now.Add(2500 * time.Millisecond))
+
+	for _, k := range []testKey{1, 2} {
+		if _, _, ok := c.Get(k); ok {
+			t.Fatalf("expired key %d should have been evicted", k)
+		}
+	}
+	for _, k := range []testKey{3, 4} {
+		if _, _, ok := c.Get(k); !ok {
+			t.Fatalf("live key %d should still be in cache", k)
+		}
+	}
+}

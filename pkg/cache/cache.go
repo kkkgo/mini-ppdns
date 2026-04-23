@@ -1,6 +1,8 @@
 package cache
 
 import (
+	"container/heap"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -36,6 +38,14 @@ type Cache[K Key, V Value] struct {
 	closed      atomic.Bool
 	closeNotify chan struct{}
 	m           *concurrent_map.Map[K, *elem[V]]
+
+	// expHeap is a min-heap keyed by expirationTime so the janitor can
+	// process expired entries in O(k log N) (k = expired count) instead
+	// of walking the whole map every tick. Stale entries (from Store
+	// refreshes on an already-queued key) are filtered out at pop time
+	// by re-checking the current expiration under the shard lock.
+	heapMu  sync.Mutex
+	expHeap expHeap[K]
 }
 
 type Opts struct {
@@ -91,12 +101,15 @@ func (c *Cache[K, V]) Get(key K) (v V, expirationTime time.Time, ok bool) {
 	if !found {
 		return
 	}
-	if ev.expirationTime.After(time.Now()) {
+	now := time.Now()
+	if ev.expirationTime.After(now) {
 		return ev.v, ev.expirationTime, true
 	}
 
 	// Entry looks expired. Double-check under the shard write lock so a
-	// parallel Store isn't clobbered by our eviction.
+	// parallel Store isn't clobbered by our eviction. Reuse `now` —
+	// widening the TOCTOU window by a few microseconds has no effect on
+	// TTL semantics but avoids a second syscall.
 	var (
 		freshV   V
 		freshExp time.Time
@@ -106,7 +119,7 @@ func (c *Cache[K, V]) Get(key K) (v V, expirationTime time.Time, ok bool) {
 		if !present {
 			return nil, false, false
 		}
-		if cur.expirationTime.After(time.Now()) {
+		if cur.expirationTime.After(now) {
 			freshV, freshExp, freshOK = cur.v, cur.expirationTime, true
 			return nil, false, false
 		}
@@ -125,6 +138,7 @@ func (c *Cache[K, V]) Store(key K, v V, expirationTime time.Time) {
 	if time.Now().After(expirationTime) {
 		return
 	}
+	stored := false
 	// Re-check closed inside the shard write lock so the tiny window between
 	// Store's pre-check and Set (during which Close may have stopped the
 	// janitor) cannot leave an entry in the map with no reaper.
@@ -132,8 +146,18 @@ func (c *Cache[K, V]) Store(key K, v V, expirationTime time.Time) {
 		if c.closed.Load() {
 			return nil, false, false
 		}
+		stored = true
 		return &elem[V]{v: v, expirationTime: expirationTime}, true, false
 	})
+	if !stored {
+		return
+	}
+	// Enqueue for the janitor. A Store that updates an existing key
+	// leaves a stale heap entry with the old expiration — handled at
+	// pop time by re-checking the current expiration (see evictExpired).
+	c.heapMu.Lock()
+	heap.Push(&c.expHeap, expEntry[K]{key: key, expirationTime: expirationTime})
+	c.heapMu.Unlock()
 }
 
 // Range walks every entry, calling f for each. Returning false from f
@@ -154,6 +178,9 @@ func (c *Cache[K, V]) Len() int {
 // Flush drops every entry.
 func (c *Cache[K, V]) Flush() {
 	c.m.Flush()
+	c.heapMu.Lock()
+	c.expHeap = c.expHeap[:0]
+	c.heapMu.Unlock()
 }
 
 // janitor runs expired-entry eviction on a ticker until the cache is
@@ -174,15 +201,55 @@ func (c *Cache[K, V]) janitor(tick time.Duration) {
 	}
 }
 
-// evictExpired walks every shard under its write lock and removes
-// entries whose expiration has already passed. Done as a single pass so
-// writers are blocked only during the walk of each shard, not through a
-// separate collect+delete round.
+// evictExpired pops every heap entry whose expiration has passed and
+// removes the corresponding map entry — as long as a concurrent Store
+// hasn't refreshed the expiration meanwhile (in which case a newer
+// heap entry already covers the next eviction deadline and we leave
+// the map entry alone).
 func (c *Cache[K, V]) evictExpired(now time.Time) {
-	_ = c.m.RangeDo(func(k K, e *elem[V]) (newV *elem[V], setV, delV bool, err error) {
-		if now.After(e.expirationTime) {
-			return nil, false, true, nil
+	for {
+		c.heapMu.Lock()
+		if len(c.expHeap) == 0 || c.expHeap[0].expirationTime.After(now) {
+			c.heapMu.Unlock()
+			return
 		}
-		return nil, false, false, nil
-	})
+		top := heap.Pop(&c.expHeap).(expEntry[K])
+		c.heapMu.Unlock()
+
+		c.m.TestAndSet(top.key, func(cur *elem[V], present bool) (newV *elem[V], setV, delV bool) {
+			if !present {
+				return nil, false, false
+			}
+			// The stored expiration may have moved later due to a
+			// Store after this heap entry was queued. In that case
+			// a newer heap entry already tracks the current deadline
+			// — drop this one without touching the map.
+			if cur.expirationTime.After(now) {
+				return nil, false, false
+			}
+			return nil, false, true
+		})
+	}
+}
+
+// expEntry is one slot in the expiration min-heap.
+type expEntry[K comparable] struct {
+	key            K
+	expirationTime time.Time
+}
+
+// expHeap implements container/heap.Interface, ordering by earliest
+// expirationTime first.
+type expHeap[K comparable] []expEntry[K]
+
+func (h expHeap[K]) Len() int           { return len(h) }
+func (h expHeap[K]) Less(i, j int) bool { return h[i].expirationTime.Before(h[j].expirationTime) }
+func (h expHeap[K]) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *expHeap[K]) Push(x any)        { *h = append(*h, x.(expEntry[K])) }
+func (h *expHeap[K]) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
 }

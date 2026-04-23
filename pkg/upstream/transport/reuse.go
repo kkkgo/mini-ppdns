@@ -31,10 +31,13 @@ type ReuseConnTransport struct {
 	ctx       context.Context
 	ctxCancel context.CancelCauseFunc
 
-	mu        sync.Mutex
-	closed    bool
-	conns     map[*reusableConn]struct{}
-	idleConns map[*reusableConn]struct{}
+	mu     sync.Mutex
+	closed bool
+	conns  map[*reusableConn]struct{}
+	// idleHead is the top of an intrusive doubly-linked LIFO of idle
+	// conns. Push and pop are O(1); mid-list removal (on shutdown) is
+	// O(1) via each node's prev/next pointers instead of a map scan.
+	idleHead *reusableConn
 
 	// testWaitRespTimeout, when positive, overrides reuseConnQueryTimeout
 	// so tests can trigger the "peer went silent" path without the full
@@ -63,7 +66,6 @@ func NewReuseConnTransport(opt ReuseConnOpts) *ReuseConnTransport {
 		ctx:       ctx,
 		ctxCancel: cancel,
 		conns:     make(map[*reusableConn]struct{}),
-		idleConns: make(map[*reusableConn]struct{}),
 	}
 	setDefaultGZ(&t.dialTimeout, opt.DialTimeout, dialTimeoutDefault)
 	setDefaultGZ(&t.idleTimeout, opt.IdleTimeout, idleTimeoutDefault)
@@ -175,32 +177,66 @@ func (t *ReuseConnTransport) dialNew(ctx context.Context) (*reusableConn, error)
 	}
 }
 
-// takeAnyIdle pulls a single idle conn out of the pool, if one exists.
-// Order is unspecified (Go map iteration).
+// takeAnyIdle pops the most-recently-idled conn from the LIFO, if any.
+// O(1) under the transport mutex — the old map iteration was O(shard)
+// under the same lock and had random victim order that hurt connection
+// warmth.
 func (t *ReuseConnTransport) takeAnyIdle() (*reusableConn, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.closed {
 		return nil, ErrClosedTransport
 	}
-	for c := range t.idleConns {
-		delete(t.idleConns, c)
-		return c, nil
+	c := t.idleHead
+	if c == nil {
+		return nil, nil
 	}
-	return nil, nil
+	t.unlinkIdleLocked(c)
+	return c, nil
 }
 
-// setIdle puts c back into the idle pool, unless the transport has been
-// closed in the meantime.
+// setIdle puts c back onto the idle LIFO, unless the transport has been
+// closed in the meantime or c was already unlinked from t.conns.
 func (t *ReuseConnTransport) setIdle(c *reusableConn) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.closed {
 		return
 	}
-	if _, ok := t.conns[c]; ok {
-		t.idleConns[c] = struct{}{}
+	if _, ok := t.conns[c]; !ok {
+		return
 	}
+	if c.onIdle {
+		// Defensive: already linked — don't double-insert. Reaching
+		// this is a logic error upstream (setIdle called twice), but
+		// silently ignoring is safer than corrupting the list.
+		return
+	}
+	c.prev = nil
+	c.next = t.idleHead
+	if t.idleHead != nil {
+		t.idleHead.prev = c
+	}
+	t.idleHead = c
+	c.onIdle = true
+}
+
+// unlinkIdleLocked removes c from the idle list. Caller must hold t.mu
+// and must ensure c is currently on the list (c.onIdle == true).
+func (t *ReuseConnTransport) unlinkIdleLocked(c *reusableConn) {
+	if !c.onIdle {
+		return
+	}
+	if c.prev != nil {
+		c.prev.next = c.next
+	} else {
+		t.idleHead = c.next
+	}
+	if c.next != nil {
+		c.next.prev = c.prev
+	}
+	c.prev, c.next = nil, nil
+	c.onIdle = false
 }
 
 // Close closes the transport and every conn. Idempotent.
@@ -213,9 +249,10 @@ func (t *ReuseConnTransport) Close() error {
 	t.closed = true
 	for c := range t.conns {
 		delete(t.conns, c)
-		delete(t.idleConns, c)
+		t.unlinkIdleLocked(c)
 		c.shutdown(ErrClosedTransport, true)
 	}
+	t.idleHead = nil
 	t.ctxCancel(ErrClosedTransport)
 	return nil
 }
@@ -231,6 +268,11 @@ type reusableConn struct {
 	mu          sync.Mutex
 	waitingResp bool
 	replyCh     chan *[]byte
+
+	// onIdle, prev, next wire this conn into t.idleHead's intrusive
+	// doubly-linked list. All three fields are protected by t.mu.
+	onIdle     bool
+	prev, next *reusableConn
 
 	closeGuard sync.Once
 	closedCh   chan struct{}
@@ -335,7 +377,7 @@ func (c *reusableConn) shutdown(err error, byTransport bool) {
 	c.t.mu.Lock()
 	if !c.t.closed {
 		delete(c.t.conns, c)
-		delete(c.t.idleConns, c)
+		c.t.unlinkIdleLocked(c)
 	}
 	c.t.mu.Unlock()
 }
