@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,14 +19,33 @@ func runMockServer(t *testing.T, network, addr string) net.Listener {
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
+	var mu sync.Mutex
+	conns := make(map[net.Conn]struct{})
+	t.Cleanup(func() {
+		_ = l.Close()
+		mu.Lock()
+		for c := range conns {
+			_ = c.SetReadDeadline(time.Now())
+			_ = c.Close()
+		}
+		mu.Unlock()
+	})
 	go func() {
 		for {
 			c, err := l.Accept()
 			if err != nil {
 				return
 			}
+			mu.Lock()
+			conns[c] = struct{}{}
+			mu.Unlock()
 			go func(conn net.Conn) {
-				defer conn.Close()
+				defer func() {
+					_ = conn.Close()
+					mu.Lock()
+					delete(conns, conn)
+					mu.Unlock()
+				}()
 				for {
 					req, _, err := dnsutils.ReadMsgFromTCP(conn)
 					if err != nil {
@@ -38,10 +58,10 @@ func runMockServer(t *testing.T, network, addr string) net.Listener {
 					}
 					b := resp.Data
 					wb := pool.GetBuf(2 + len(b))
-					defer pool.ReleaseBuf(wb)
 					binary.BigEndian.PutUint16((*wb)[0:2], uint16(len(b)))
 					copy((*wb)[2:], b)
-					conn.Write(*wb)
+					_, _ = conn.Write(*wb)
+					pool.ReleaseBuf(wb)
 				}
 			}(c)
 		}
@@ -160,5 +180,54 @@ func TestPipelineTransport_Exchange(t *testing.T) {
 	resp.Unpack()
 	if resp.ID != m.ID {
 		t.Fatalf("expected id %d, got %d", m.ID, resp.ID)
+	}
+}
+
+// TestPipelineTransport_MaxConnsBackpressure verifies that reserveExchanger
+// blocks (rather than dialing unboundedly) once maxConns is reached, and
+// that a subsequent ctx cancellation releases the waiting caller.
+func TestPipelineTransport_MaxConnsBackpressure(t *testing.T) {
+	// Dial hangs forever so every reserveExchanger holds its semaphore
+	// token indefinitely. With MaxConns=1, the second caller must block
+	// in acquireSlot until ctx fires.
+	dialCh := make(chan struct{})
+	hangingDial := func(ctx context.Context) (DnsConn, error) {
+		<-dialCh
+		return nil, context.Canceled
+	}
+	tr := NewPipelineTransport(PipelineOpts{
+		DialContext: hangingDial,
+		MaxConns:    1,
+	})
+	defer func() {
+		close(dialCh)
+		tr.Close()
+	}()
+
+	// Fill the one-slot semaphore via a goroutine that will block on the
+	// hanging dial.
+	firstDone := make(chan struct{})
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, _ = tr.ExchangeContext(ctx, make([]byte, 12))
+		close(firstDone)
+	}()
+	// Let the first goroutine reach acquireSlot + dial.
+	time.Sleep(50 * time.Millisecond)
+
+	// Second caller must block on acquireSlot. Fire a short context and
+	// assert that it times out (proving back-pressure engaged) rather
+	// than succeeding by dialing a second conn.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := tr.ExchangeContext(ctx, make([]byte, 12))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("second ExchangeContext unexpectedly succeeded under MaxConns=1")
+	}
+	if elapsed < 80*time.Millisecond {
+		t.Fatalf("second call returned in %v, expected to block ~100ms", elapsed)
 	}
 }

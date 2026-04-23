@@ -1917,3 +1917,147 @@ func TestPaopaoDNS_HostsOverride(t *testing.T) {
 		t.Errorf("expected 10.10.10.53, got %s", r.Answer[0].(*dns.A).A.String())
 	}
 }
+
+// TestFallbackServfailSemantics : when main DNS returns an
+// explicit error rcode (NXDOMAIN here) that is not in trust_rcode, and the
+// fallback upstream fails entirely (timeout), the client must still receive
+// the main-DNS NXDOMAIN rather than a synthesized SERVFAIL.
+func TestFallbackServfailSemantics(t *testing.T) {
+	localAddr, localSrv, _ := mockServer(func(_ context.Context, w dns.ResponseWriter, r *dns.Msg) {
+		resp := new(dns.Msg)
+		dnsutil.SetReply(resp, r)
+		resp.Rcode = dns.RcodeNameError // NXDOMAIN
+		resp.WriteTo(w)
+	})
+	defer localSrv.Shutdown(context.Background())
+
+	// Fallback that never responds — Exec will hit qtime and return err.
+	fallAddr, fallSrv, _ := mockServer(func(_ context.Context, w dns.ResponseWriter, r *dns.Msg) {
+		time.Sleep(5 * time.Second)
+	})
+	defer fallSrv.Shutdown(context.Background())
+
+	logger, _ := mlog.NewLogger(mlog.LogConfig{Level: "error"})
+
+	uLocal, _ := upstream.NewUpstream("udp://"+localAddr, upstream.Opt{Logger: logger})
+	localFwd := &miniForwarder{
+		upstreams: []upstream.Upstream{uLocal},
+		addresses: []string{"udp://" + localAddr},
+		qtime:     time.Second,
+		logger:    logger,
+	}
+
+	uFall, _ := upstream.NewUpstream("udp://"+fallAddr, upstream.Opt{Logger: logger})
+	fallbackFwd := &miniForwarder{
+		upstreams: []upstream.Upstream{uFall},
+		addresses: []string{"udp://" + fallAddr},
+		qtime:     200 * time.Millisecond,
+		logger:    logger,
+	}
+
+	handler := &miniHandler{
+		logger:       logger,
+		localForward: localFwd,
+		cnForward:    fallbackFwd,
+		dnsCache:     cache.New[CacheKey, *dns.Msg](cache.Opts{Size: 10}),
+	}
+
+	q := new(dns.Msg)
+	dnsutil.SetQuestion(q, "nxdomain.example.", dns.TypeA)
+	ctx := query_context.NewContext(q)
+	ctx.ServerMeta.ClientAddr, _ = netip.ParseAddr("127.0.0.1")
+
+	if err := handler.process(context.Background(), ctx); err != nil {
+		t.Fatalf("process error: %v", err)
+	}
+
+	r := ctx.R()
+	if r == nil {
+		t.Fatal("expected non-nil response (main NXDOMAIN), got nil which would become SERVFAIL")
+	}
+	if r.Rcode != dns.RcodeNameError {
+		t.Fatalf("expected NXDOMAIN, got %s", dns.RcodeToString[r.Rcode])
+	}
+}
+
+// panicUpstream is a mock upstream whose ExchangeContext panics.
+type panicUpstream struct{}
+
+func (panicUpstream) ExchangeContext(ctx context.Context, m []byte) (*[]byte, error) {
+	panic("simulated upstream panic")
+}
+func (panicUpstream) Close() error { return nil }
+
+// TestMiniForwarderPanicRecover: a panicking upstream must
+// not crash the resolver process; the panic should surface as a normal error
+// through resChan.
+func TestMiniForwarderPanicRecover(t *testing.T) {
+	logger, _ := mlog.NewLogger(mlog.LogConfig{Level: "error"})
+	fwd := &miniForwarder{
+		upstreams: []upstream.Upstream{panicUpstream{}},
+		addresses: []string{"mock://panic"},
+		qtime:     time.Second,
+		logger:    logger,
+	}
+
+	q := new(dns.Msg)
+	dnsutil.SetQuestion(q, "panic.example.", dns.TypeA)
+	qc := query_context.NewContext(q)
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			t.Fatalf("Exec must not propagate upstream panic, got: %v", rec)
+		}
+	}()
+
+	r, _, _, err := fwd.Exec(context.Background(), qc)
+	if err == nil {
+		t.Fatal("expected error from panicking upstream, got nil")
+	}
+	if r != nil {
+		t.Fatalf("expected nil *dns.Msg on panic path, got %v", r)
+	}
+	if !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("expected error to mention panic, got: %v", err)
+	}
+}
+
+// TestCacheSnapshotDefensiveCopyQuestion: cacheSnapshot must
+// not share the Question slice with the original Msg, otherwise a later
+// mutation of the original could corrupt cached entries.
+func TestCacheSnapshotDefensiveCopyQuestion(t *testing.T) {
+	orig := new(dns.Msg)
+	dnsutil.SetQuestion(orig, "example.com.", dns.TypeA)
+	if len(orig.Question) == 0 {
+		t.Fatal("expected orig.Question to have at least one element")
+	}
+
+	snap := cacheSnapshot(orig)
+	if snap == nil {
+		t.Fatal("expected non-nil snapshot")
+	}
+	if len(snap.Question) != len(orig.Question) {
+		t.Fatalf("expected snapshot Question length %d, got %d", len(orig.Question), len(snap.Question))
+	}
+
+	// Mutate the original's Question slice (truncate to zero). A shared
+	// backing array would be visible on the snapshot.
+	origFirst := orig.Question[0]
+	orig.Question = orig.Question[:0]
+
+	if len(snap.Question) == 0 {
+		t.Fatal("snapshot Question was emptied by mutation of original — slice is shared")
+	}
+	if snap.Question[0] != origFirst {
+		t.Fatal("snapshot Question[0] changed identity after original mutation")
+	}
+
+	// Also verify snapshot's backing array is distinct from original's so
+	// an append into the original's slice doesn't overwrite snapshot RRs.
+	orig.Question = append(orig.Question, origFirst)
+	extra, _ := dns.New("other.example. 60 IN A 1.1.1.1")
+	orig.Question = append(orig.Question, extra)
+	if snap.Question[0] != origFirst {
+		t.Fatal("snapshot Question[0] mutated via original's append — backing array shared")
+	}
+}

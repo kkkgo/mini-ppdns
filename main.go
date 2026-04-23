@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -159,25 +160,7 @@ func main() {
 		args.Lite = "yes"
 	}
 
-	// Ensure upstreams use udp:// or tcp:// and have an explicit port.
-	// Uses net/url + net.SplitHostPort so IPv6 literals like tcp://[::1] are
-	// handled correctly (string-contains ":" would misclassify them).
-	formatUpstream := func(addr string) string {
-		addr = strings.TrimSpace(addr)
-		if !strings.Contains(addr, "://") {
-			addr = "udp://" + addr
-		}
-		u, err := url.Parse(addr)
-		if err != nil || u.Host == "" {
-			return addr
-		}
-		if _, _, err := net.SplitHostPort(u.Host); err != nil {
-			host := u.Hostname()
-			u.Host = net.JoinHostPort(host, "53")
-			addr = u.String()
-		}
-		return addr
-	}
+	formatUpstream := formatUpstreamAddr
 
 	// Setup logging
 	logLevel := "info"
@@ -520,4 +503,31 @@ func initTimezone() {
 		return
 	}
 	time.Local = time.FixedZone("UTC+8", 8*60*60)
+}
+
+// formatUpstreamAddr normalizes an upstream DNS string into a URL that
+// upstream.NewUpstream accepts: it adds udp:// when no scheme is present and
+// fills in the default port 53 when missing. Bare IP literals — including
+// unbracketed IPv6 like "::1" — take a fast path because url.Parse cannot
+// round-trip udp://::1 (RFC 3986 requires IPv6 hosts to be bracketed).
+func formatUpstreamAddr(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if !strings.Contains(addr, "://") && !strings.ContainsRune(addr, '[') {
+		if ip, err := netip.ParseAddr(addr); err == nil {
+			return "udp://" + net.JoinHostPort(ip.String(), "53")
+		}
+	}
+	if !strings.Contains(addr, "://") {
+		addr = "udp://" + addr
+	}
+	u, err := url.Parse(addr)
+	if err != nil || u.Host == "" {
+		return addr
+	}
+	if _, _, err := net.SplitHostPort(u.Host); err != nil {
+		host := u.Hostname()
+		u.Host = net.JoinHostPort(host, "53")
+		addr = u.String()
+	}
+	return addr
 }
