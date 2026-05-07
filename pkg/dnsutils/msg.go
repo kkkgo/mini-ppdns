@@ -10,10 +10,18 @@ import (
 // forEachAnswerRR walks Answer/Authority/Additional sections and calls fn
 // for every RR that carries a meaningful TTL. OPT records are skipped
 // because their "TTL" bits encode EDNS0 flags, not a cache lifetime.
+// nil m and nil RR entries are tolerated so callers don't have to guard
+// against malformed responses on the hot path.
 func forEachAnswerRR(m *dns.Msg, fn func(rr dns.RR)) {
+	if m == nil {
+		return
+	}
 	sections := [...][]dns.RR{m.Answer, m.Ns, m.Extra}
 	for _, s := range sections {
 		for _, rr := range s {
+			if rr == nil {
+				continue
+			}
 			if dns.RRToType(rr) == dns.TypeOPT {
 				continue
 			}

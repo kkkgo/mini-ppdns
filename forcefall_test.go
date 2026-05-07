@@ -30,6 +30,7 @@ func TestForceFall(t *testing.T) {
 	uFall, _ := upstream.NewUpstream("udp://"+fallAddr, upstream.Opt{Logger: logger})
 	fallbackFwd := &miniForwarder{
 		upstreams: []upstream.Upstream{uFall},
+		addresses: []string{"udp://" + fallAddr},
 		qtime:     time.Second,
 		logger:    logger,
 	}

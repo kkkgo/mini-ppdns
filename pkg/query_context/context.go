@@ -14,10 +14,6 @@ import (
 // without triggering IP fragmentation over typical MTUs.
 const ourUDPSize = 1200
 
-// edns0Size is kept as an alias of ourUDPSize so existing references
-// still resolve. New code should use ourUDPSize.
-const edns0Size = ourUDPSize
-
 // Question is a plain-value view of the DNS question section. The
 // upstream library represents the question as an RR; we copy the three
 // fields that callers actually want so they don't have to know that.

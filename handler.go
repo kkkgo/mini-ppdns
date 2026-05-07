@@ -1,11 +1,12 @@
 package main
 
 import (
-	crand "crypto/rand"
 	"context"
+	crand "crypto/rand"
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,7 +17,6 @@ import (
 	"codeberg.org/miekg/dns/rdata"
 	"github.com/kkkgo/mini-ppdns/mlog"
 	"github.com/kkkgo/mini-ppdns/pkg/cache"
-	"github.com/kkkgo/mini-ppdns/pkg/dnsutils"
 	"github.com/kkkgo/mini-ppdns/pkg/pool"
 	"github.com/kkkgo/mini-ppdns/pkg/query_context"
 	"github.com/kkkgo/mini-ppdns/pkg/server"
@@ -42,6 +42,18 @@ var randPool = sync.Pool{
 	},
 }
 
+// randPoolWarmup is the number of generators seeded at startup. A cold
+// sync.Pool would otherwise force every concurrent request in the first
+// burst through crand.Read + ChaCha8 setup on the Get path; pre-filling
+// shifts that work off the hot path and keeps the initial flood lock-free.
+const randPoolWarmup = 16
+
+func init() {
+	for i := 0; i < randPoolWarmup; i++ {
+		randPool.Put(randPool.New())
+	}
+}
+
 func getRand() *rand.Rand  { return randPool.Get().(*rand.Rand) }
 func putRand(r *rand.Rand) { randPool.Put(r) }
 
@@ -52,7 +64,14 @@ type CacheKey struct {
 }
 
 func (k CacheKey) Sum() uint64 {
-	// FNV-1a hash
+	// FNV-1a body, plus a SplitMix64 finalization. The shard picker in
+	// concurrent_map uses `Sum() % 32`, i.e. only the low 5 bits — and
+	// FNV-1a's low bits aren't fully avalanched, especially on DNS
+	// inputs where Qclass is effectively a constant (IN=1) and shared
+	// suffixes (.com.) push the divergence to the front of the hash.
+	// The finalization step is two muls and three xor-shifts: it costs
+	// ~5 ns once per cache lookup and lifts the bottom bits to good
+	// distribution without changing the hash interface.
 	var hash uint64 = 14695981039346656037
 	for i := 0; i < len(k.Name); i++ {
 		hash ^= uint64(k.Name[i])
@@ -62,7 +81,26 @@ func (k CacheKey) Sum() uint64 {
 	hash *= 1099511628211
 	hash ^= uint64(k.Qclass)
 	hash *= 1099511628211
+	hash ^= hash >> 30
+	hash *= 0xbf58476d1ce4e5b9
+	hash ^= hash >> 27
+	hash *= 0x94d049bb133111eb
+	hash ^= hash >> 31
 	return hash
+}
+
+// setReply initializes r as a reply to q. It mirrors dnsutil.SetReply but
+// also propagates the EDNS0 advertised UDP size so the wire-format
+// response carries an OPT pseudo-record whenever the query did. Per RFC
+// 6891 §6.1.1 a server MUST include OPT in responses to queries that
+// carried OPT; dnsutil.SetReply only copies the DO/CD/RD bits, leaving
+// UDPSize at zero — which suppresses OPT generation in Msg.Pack and can
+// trip strict validators or DNSSEC-aware clients on the static-rewrite
+// fast paths (AAAA/SVCB/HTTPS block, hosts/local-PTR hits, bogus-priv
+// NXDOMAIN, FORMERR, SERVFAIL synthesis).
+func setReply(r, q *dns.Msg) {
+	dnsutil.SetReply(r, q)
+	r.UDPSize = q.UDPSize
 }
 
 // lowerASCIIName returns a lower-cased copy of a DNS name, skipping the
@@ -156,12 +194,6 @@ func (f *miniForwarder) Exec(ctx context.Context, qCtx *query_context.Context) (
 		concurrent = len(f.upstreams)
 	}
 
-	resChan := make(chan res, concurrent)
-	done := make(chan struct{})
-	defer close(done)
-
-	start := time.Now()
-
 	// Pick concurrent distinct upstreams via partial Fisher-Yates shuffle (no heap allocation).
 	// Cap n at the stack array size so an oversized upstream list cannot produce out-of-range indices.
 	n := len(f.upstreams)
@@ -177,6 +209,30 @@ func (f *miniForwarder) Exec(ctx context.Context, qCtx *query_context.Context) (
 	if concurrent > n {
 		concurrent = n
 	}
+
+	// execCtx is the cancellation fan-out: once Exec commits to a response we
+	// cancel execCtx so pending ExchangeContext calls abort immediately
+	// instead of running to their own f.qtime. Derive per-call upstream
+	// contexts from it.
+	execCtx, cancel := context.WithCancel(ctx)
+
+	// resChan is sized exactly for concurrent sends (one per goroutine) so
+	// sends never block a producer — the main loop can leave early while
+	// in-flight goroutines finish cleanly.
+	resChan := make(chan res, concurrent)
+	var wg sync.WaitGroup
+
+	// Cleanup ordering (defers pop LIFO): cancel() first to wake blocked
+	// ExchangeContext calls, then wg.Wait() so every goroutine's deferred
+	// pool.ReleaseBuf completes before Exec returns. Without the wait, a
+	// caller that grabs a buffer from pool.GetBuf right after Exec returns
+	// can race the in-flight release and observe a fresh buffer — this was
+	// the root cause of the TestMiniForwarderUnpackPanicReleasesBuf flakes.
+	defer wg.Wait()
+	defer cancel()
+
+	start := time.Now()
+
 	var indices [maxUpstreams]int
 	for i := 0; i < n; i++ {
 		indices[i] = i
@@ -190,23 +246,33 @@ func (f *miniForwarder) Exec(ctx context.Context, qCtx *query_context.Context) (
 	for c := 0; c < concurrent; c++ {
 		idx := indices[c]
 		u := f.upstreams[idx]
-		addr := ""
-		if idx < len(f.addresses) {
-			addr = f.addresses[idx]
-		}
+		// upstreams and addresses are appended in lockstep at construction
+		// (main.go), so indexing is symmetric — no length divergence to guard.
+		addr := f.addresses[idx]
+		// Size the per-goroutine copy by len, not cap: queryPayload comes
+		// from pool.PackBuffer which returns a 64 KiB-backed slice
+		// regardless of message length. Asking for cap returned a 64 KiB
+		// pool bucket per concurrent goroutine to hold a ~50-byte query —
+		// 192 KiB wasted per request at default concurrency=3. Sizing by
+		// len lets pool.GetBuf pick a tight 64- or 128-byte bucket.
 		qc := func(b *[]byte) *[]byte {
-			c := pool.GetBuf(cap(*b))
-			*c = (*c)[:len(*b)]
+			n := len(*b)
+			c := pool.GetBuf(n)
+			*c = (*c)[:n]
 			copy(*c, *b)
 			return c
 		}(queryPayload)
 
+		wg.Add(1)
 		go func(up upstream.Upstream, upAddr string) {
+			defer wg.Done()
 			defer pool.ReleaseBuf(qc)
 			// Recover from upstream panics (nil-deref in transport layers,
 			// miekg/dns decode edge cases) and funnel them into resChan as a
 			// normal error. A single bad response should never crash the
-			// resolver process.
+			// resolver process. Select-default guards the pathological case
+			// where a late defer panics after the normal send has already
+			// filled the channel slot for this goroutine.
 			defer func() {
 				if rec := recover(); rec != nil {
 					if f.logger != nil {
@@ -220,32 +286,36 @@ func (f *miniForwarder) Exec(ctx context.Context, qCtx *query_context.Context) (
 						upstream: upAddr,
 						duration: time.Since(start),
 					}:
-					case <-done:
+					default:
 					}
 				}
 			}()
-			upstreamCtx, cancel := context.WithTimeout(ctx, f.qtime)
-			defer cancel()
+			upstreamCtx, uCancel := context.WithTimeout(execCtx, f.qtime)
+			defer uCancel()
 
 			var r *dns.Msg
 			respPayload, err := up.ExchangeContext(upstreamCtx, *qc)
 			dur := time.Since(start)
 			if err == nil {
+				// Defer the release so a panic inside r.Unpack (miekg/dns
+				// can panic on sufficiently pathological wire data) is caught
+				// by the outer recover() without leaking the pooled buffer.
+				// Defers run at goroutine exit — after recover — so cleanup
+				// is guaranteed on both the success and panic paths.
+				defer pool.ReleaseBuf(respPayload)
 				r = new(dns.Msg)
 				r.Data = *respPayload
 				err = r.Unpack()
-				// Clear r.Data before releasing the pooled buffer so r does
-				// not hold a dangling pointer into a reusable slice.
+				// Clear r.Data before the deferred release so r does not hold
+				// a dangling pointer into a reusable slice.
 				r.Data = nil
-				pool.ReleaseBuf(respPayload)
 				if err != nil {
 					r = nil
 				}
 			}
-			select {
-			case resChan <- res{r: r, err: err, upstream: upAddr, duration: dur}:
-			case <-done:
-			}
+			// Channel capacity equals goroutine count and each goroutine
+			// sends at most once on this path, so the send never blocks.
+			resChan <- res{r: r, err: err, upstream: upAddr, duration: dur}
 		}(u, addr)
 	}
 
@@ -281,7 +351,7 @@ func (h *miniHandler) Handle(ctx context.Context, q *dns.Msg, meta server.QueryM
 	// downstream code can assume a non-empty Question slice.
 	if len(q.Question) == 0 {
 		r := new(dns.Msg)
-		dnsutil.SetReply(r, q)
+		setReply(r, q)
 		r.Rcode = dns.RcodeFormatError
 		payload, err := packMsgPayload(r)
 		if err != nil {
@@ -299,14 +369,14 @@ func (h *miniHandler) Handle(ctx context.Context, q *dns.Msg, meta server.QueryM
 		h.logger.Debugw("query failed", mlog.Err(err))
 		if qCtx.R() == nil {
 			r := new(dns.Msg)
-			dnsutil.SetReply(r, q)
+			setReply(r, q)
 			r.Rcode = dns.RcodeServerFailure
 			qCtx.SetResponse(r)
 		}
 	} else if qCtx.R() == nil {
 		// Empty response
 		r := new(dns.Msg)
-		dnsutil.SetReply(r, q)
+		setReply(r, q)
 		r.Rcode = dns.RcodeServerFailure
 		qCtx.SetResponse(r)
 	}
@@ -319,7 +389,19 @@ func (h *miniHandler) Handle(ctx context.Context, q *dns.Msg, meta server.QueryM
 	payload, err := packMsgPayload(qCtx.R())
 	if err != nil {
 		h.logger.Warnw("failed to pack response", mlog.Err(err))
-		return nil
+		// Fall back to a synthesized SERVFAIL so the client gets an
+		// explicit error code instead of timing out. If even SERVFAIL
+		// fails to pack — implausible for a header-only message — there
+		// is nothing useful left to send.
+		sf := new(dns.Msg)
+		setReply(sf, q)
+		sf.Rcode = dns.RcodeServerFailure
+		sfPayload, sfErr := packMsgPayload(sf)
+		if sfErr != nil {
+			h.logger.Warnw("failed to pack SERVFAIL fallback", mlog.Err(sfErr))
+			return nil
+		}
+		return sfPayload
 	}
 	return payload
 }
@@ -394,53 +476,108 @@ func stablePartitionRR(s []dns.RR, pred func(dns.RR) bool) int {
 	return matches
 }
 
-// cacheSnapshot prepares a Msg for storage in the DNS cache. Answer/Ns/Extra
-// are copied into fresh backing arrays so downstream in-place operations —
-// notably shuffleAnswers in Handle — cannot reach back into cached entries.
-// RR pointers themselves are shared: RRs are treated as immutable once stored
-// (applyLiteMode already finished; fall-path TTL rewrites happen before the
-// call reaches here), and the Load path deep-clones via cloneRRsWithTTL
-// before the only remaining mutation site (the cache-hit TTL rewrite), so
-// the sharing never becomes observable. This replaces the library's
-// Msg.Copy, which is explicitly a shallow copy and would let shuffleAnswers
-// reorder the cached slice and let Load-side TTL rewrites pollute cached
-// RR headers.
-func cacheSnapshot(r *dns.Msg) *dns.Msg {
+// cacheSnapshot prepares a Msg for storage in the DNS cache and returns
+// the minimum non-OPT TTL across all sections in the same pass — folding
+// the GetMinimalTTL scan into the slice copy avoids re-walking Answer/Ns/
+// Extra at every Store call site (5 of them in this file). Caller still
+// applies the same "0 means no records / use a default" semantics as the
+// standalone helper.
+//
+// Answer/Ns/Extra/Pseudo are copied into fresh backing arrays so downstream
+// in-place operations — notably shuffleAnswers in Handle — cannot reach
+// back into cached entries. RR pointers themselves are shared: RRs are
+// treated as immutable once stored (applyLiteMode already finished;
+// fall-path TTL rewrites happen before the call reaches here), and the
+// Load path deep-clones via cloneRRsWithTTL before the only remaining
+// mutation site (the cache-hit TTL rewrite), so the sharing never becomes
+// observable. This replaces the library's Msg.Copy, which is explicitly a
+// shallow copy and would let shuffleAnswers reorder the cached slice and
+// let Load-side TTL rewrites pollute cached RR headers.
+//
+// Pseudo (the EDNS0 virtual section) is also detached: the codeberg dns
+// fork makes Pseudo a []RR distinct from Extra's OPT, and a shared slice
+// would let any future mutation on the response (e.g. EDNS option append)
+// race against concurrent cache hits.
+//
+// Data is intentionally NOT carried over: it points at a pooled wire-format
+// buffer that the caller releases after Unpack, and a stale slice header in
+// the cached Msg would be a use-after-free waiting to surface. Cached entries
+// are re-packed on the Load path anyway.
+func cacheSnapshot(r *dns.Msg) (*dns.Msg, uint32) {
 	if r == nil {
-		return nil
+		return nil, 0
 	}
 	snap := &dns.Msg{
 		MsgHeader: r.MsgHeader,
-		Pseudo:    r.Pseudo,
-		Data:      r.Data,
 	}
-	if n := len(r.Question); n > 0 {
-		snap.Question = append(make([]dns.RR, 0, n), r.Question...)
+	var (
+		minTTL   uint32
+		ttlFound bool
+	)
+	track := func(rr dns.RR) {
+		// Defensive: a malformed upstream response could in principle
+		// land a nil entry in a section. Skipping silently keeps the
+		// cache write going for the well-formed RRs around it instead
+		// of letting a panic tear down the resolve path.
+		if rr == nil {
+			return
+		}
+		if dns.RRToType(rr) == dns.TypeOPT {
+			return
+		}
+		t := rr.Header().TTL
+		if !ttlFound || t < minTTL {
+			minTTL = t
+			ttlFound = true
+		}
 	}
+	// Question is intentionally not copied: tryCacheHit always overwrites
+	// the response's Question slice with the live query's Question (to echo
+	// the client's exact case per RFC 1035 §3.1 and detach from the cached
+	// entry). Storing a copy here would be a pure waste.
 	if n := len(r.Answer); n > 0 {
 		snap.Answer = append(make([]dns.RR, 0, n), r.Answer...)
+		for _, rr := range snap.Answer {
+			track(rr)
+		}
 	}
 	if n := len(r.Ns); n > 0 {
 		snap.Ns = append(make([]dns.RR, 0, n), r.Ns...)
+		for _, rr := range snap.Ns {
+			track(rr)
+		}
 	}
 	if n := len(r.Extra); n > 0 {
 		snap.Extra = append(make([]dns.RR, 0, n), r.Extra...)
+		for _, rr := range snap.Extra {
+			track(rr)
+		}
 	}
-	return snap
+	if n := len(r.Pseudo); n > 0 {
+		snap.Pseudo = append(make([]dns.RR, 0, n), r.Pseudo...)
+	}
+	return snap, minTTL
 }
 
 // cloneRRsWithTTL returns a new slice where every RR is a deep clone with
 // its TTL field replaced. Used on the cache-hit path so the TTL rewrite
 // doesn't leak into the cached Msg that other concurrent hits are reading.
+// nil entries in src are skipped rather than panicking on rr.Clone().
 func cloneRRsWithTTL(src []dns.RR, ttl uint32) []dns.RR {
 	if len(src) == 0 {
 		return nil
 	}
-	out := make([]dns.RR, len(src))
-	for i, rr := range src {
+	out := make([]dns.RR, 0, len(src))
+	for _, rr := range src {
+		if rr == nil {
+			continue
+		}
 		c := rr.Clone()
 		c.Header().TTL = ttl
-		out[i] = c
+		out = append(out, c)
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
@@ -490,13 +627,13 @@ func (h *miniHandler) pplogReport(qCtx *query_context.Context, route byte, rcode
 // Returns the final resolved name (the last CNAME target, or startName if no chain).
 // The returned name is always lower-cased for comparison.
 func resolveCNAMEChain(answers []dns.RR, startName string) string {
-	current := strings.ToLower(startName)
+	current := lowerASCIIName(startName)
 	for range answers { // max iterations = len(answers), prevents infinite loops
 		found := false
 		for _, rr := range answers {
 			if dns.RRToType(rr) == dns.TypeCNAME &&
 				strings.EqualFold(rr.Header().Name, current) {
-				current = strings.ToLower(rr.(*dns.CNAME).Target)
+				current = lowerASCIIName(rr.(*dns.CNAME).Target)
 				found = true
 				break
 			}
@@ -508,35 +645,47 @@ func resolveCNAMEChain(answers []dns.RR, startName string) string {
 	return current
 }
 
+// keepOPTOnly compacts r.Extra in place to keep only the OPT pseudo-record.
+// Reuses the source backing array — applyLiteMode runs on a freshly-decoded
+// upstream response that nobody else aliases, so shrinking the slice header
+// is safe and avoids the per-query allocation of a `make([]dns.RR, 0, len)`
+// destination slice.
+func keepOPTOnly(s []dns.RR) []dns.RR {
+	out := s[:0]
+	for _, rr := range s {
+		if dns.RRToType(rr) == dns.TypeOPT {
+			out = append(out, rr)
+		}
+	}
+	return out
+}
+
 func (h *miniHandler) applyLiteMode(r *dns.Msg, qtype uint16, qname string) {
 	if r == nil {
 		return
 	}
 
-	// If qtype is CNAME, no chain rewriting needed -- just filter normally
+	// If qtype is CNAME, no chain rewriting needed -- just filter normally.
+	// Filter in place: r.Answer / r.Extra come from a freshly-decoded upstream
+	// Msg whose backing arrays nobody else aliases, so shrinking the slice
+	// is safe and skips the per-query make() that the previous code paid
+	// even when Answer/Extra were already small.
 	if qtype == dns.TypeCNAME {
-		// Keep only CNAME records (matching qtype)
-		filteredAns := make([]dns.RR, 0, len(r.Answer))
+		ans := r.Answer[:0]
 		for _, rr := range r.Answer {
 			if dns.RRToType(rr) == qtype {
-				filteredAns = append(filteredAns, rr)
+				ans = append(ans, rr)
 			}
 		}
-		r.Answer = filteredAns
-		r.Ns = nil
-		filteredExtra := make([]dns.RR, 0, len(r.Extra))
-		for _, rr := range r.Extra {
-			if dns.RRToType(rr) == dns.TypeOPT {
-				filteredExtra = append(filteredExtra, rr)
-			}
-		}
-		r.Extra = filteredExtra
+		r.Answer = ans
+		r.Ns = filterSOA(r.Ns)
+		r.Extra = keepOPTOnly(r.Extra)
 		return
 	}
 
 	// Follow CNAME chain to find the final resolved name
 	finalName := resolveCNAMEChain(r.Answer, qname)
-	qnameLower := strings.ToLower(qname)
+	qnameLower := lowerASCIIName(qname)
 
 	// Check if chain actually resolved (finalName differs from qname means CNAMEs exist)
 	// and that there are matching qtype records at the chain's end
@@ -555,7 +704,7 @@ func (h *miniHandler) applyLiteMode(r *dns.Msg, qtype uint16, qname string) {
 		}
 	}
 
-	filteredAns := make([]dns.RR, 0, len(r.Answer))
+	ans := r.Answer[:0]
 	for _, rr := range r.Answer {
 		if dns.RRToType(rr) == qtype {
 			if hasChain {
@@ -565,18 +714,37 @@ func (h *miniHandler) applyLiteMode(r *dns.Msg, qtype uint16, qname string) {
 				}
 				rr.Header().Name = qname
 			}
-			filteredAns = append(filteredAns, rr)
+			ans = append(ans, rr)
 		}
 	}
-	r.Answer = filteredAns
-	r.Ns = nil
-	filteredExtra := make([]dns.RR, 0, len(r.Extra))
-	for _, rr := range r.Extra {
-		if dns.RRToType(rr) == dns.TypeOPT {
-			filteredExtra = append(filteredExtra, rr)
+	r.Answer = ans
+	r.Ns = filterSOA(r.Ns)
+	r.Extra = keepOPTOnly(r.Extra)
+}
+
+// filterSOA returns the subset of ns containing only SOA records, in a
+// fresh slice so callers can replace ns without aliasing into the
+// original (possibly cached) backing array.
+//
+// Lite mode previously cleared Ns wholesale, which stripped the SOA from
+// NXDOMAIN/NODATA responses — clients lose RFC 2308 negative-cache TTLs
+// and DNSSEC validators lose authority chain proof. SOA is small and
+// non-redundant; keeping just it preserves protocol conformance while
+// dropping the rest of the typical "thin response" noise.
+func filterSOA(ns []dns.RR) []dns.RR {
+	if len(ns) == 0 {
+		return nil
+	}
+	var out []dns.RR
+	for _, rr := range ns {
+		if dns.RRToType(rr) == dns.TypeSOA {
+			if out == nil {
+				out = make([]dns.RR, 0, 1)
+			}
+			out = append(out, rr)
 		}
 	}
-	r.Extra = filteredExtra
+	return out
 }
 
 // requestRoute captures the routing decision for a single query:
@@ -615,19 +783,37 @@ func (h *miniHandler) tryStaticRewrite(qCtx *query_context.Context) bool {
 
 	// Reject AAAA, SVCB, HTTPS queries
 	if q.Qtype == dns.TypeSVCB || q.Qtype == dns.TypeHTTPS || (h.aaaaMode == "no" && q.Qtype == dns.TypeAAAA) {
-		if h.aaaaMode == "no" && q.Qtype == dns.TypeAAAA {
-			logQuery(h.logger, &queryLog{
-				route:  "block",
-				client: qCtx.ServerMeta.ClientAddr,
-				qtype:  q.Qtype,
-				domain: q.Name,
-				rcode:  "BLOCKED",
-			})
+		// Pick a route label so debug logs and pplog telemetry line up with
+		// the hosts/local-ptr/bogus-priv paths instead of disappearing
+		// silently. SVCB and HTTPS were previously logged nowhere, and the
+		// AAAA block had a debug log but no pplog entry.
+		var routeLabel, upstreamLabel string
+		switch q.Qtype {
+		case dns.TypeSVCB:
+			routeLabel = "block-svcb"
+			upstreamLabel = "block-svcb"
+		case dns.TypeHTTPS:
+			routeLabel = "block-https"
+			upstreamLabel = "block-https"
+		default: // AAAA block
+			routeLabel = "block"
+			upstreamLabel = "block-aaaa"
 		}
+		logQuery(h.logger, &queryLog{
+			route:  routeLabel,
+			client: qCtx.ServerMeta.ClientAddr,
+			qtype:  q.Qtype,
+			domain: q.Name,
+			rcode:  "BLOCKED",
+		})
 		r := new(dns.Msg)
-		dnsutil.SetReply(r, qCtx.Q())
+		setReply(r, qCtx.Q())
 		r.Rcode = dns.RcodeSuccess
 		qCtx.SetResponse(r)
+		// Empty NOERROR is reported as RcodeNoData (matches execLocal's
+		// NODATA path), routed under RouteHosts since this is a local
+		// static decision.
+		h.pplogReport(qCtx, pplog.RouteHosts, pplog.RcodeNoData, 0, upstreamLabel, r)
 		return true
 	}
 
@@ -635,7 +821,7 @@ func (h *miniHandler) tryStaticRewrite(qCtx *query_context.Context) bool {
 	if (q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA) && h.ptrResolver != nil {
 		if ips := h.ptrResolver.LookupIP(q.Name); len(ips) > 0 {
 			r := new(dns.Msg)
-			dnsutil.SetReply(r, qCtx.Q())
+			setReply(r, qCtx.Q())
 			r.Rcode = dns.RcodeSuccess
 			for _, ip := range ips {
 				if q.Qtype == dns.TypeA && ip.To4() != nil {
@@ -671,7 +857,7 @@ func (h *miniHandler) tryStaticRewrite(qCtx *query_context.Context) bool {
 	if q.Qtype == dns.TypePTR && h.ptrResolver != nil {
 		if hostname := h.ptrResolver.Lookup(q.Name); hostname != "" {
 			r := new(dns.Msg)
-			dnsutil.SetReply(r, qCtx.Q())
+			setReply(r, qCtx.Q())
 			r.Rcode = dns.RcodeSuccess
 			ptrRR := &dns.PTR{
 				Hdr: dns.Header{
@@ -697,7 +883,7 @@ func (h *miniHandler) tryStaticRewrite(qCtx *query_context.Context) bool {
 		// bogus-priv: private PTR not found locally -> NXDOMAIN, don't forward upstream
 		if h.bogusPriv && isPrivatePTR(q.Name) {
 			r := new(dns.Msg)
-			dnsutil.SetReply(r, qCtx.Q())
+			setReply(r, qCtx.Q())
 			r.Rcode = dns.RcodeNameError
 			qCtx.SetResponse(r)
 			logQuery(h.logger, &queryLog{
@@ -714,7 +900,7 @@ func (h *miniHandler) tryStaticRewrite(qCtx *query_context.Context) bool {
 	// bogus-priv without ptrResolver: still block private PTR from going upstream
 	if q.Qtype == dns.TypePTR && h.bogusPriv && h.ptrResolver == nil && isPrivatePTR(q.Name) {
 		r := new(dns.Msg)
-		dnsutil.SetReply(r, qCtx.Q())
+		setReply(r, qCtx.Q())
 		r.Rcode = dns.RcodeNameError
 		qCtx.SetResponse(r)
 		h.logger.Debugw("bogus-priv",
@@ -786,13 +972,30 @@ func (h *miniHandler) tryCacheHit(qCtx *query_context.Context, cacheKey CacheKey
 	// by pointer and slice headers point into the same backing arrays.
 	// Deep-clone each RR into a fresh slice so the TTL rewrite below and
 	// the downstream shuffleAnswers cannot mutate the cached entry (which
-	// concurrent hits may be reading). Question/Pseudo/Data are treated
-	// as immutable after Store and shared by reference.
+	// concurrent hits may be reading).
+	//
+	// Question echoes the client's actual query rather than the cached
+	// response's Question. This both (a) preserves the client's case
+	// (RFC 1035 §3.1: domain names are case-insensitive but case-
+	// preserving — clients that asked "Example.COM." should see
+	// "Example.COM." echoed back, not whatever form the upstream used),
+	// and (b) structurally prevents any future in-response Question
+	// mutation from reaching back into the cached entry. Pseudo's slice
+	// header is detached from the cached one (RR pointers stay shared
+	// since EDNS option RRs are treated as immutable like the rest);
+	// without the detach, two concurrent cache hits would alias the same
+	// backing array and a future feature that appends to resp.Pseudo
+	// would silently mutate every other in-flight response. Data is
+	// intentionally absent on the cached entry (cacheSnapshot drops it),
+	// so the response gets re-packed on the way out.
+	var pseudo []dns.RR
+	if n := len(cachedMsg.Pseudo); n > 0 {
+		pseudo = append(make([]dns.RR, 0, n), cachedMsg.Pseudo...)
+	}
 	resp := &dns.Msg{
 		MsgHeader: cachedMsg.MsgHeader,
-		Question:  cachedMsg.Question,
-		Pseudo:    cachedMsg.Pseudo,
-		Data:      cachedMsg.Data,
+		Question:  qCtx.Q().Question,
+		Pseudo:    pseudo,
 		Answer:    cloneRRsWithTTL(cachedMsg.Answer, ttlLeft),
 		Ns:        cloneRRsWithTTL(cachedMsg.Ns, ttlLeft),
 		Extra:     cloneExtraWithTTL(cachedMsg.Extra, ttlLeft),
@@ -805,6 +1008,12 @@ func (h *miniHandler) tryCacheHit(qCtx *query_context.Context, cacheKey CacheKey
 		rcodeLabel = "NODATA"
 	} else if resp.Rcode != dns.RcodeSuccess {
 		rcodeLabel = dns.RcodeToString[resp.Rcode]
+		// Future-allocated or extended rcodes are absent from the table
+		// and would otherwise log as an empty string. Surface the numeric
+		// value so ops can identify the unknown code.
+		if rcodeLabel == "" {
+			rcodeLabel = "RCODE_" + strconv.Itoa(int(resp.Rcode))
+		}
 	}
 	logQuery(h.logger, &queryLog{
 		route:  "cache",
@@ -813,7 +1022,15 @@ func (h *miniHandler) tryCacheHit(qCtx *query_context.Context, cacheKey CacheKey
 		domain: q.Name,
 		rcode:  rcodeLabel,
 	})
-	h.pplogReport(qCtx, pplog.RouteCache, byte(resp.Rcode), 0, "", resp)
+	// Mirror execLocal's rcode encoding: NOERROR + empty Answer is reported
+	// as the synthetic RcodeNoData (0xFF). Without this, the same NODATA
+	// response shows up as rcode=0 on cache hits and rcode=0xFF on misses,
+	// breaking pplog aggregation.
+	rcodeByte := byte(resp.Rcode)
+	if resp.Rcode == dns.RcodeSuccess && len(resp.Answer) == 0 {
+		rcodeByte = pplog.RcodeNoData
+	}
+	h.pplogReport(qCtx, pplog.RouteCache, rcodeByte, 0, "", resp)
 	return true
 }
 
@@ -844,11 +1061,11 @@ func (h *miniHandler) execLocal(ctx context.Context, qCtx *query_context.Context
 	// response directly (even without answer records) and skip fallback.
 	if len(h.trustRcodes) > 0 && h.trustRcodes[int(r.Rcode)] {
 		qCtx.SetResponse(r)
-		ttl := dnsutils.GetMinimalTTL(r)
+		snap, ttl := cacheSnapshot(r)
 		if ttl == 0 {
 			ttl = 1
 		}
-		h.dnsCache.Store(cacheKey, cacheSnapshot(r), time.Now().Add(time.Duration(ttl)*time.Second))
+		h.dnsCache.Store(cacheKey, snap, time.Now().Add(time.Duration(ttl)*time.Second))
 		rcodeLabel := dns.RcodeToString[r.Rcode]
 		if len(r.Answer) == 0 {
 			rcodeLabel += "(trusted)"
@@ -863,10 +1080,17 @@ func (h *miniHandler) execLocal(ctx context.Context, qCtx *query_context.Context
 	}
 	if r.Rcode == dns.RcodeSuccess && len(r.Answer) > 0 {
 		qCtx.SetResponse(r)
-		ttl := dnsutils.GetMinimalTTL(r)
-		if ttl > 0 {
-			h.dnsCache.Store(cacheKey, cacheSnapshot(r), time.Now().Add(time.Duration(ttl)*time.Second))
+		snap, ttl := cacheSnapshot(r)
+		// Mirror the trust_rcode / aaaa=noerror / fallback branches: a
+		// TTL of 0 (some CDN/dynamic-DNS upstreams) still gets a 1-second
+		// floor so an immediately-retried query doesn't re-traverse the
+		// full upstream pipeline. The previous "skip cache when ttl==0"
+		// behavior produced inconsistent hit rates depending on which
+		// branch served the response.
+		if ttl == 0 {
+			ttl = 1
 		}
+		h.dnsCache.Store(cacheKey, snap, time.Now().Add(time.Duration(ttl)*time.Second))
 		logLocalQuery(h.logger, qCtx.ServerMeta.ClientAddr, upstreamUsed, q.Qtype, q.Name, "NOERROR", queryDur, nil)
 		h.pplogReport(qCtx, pplog.RouteLocal, byte(r.Rcode), durToMs(queryDur), upstreamUsed, r)
 		return nil, nil, true
@@ -876,11 +1100,11 @@ func (h *miniHandler) execLocal(ctx context.Context, qCtx *query_context.Context
 		// skip fallback. Cache with original TTL (or TTL=1 if no NS record TTL).
 		if h.aaaaMode == "noerror" && q.Qtype == dns.TypeAAAA {
 			qCtx.SetResponse(r)
-			ttl := dnsutils.GetMinimalTTL(r)
+			snap, ttl := cacheSnapshot(r)
 			if ttl == 0 {
 				ttl = 1
 			}
-			h.dnsCache.Store(cacheKey, cacheSnapshot(r), time.Now().Add(time.Duration(ttl)*time.Second))
+			h.dnsCache.Store(cacheKey, snap, time.Now().Add(time.Duration(ttl)*time.Second))
 			logLocalQuery(h.logger, qCtx.ServerMeta.ClientAddr, upstreamUsed, q.Qtype, q.Name, "NODATA(trusted)", queryDur, nil)
 			h.pplogReport(qCtx, pplog.RouteLocal, pplog.RcodeNoData, durToMs(queryDur), upstreamUsed, r)
 			return nil, nil, true
@@ -917,10 +1141,16 @@ func (h *miniHandler) execFallbackAndFinalize(ctx context.Context, qCtx *query_c
 			h.applyLiteMode(localNoData, q.Qtype, q.Name)
 		}
 		qCtx.SetResponse(localNoData)
-		ttl := dnsutils.GetMinimalTTL(localNoData)
-		if ttl > 0 {
-			h.dnsCache.Store(cacheKey, cacheSnapshot(localNoData), time.Now().Add(time.Duration(ttl)*time.Second))
+		snap, ttl := cacheSnapshot(localNoData)
+		// Match the trust_rcode and aaaa=noerror branches: a NODATA reply
+		// without an SOA in Authority has no minimum TTL, but we still
+		// want it cached for at least one second so an immediately-retried
+		// query doesn't re-traverse the upstream pipeline. Without this
+		// floor, NODATA responses missing an SOA silently bypass the cache.
+		if ttl == 0 {
+			ttl = 1
 		}
+		h.dnsCache.Store(cacheKey, snap, time.Now().Add(time.Duration(ttl)*time.Second))
 	} else if rFall != nil {
 		if h.lite {
 			h.applyLiteMode(rFall, q.Qtype, q.Name)
@@ -941,7 +1171,8 @@ func (h *miniHandler) execFallbackAndFinalize(ctx context.Context, qCtx *query_c
 				ext.Header().TTL = fallbackTTL
 			}
 		}
-		h.dnsCache.Store(cacheKey, cacheSnapshot(qCtx.R()), time.Now().Add(time.Duration(fallbackTTL)*time.Second))
+		snap, _ := cacheSnapshot(qCtx.R())
+		h.dnsCache.Store(cacheKey, snap, time.Now().Add(time.Duration(fallbackTTL)*time.Second))
 	} else if errFall != nil && localResp != nil {
 		// Fallback failed entirely (timeout / network error). Surface the
 		// main-DNS response that was logged earlier (NXDOMAIN/REFUSED/NODATA)
@@ -951,11 +1182,11 @@ func (h *miniHandler) execFallbackAndFinalize(ctx context.Context, qCtx *query_c
 			h.applyLiteMode(localResp, q.Qtype, q.Name)
 		}
 		qCtx.SetResponse(localResp)
-		ttl := dnsutils.GetMinimalTTL(localResp)
+		snap, ttl := cacheSnapshot(localResp)
 		if ttl == 0 {
 			ttl = 1
 		}
-		h.dnsCache.Store(cacheKey, cacheSnapshot(localResp), time.Now().Add(time.Duration(ttl)*time.Second))
+		h.dnsCache.Store(cacheKey, snap, time.Now().Add(time.Duration(ttl)*time.Second))
 	}
 
 	switch {

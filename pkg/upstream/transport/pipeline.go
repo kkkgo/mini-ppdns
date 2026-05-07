@@ -199,11 +199,16 @@ func (t *PipelineTransport) reserveExchanger(ctx context.Context) (rx ReservedEx
 		t.releaseSlot()
 		return nil, false, ErrClosedTransport
 	}
-	// Re-probe once under the held lock: another in-flight
-	// reserveExchanger may have dialed a fresh conn while we were
-	// blocked on acquireSlot, so a reuse slot may now exist. This
-	// prevents needlessly dialing past the useful working set.
+	// Re-probe under the held lock: another in-flight reserveExchanger
+	// may have dialed a fresh conn while we were blocked on
+	// acquireSlot, so a reuse slot may now exist. Cap the probe count
+	// at reserveProbeCap (Go's randomized map iteration would otherwise
+	// let one full conn shadow many idle ones — when only one randomly
+	// picked conn was checked, dialing past the useful working set was
+	// the common outcome under load).
+	reprobes := 0
 	for c := range t.conns {
+		reprobes++
 		exch, dead := c.ReserveNewQuery()
 		if dead {
 			delete(t.conns, c)
@@ -215,8 +220,9 @@ func (t *PipelineTransport) reserveExchanger(ctx context.Context) (rx ReservedEx
 			t.releaseSlot() // didn't dial; hand the token back
 			return exch, false, nil
 		}
-		// One re-probe attempt is enough — we already hold a token.
-		break
+		if reprobes >= reserveProbeCap {
+			break
+		}
 	}
 	fresh := newLazyDnsConn(t.dialFunc, t.dialTimeout, t.maxLazyConnQueue, t.logger)
 	t.conns[fresh] = struct{}{}
@@ -225,10 +231,13 @@ func (t *PipelineTransport) reserveExchanger(ctx context.Context) (rx ReservedEx
 
 	if exch == nil {
 		// Dial-newborn failed to reserve even its first slot; drop
-		// it from the map and free the semaphore token.
+		// it from the map, free the semaphore token, and Close the
+		// lazy conn so the in-flight dial goroutine cannot orphan a
+		// freshly-opened socket once it completes.
 		t.m.Lock()
 		delete(t.conns, fresh)
 		t.m.Unlock()
+		fresh.Close()
 		t.releaseSlot()
 		return nil, false, ErrNewConnCannotReserveQueryExchanger
 	}

@@ -27,17 +27,18 @@ const (
 
 var byteBuckets [bucketCount]sync.Pool
 
-// sharedEmpty is returned for GetBuf(0) so the zero-size fast path never
-// allocates. Callers are contractually forbidden from appending to it;
-// ReleaseBuf ignores zero-cap buffers so no aliasing ever leaks back.
-var sharedEmpty = make([]byte, 0)
-
 // GetBuf returns a *[]byte of length `size`. The backing array is rounded
 // up to the next power of two within the bucket range; oversize requests
 // fall back to a plain allocation so the pools don't grow unbounded.
 func GetBuf(size int) *[]byte {
 	if size <= 0 {
-		b := sharedEmpty
+		// Each call gets an independent zero-length slice header. A previous
+		// version returned a pointer to a package-global empty slice; if any
+		// caller violated the "do not append" contract, the global's backing
+		// array would be inflated and shared across goroutines. ReleaseBuf
+		// already ignores zero-cap buffers, so the per-call allocation here
+		// only costs a slice header (no backing array).
+		b := []byte(nil)
 		return &b
 	}
 	idx := bucketIndexFor(size)

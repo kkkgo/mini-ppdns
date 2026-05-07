@@ -39,6 +39,20 @@ type UDPServerOpts struct {
 	MaxConcurrent int
 }
 
+// safeUnpack wraps q.Unpack() so a panic in the decoder surfaces as a
+// recovered value instead of unwinding the UDP read loop. Return conventions:
+// (nil, err) for a normal decode failure, (rec, nil) for a panic, (nil, nil)
+// for success. error is last per Go convention (staticcheck ST1008).
+func safeUnpack(q *dns.Msg) (panicVal any, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			panicVal = rec
+		}
+	}()
+	err = q.Unpack()
+	return
+}
+
 // ServeUDP runs a DNS UDP server on c until c returns a non-recoverable
 // read error (typically: c.Close from another goroutine). Clean shutdown
 // via c.Close returns nil.
@@ -72,7 +86,16 @@ func ServeUDP(c *net.UDPConn, h Handler, opts UDPServerOpts) error {
 	// retried anyway.
 	sem := make(chan struct{}, maxConc)
 
-	rxBuf := pool.GetBuf(dns.MaxMsgSize)
+	// rxBufSize bounds incoming DNS queries. Real-world clients keep
+	// queries well under 1 KiB; EDNS0's UDP payload negotiation (RFC
+	// 9715) recommends 4 KiB as the upper bound. dns.MaxMsgSize (64
+	// KiB) was 16× larger than necessary and pulled a 64 KiB bucket out
+	// of the pool every time. dns.DefaultMsgSize trips one bucket-12
+	// (4 KiB) — same throughput, far less memory churn under load, and
+	// any over-sized datagram still surfaces as MSG_TRUNC → unpack
+	// error → "invalid msg" warn, which is the only sensible response
+	// to a >4 KiB DNS query anyway.
+	rxBuf := pool.GetBuf(dns.DefaultMsgSize)
 	defer pool.ReleaseBuf(rxBuf)
 
 	var oobSlice []byte
@@ -100,8 +123,18 @@ func ServeUDP(c *net.UDPConn, h Handler, opts UDPServerOpts) error {
 
 		q := new(dns.Msg)
 		q.Data = (*rxBuf)[:n]
-		if err := q.Unpack(); err != nil {
-			logger.Warnw("invalid msg", mlog.Err(err), mlog.Stringer("from", remote))
+		// miekg/dns Unpack has historically panicked on pathological wire
+		// data (out-of-range offsets in compression pointers, malformed
+		// EDNS0 option lengths, etc.). A single hostile datagram must not
+		// tear down the listener, so funnel panics into the same log path
+		// as a plain parse error.
+		unpackPanic, unpackErr := safeUnpack(q)
+		if unpackPanic != nil {
+			logger.Errorw("unpack panic", mlog.String("recover", fmt.Sprint(unpackPanic)), mlog.Stringer("from", remote))
+			continue
+		}
+		if unpackErr != nil {
+			logger.Warnw("invalid msg", mlog.Err(unpackErr), mlog.Stringer("from", remote))
 			continue
 		}
 		// rxBuf is reused on the next iteration; detach the pointer so

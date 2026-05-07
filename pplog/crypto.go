@@ -14,11 +14,10 @@ type Cipher struct {
 	aead      cipher.AEAD
 	keyHint   [4]byte // SHA-256(UUID)[0:4]
 	sessionID [8]byte // random per startup (8 bytes for collision resistance)
-	seq       uint32  // not used here; Reporter manages seq
 }
 
 // NewCipher creates a new Cipher from a 16-byte UUID.
-// Key = SHA-256(UUID_bytes), sessionID = 4 random bytes.
+// Key = SHA-256(UUID_bytes), sessionID = 8 random bytes.
 func NewCipher(uuid [16]byte) (*Cipher, error) {
 	hash := sha256.Sum256(uuid[:])
 

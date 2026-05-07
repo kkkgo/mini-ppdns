@@ -119,21 +119,36 @@ func ReadMsgFromUDP(c io.Reader, bufSize int) (*dns.Msg, int, error) {
 
 // readLenHdr pulls the two-byte big-endian length prefix from a TCP frame.
 func readLenHdr(r io.Reader) (uint16, error) {
-	hdr := pool.GetBuf(2)
-	defer pool.ReleaseBuf(hdr)
-	if _, err := io.ReadFull(r, *hdr); err != nil {
+	// Stack buffer: a 2-byte allocation has no business going through
+	// sync.Pool. The pool path forced a power-of-2 bucket lookup and a
+	// pool Put on every TCP message header, with no GC benefit at this
+	// size.
+	var hdr [2]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return 0, err
 	}
-	return binary.BigEndian.Uint16(*hdr), nil
+	return binary.BigEndian.Uint16(hdr[:]), nil
 }
 
-// unpackWireMsg parses raw wire bytes. On failure the error includes the
-// hex dump so callers looking at logs can reproduce the issue.
+// maxUnpackErrDump caps how much of a malformed wire payload we hex-dump
+// into the error message. A 64 KiB attack packet would otherwise inflate
+// the formatted error to a 128 KiB string, multiplied across every log
+// site that ends up rendering err.Error() — easy memory amplification on
+// repeated bad input.
+const maxUnpackErrDump = 64
+
+// unpackWireMsg parses raw wire bytes. On failure the error includes a
+// truncated hex dump so callers looking at logs can reproduce the issue
+// without paying for the full payload's hex expansion.
 func unpackWireMsg(raw []byte) (*dns.Msg, error) {
 	m := new(dns.Msg)
 	m.Data = raw
 	if err := m.Unpack(); err != nil {
-		return nil, fmt.Errorf("dnsutils: unpack failed for %x: %w", raw, err)
+		head := raw
+		if len(head) > maxUnpackErrDump {
+			head = head[:maxUnpackErrDump]
+		}
+		return nil, fmt.Errorf("dnsutils: unpack failed for %x (len=%d): %w", head, len(raw), err)
 	}
 	return m, nil
 }

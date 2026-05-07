@@ -23,6 +23,13 @@ func TestFormatUpstreamAddr(t *testing.T) {
 		{"scheme_domain_with_port", "udp://dns.example.com:5353", "udp://dns.example.com:5353"},
 		{"tcp_scheme_ipv4", "tcp://1.1.1.1", "tcp://1.1.1.1:53"},
 		{"whitespace_trim", "  8.8.8.8  ", "udp://8.8.8.8:53"},
+		// Issue: unbracketed IPv6 after a scheme must be bracketed so
+		// url.Parse can round-trip it instead of handing back ":" via
+		// Hostname() and producing addresses like "[:]:53".
+		{"scheme_unbracketed_ipv6_loopback", "udp://::1", "udp://[::1]:53"},
+		{"scheme_unbracketed_ipv6_linklocal", "udp://fe80::1", "udp://[fe80::1]:53"},
+		{"scheme_unbracketed_ipv6_doc", "udp://2001:db8::1", "udp://[2001:db8::1]:53"},
+		{"tcp_scheme_unbracketed_ipv6", "tcp://::1", "tcp://[::1]:53"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -61,5 +68,34 @@ func TestLowerASCIIName_AllLowerSharesBacking(t *testing.T) {
 	in := "example.com."
 	if got := lowerASCIIName(in); got != in {
 		t.Fatalf("expected identity on already-lowercase input, got %q", got)
+	}
+}
+
+func TestIsDaemonFlagArg(t *testing.T) {
+	// Any -d variant that Go's flag package accepts must be stripped so a
+	// re-fork of the daemon cannot recursively fork. The false-value forms
+	// never enter the daemon branch anyway, but we strip them too for
+	// consistency and defense-in-depth.
+	stripped := []string{
+		"-d", "--d",
+		"-d=true", "-d=True", "-d=TRUE", "-d=t", "-d=T", "-d=1",
+		"-d=false", "-d=False", "-d=FALSE", "-d=f", "-d=F", "-d=0",
+		"--d=true", "--d=1", "--d=0", "--d=false",
+	}
+	for _, arg := range stripped {
+		if !isDaemonFlagArg(arg) {
+			t.Errorf("isDaemonFlagArg(%q) = false, want true", arg)
+		}
+	}
+	// Flags with a -d prefix but a different name must NOT be stripped.
+	kept := []string{
+		"-dns", "-dns=8.8.8.8", "-debug", "-debug=true",
+		"--dns", "--debug",
+		"-daemon", "-d-extra", "-", "",
+	}
+	for _, arg := range kept {
+		if isDaemonFlagArg(arg) {
+			t.Errorf("isDaemonFlagArg(%q) = true, want false", arg)
+		}
 	}
 }

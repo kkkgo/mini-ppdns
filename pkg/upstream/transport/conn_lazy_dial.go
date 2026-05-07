@@ -133,6 +133,14 @@ type lazyDnsConnEarlyReservedExchanger lazyDnsConn
 var _ ReservedExchanger = (*lazyDnsConnEarlyReservedExchanger)(nil)
 
 func (ote *lazyDnsConnEarlyReservedExchanger) ExchangeReserved(ctx context.Context, q []byte) (resp *[]byte, err error) {
+	// earlyReserveCallWg.Done() must run on every return path — including the
+	// dial-error early return below and any panic from dc.ReserveNewQuery
+	// (miekg/dns has a history of panics on pathological wire data). If Done
+	// were skipped, a later ReserveNewQuery on this lazyDnsConn would block
+	// forever on earlyReserveCallWg.Wait, deadlocking every future query on
+	// this transport. The mu/reservedQuery defer is layered separately so its
+	// ordering with Done is unambiguous (LIFO: Done first, then mu unlock).
+	defer ote.earlyReserveCallWg.Done()
 	defer func() {
 		ote.mu.Lock()
 		ote.reservedQuery--
@@ -141,7 +149,6 @@ func (ote *lazyDnsConnEarlyReservedExchanger) ExchangeReserved(ctx context.Conte
 
 	select {
 	case <-ctx.Done():
-		ote.earlyReserveCallWg.Done()
 		return nil, context.Cause(ctx)
 	case <-ote.dialFinished:
 		dc, err := ote.c, ote.dialErr
@@ -149,7 +156,6 @@ func (ote *lazyDnsConnEarlyReservedExchanger) ExchangeReserved(ctx context.Conte
 			return nil, err
 		}
 		rec, _ := dc.ReserveNewQuery()
-		ote.earlyReserveCallWg.Done()
 		if rec == nil {
 			return nil, ErrLazyConnCannotReserveQueryExchanger
 		}
