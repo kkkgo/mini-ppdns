@@ -61,13 +61,28 @@ func parseINI(filename string, m *ConfigArgs, logger *mlog.Logger) error {
 	// [hosts] entry with many aliases doesn't trip ErrTooLong.
 	scanner.Buffer(make([]byte, 64*1024), 1<<20)
 	section := ""
+	firstLine := true
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		line := scanner.Text()
+		if firstLine {
+			// Strip a UTF-8 BOM (\xEF\xBB\xBF) if present. Windows editors
+			// (Notepad, default save-as-UTF-8) prepend it, which would
+			// otherwise turn the first line "[hosts]" into something like
+			// "\xEF\xBB\xBF[hosts]" and cause the section to silently fail
+			// the bracket check below — every following entry would land
+			// in the empty-section bucket and be ignored.
+			line = strings.TrimPrefix(line, "\xef\xbb\xbf")
+			firstLine = false
+		}
+		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = strings.Trim(line, "[]")
+			// Strip exactly one bracket from each side. strings.Trim would
+			// chew through any number of [ or ] on either end, silently
+			// accepting typos like [[hosts]] as the section "hosts".
+			section = line[1 : len(line)-1]
 			continue
 		}
 
@@ -110,7 +125,8 @@ func parseINI(filename string, m *ConfigArgs, logger *mlog.Logger) error {
 						}
 					}
 				case "boguspriv":
-					m.BogusPriv = v == "1" || v == "yes" || v == "true"
+					lv := strings.ToLower(v)
+					m.BogusPriv = lv == "1" || lv == "yes" || lv == "true"
 					m.BogusPrivSet = true
 				case "lease_file":
 					for _, lf := range strings.Split(v, ",") {
@@ -126,10 +142,21 @@ func parseINI(filename string, m *ConfigArgs, logger *mlog.Logger) error {
 							m.HostsFile = append(m.HostsFile, hf)
 						}
 					}
+				default:
+					logger.Warnw("unknown config key, ignored",
+						mlog.String("section", section), mlog.String("key", k))
 				}
 			}
 		case "hosts":
-			fields := strings.Fields(line)
+			// Strip inline comments before tokenizing so an entry like
+			// `1.2.3.4 example.com # local override` doesn't pull "#" and
+			// "local" / "override" in as bogus aliases. Mirrors the same
+			// handling in ptr.go's loadHostsFile so the two parsers agree.
+			hostsLine := line
+			if idx := strings.IndexByte(hostsLine, '#'); idx >= 0 {
+				hostsLine = hostsLine[:idx]
+			}
+			fields := strings.Fields(hostsLine)
 			if len(fields) >= 2 {
 				ip := net.ParseIP(fields[0])
 				if ip == nil {
@@ -140,6 +167,13 @@ func parseINI(filename string, m *ConfigArgs, logger *mlog.Logger) error {
 					m.Hosts = make(map[string][]net.IP)
 				}
 				for _, domain := range fields[1:] {
+					// Drop wildcards and empty placeholders the same way
+					// loadHostsFile does, so the two ingest paths produce
+					// the same map shape regardless of where the entry
+					// originated.
+					if domain == "*" || domain == "" {
+						continue
+					}
 					domain = strings.ToLower(strings.TrimSuffix(domain, ".")) + "."
 					m.Hosts[domain] = append(m.Hosts[domain], ip)
 				}
@@ -166,6 +200,9 @@ func parseINI(filename string, m *ConfigArgs, logger *mlog.Logger) error {
 					} else {
 						logger.Warnw("invalid pplog heart_beat value, ignoring", mlog.String("value", v))
 					}
+				default:
+					logger.Warnw("unknown config key, ignored",
+						mlog.String("section", section), mlog.String("key", k))
 				}
 			}
 		case "hook":
@@ -210,8 +247,18 @@ func parseINI(filename string, m *ConfigArgs, logger *mlog.Logger) error {
 					m.Hook.SwitchFallExec = v
 				case "switch_main_exec":
 					m.Hook.SwitchMainExec = v
+				default:
+					logger.Warnw("unknown config key, ignored",
+						mlog.String("section", section), mlog.String("key", k))
 				}
 			}
+		default:
+			// Only log the section name. The raw line may contain values
+			// the user mistakenly placed under an unknown section
+			// (passwords, tokens), and warn-level logs often end up in
+			// long-lived collectors.
+			logger.Warnw("unknown config section, ignored",
+				mlog.String("section", section))
 		}
 	}
 	return scanner.Err()

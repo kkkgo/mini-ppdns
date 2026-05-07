@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -48,7 +49,10 @@ func collectPrivateListenAddrs(port string, v4, v6 bool) []string {
 				if !v4 {
 					continue
 				}
-				if ip.IsPrivate() || ip.IsLoopback() {
+				// Match IPv6 branch: link-local (169.254.0.0/16, APIPA, container
+				// nets) is a legitimate "private" interface for autodetected DNS
+				// listening and should be bound when present.
+				if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
 					ips = append(ips, net.JoinHostPort(ip.String(), port))
 				}
 			} else if ip.To16() != nil {
@@ -74,6 +78,25 @@ func collectPrivateListenAddrs(port string, v4, v6 bool) []string {
 		}
 	}
 	return ips
+}
+
+// ensureListenPort appends the default DNS port (:53) to a bare IP literal
+// that has no port. Anything already containing host:port (parseable by
+// net.SplitHostPort) is returned unchanged. Hostnames or other shapes we
+// can't classify as bare IPs also pass through so net.Resolve* can produce
+// the right error rather than a misleading silent rewrite.
+func ensureListenPort(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return addr
+	}
+	if _, _, err := net.SplitHostPort(addr); err == nil {
+		return addr
+	}
+	if ip, err := netip.ParseAddr(addr); err == nil {
+		return net.JoinHostPort(ip.String(), "53")
+	}
+	return addr
 }
 
 // expandWildcardListen rewrites a 0.0.0.0:<port> or [::]:<port> listen entry
@@ -138,6 +161,13 @@ func getAvailableMemory() uint64 {
 		case "Cached:":
 			cached = val
 		}
+	}
+	// If the scan itself failed mid-stream (truncated read, kernel I/O
+	// error), the partial counters above are unreliable. Return 0 so
+	// calculateCacheSize falls back to its safe default rather than
+	// computing a starvingly small cache from half-read fields.
+	if err := scanner.Err(); err != nil {
+		return 0
 	}
 	if memAvailable > 0 {
 		return memAvailable

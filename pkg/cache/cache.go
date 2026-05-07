@@ -13,6 +13,20 @@ import (
 // sweep expired entries when the caller did not specify an interval.
 const defaultJanitorTick = 10 * time.Second
 
+// heapCompactRatio controls when the janitor rebuilds expHeap from the live
+// map. The heap carries stale entries left over from Store refreshes on an
+// already-queued key; lazy eviction at pop time keeps correctness, but under
+// sustained high refresh rates (e.g., 1-second fallback TTLs under QPS) the
+// stale backlog is bounded by store_rate × TTL, which can reach millions of
+// entries before the oldest expirations catch up. Rebuilding when the heap
+// exceeds heapCompactRatio × live entries amortizes O(N) work infrequently
+// while capping worst-case RSS.
+const heapCompactRatio = 4
+
+// heapCompactMin is the absolute size below which compaction never runs —
+// tiny heaps are not worth the Range walk.
+const heapCompactMin = 1024
+
 type Hashable interface {
 	comparable
 	Sum() uint64
@@ -33,11 +47,18 @@ type Value interface {
 
 // Cache is a concurrent TTL-keyed cache on top of concurrent_map.
 type Cache[K Key, V Value] struct {
-	opts Opts
-
 	closed      atomic.Bool
 	closeNotify chan struct{}
 	m           *concurrent_map.Map[K, *elem[V]]
+
+	// flushMu is the gate that keeps Store's two-step write (shard write +
+	// heap push) atomic with respect to Flush/Close. Store holds RLock so
+	// many Stores can proceed in parallel; Flush/Close hold the write lock
+	// to drain in-flight Stores before clearing or shutting down. Without
+	// this, a Store interleaved between Flush's m.Flush() and the heap
+	// reset could leave a live map entry with no heap entry — janitor
+	// drives eviction off the heap, so that entry would leak forever.
+	flushMu sync.RWMutex
 
 	// expHeap is a min-heap keyed by expirationTime so the janitor can
 	// process expired entries in O(k log N) (k = expired count) instead
@@ -86,10 +107,30 @@ func New[K Key, V Value](opts Opts) *Cache[K, V] {
 // so the map can't grow once nothing is reaping it. Calling Close more
 // than once is safe and always returns nil.
 func (c *Cache[K, V]) Close() error {
-	if c.closed.CompareAndSwap(false, true) {
-		close(c.closeNotify)
+	if !c.closed.CompareAndSwap(false, true) {
+		return nil
 	}
+	// Wait for any Store mid-flight (between TestAndSet and heap.Push) to
+	// drain. Without this barrier a Store that already passed the closed
+	// check could heap.Push into a heap that nothing reaps, leaving a
+	// matching map entry permanently parked. The empty critical section
+	// is the barrier itself: acquiring the write lock blocks until every
+	// in-flight RLock holder releases, then we let go immediately.
+	c.drainInflightStores()
+	close(c.closeNotify)
 	return nil
+}
+
+// drainInflightStores blocks until every Store call that already saw
+// closed=false has finished its heap.Push. Acquiring flushMu.Lock waits
+// for every outstanding RLock holder; the immediate Unlock is correct
+// because Close has already set closed=true, so any Store that wakes
+// after we release will hit the closed check and bail. The empty
+// critical section is the barrier itself, not a coding mistake.
+func (c *Cache[K, V]) drainInflightStores() {
+	c.flushMu.Lock()
+	//lint:ignore SA2001 empty critical section is the drain barrier
+	c.flushMu.Unlock()
 }
 
 // Get returns the value for key if present and unexpired. Expired
@@ -135,23 +176,32 @@ func (c *Cache[K, V]) Get(key K) (v V, expirationTime time.Time, ok bool) {
 // already in the past, the call is a no-op. Stores after Close are
 // dropped silently.
 func (c *Cache[K, V]) Store(key K, v V, expirationTime time.Time) {
-	if time.Now().After(expirationTime) {
+	// flushMu.RLock pairs the shard write and heap push into one atomic
+	// segment relative to Flush/Close. Many Stores still proceed in
+	// parallel — only Flush/Close take the write lock.
+	c.flushMu.RLock()
+	defer c.flushMu.RUnlock()
+	if c.closed.Load() {
 		return
 	}
-	stored := false
-	// Re-check closed inside the shard write lock so the tiny window between
-	// Store's pre-check and Set (during which Close may have stopped the
-	// janitor) cannot leave an entry in the map with no reaper.
-	c.m.TestAndSet(key, func(_ *elem[V], _ bool) (newV *elem[V], setV, delV bool) {
-		if c.closed.Load() {
-			return nil, false, false
-		}
-		stored = true
-		return &elem[V]{v: v, expirationTime: expirationTime}, true, false
-	})
-	if !stored {
+	// Time check inside the lock: a single time.Now() reading also covers
+	// the TestAndSet decision, eliminating the pre-lock TOCTOU where wall
+	// clock crosses expirationTime between the check and the write. Reject
+	// expirationTime == now too: Get treats equal-instant entries as
+	// expired (After is strict), so storing one would leak a permanently
+	// unreadable entry until the janitor reaps it.
+	if !expirationTime.After(time.Now()) {
 		return
 	}
+	// Use Set rather than TestAndSet: the closure variant boxed the entry
+	// pointer plus three captured locals (stored, v, expirationTime) into a
+	// per-call heap allocation on every Store, and concurrent_map's Set
+	// path enforces the per-shard cap that TestAndSet silently bypasses
+	// (set() at concurrent_map/map.go:146 random-evicts when full;
+	// testAndSet has no len() check). Net effect: the configured cache cap
+	// finally takes effect AND each Store no longer pays a closure
+	// allocation.
+	c.m.Set(key, &elem[V]{v: v, expirationTime: expirationTime})
 	// Enqueue for the janitor. A Store that updates an existing key
 	// leaves a stale heap entry with the old expiration — handled at
 	// pop time by re-checking the current expiration (see evictExpired).
@@ -177,6 +227,12 @@ func (c *Cache[K, V]) Len() int {
 
 // Flush drops every entry.
 func (c *Cache[K, V]) Flush() {
+	// Hold flushMu.Lock so no Store can interleave between m.Flush and
+	// the heap reset. Without it, a Store that wrote its map entry after
+	// m.Flush() but pushed onto the heap before this reset would survive
+	// the map flush and lose its heap entry — an unreapable ghost.
+	c.flushMu.Lock()
+	defer c.flushMu.Unlock()
 	c.m.Flush()
 	c.heapMu.Lock()
 	c.expHeap = c.expHeap[:0]
@@ -197,9 +253,50 @@ func (c *Cache[K, V]) janitor(tick time.Duration) {
 			return
 		case now := <-t.C:
 			c.evictExpired(now)
+			c.maybeCompactHeap()
 		}
 	}
 }
+
+// maybeCompactHeap rebuilds expHeap from the live map when the stale-entry
+// backlog outweighs the live entries. Lazy eviction alone is correct but
+// O(store_rate × TTL) in memory when keys are refreshed faster than their
+// TTL expires; compaction bounds the heap at roughly live entry count.
+//
+// Rebuild cost is O(M) where M is the live entry count: Range walks the
+// sharded map once, heap.Init uses Floyd's bottom-up heapify (O(M)).
+// heapMu is held for the duration — concurrent Store's heap.Push blocks
+// briefly but map writes (under the shard lock) proceed unimpeded, so any
+// Store races either land in the Range walk (heap has their entry) or push
+// onto the rebuilt heap after we unlock (also covered). A stale duplicate
+// is tolerated; a missed live entry would silently leak and is not.
+func (c *Cache[K, V]) maybeCompactHeap() {
+	c.heapMu.Lock()
+	defer c.heapMu.Unlock()
+	heapLen := len(c.expHeap)
+	if heapLen < heapCompactMin {
+		return
+	}
+	live := c.m.Len()
+	if heapLen <= live*heapCompactRatio {
+		return
+	}
+	rebuilt := make(expHeap[K], 0, live)
+	c.m.Range(func(k K, e *elem[V]) bool {
+		rebuilt = append(rebuilt, expEntry[K]{key: k, expirationTime: e.expirationTime})
+		return true
+	})
+	heap.Init(&rebuilt)
+	c.expHeap = rebuilt
+}
+
+// expiredStackLimit is the largest expired-batch we can drain without a
+// heap allocation. The stack-backed slice grows transparently into a heap
+// slice past this point — the limit just sets the no-alloc fast-path size.
+// 256 covers a steady-state tick on a healthy cache; bursty expirations
+// (e.g. a fall-path TTL=1 flood) overflow gracefully without losing the
+// fast path on the next tick.
+const expiredStackLimit = 256
 
 // evictExpired pops every heap entry whose expiration has passed and
 // removes the corresponding map entry — as long as a concurrent Store
@@ -207,15 +304,26 @@ func (c *Cache[K, V]) janitor(tick time.Duration) {
 // heap entry already covers the next eviction deadline and we leave
 // the map entry alone).
 func (c *Cache[K, V]) evictExpired(now time.Time) {
-	for {
-		c.heapMu.Lock()
-		if len(c.expHeap) == 0 || c.expHeap[0].expirationTime.After(now) {
-			c.heapMu.Unlock()
-			return
-		}
-		top := heap.Pop(&c.expHeap).(expEntry[K])
-		c.heapMu.Unlock()
+	// Drain every ready-to-expire heap entry under a single heapMu
+	// acquisition. The previous one-pop-per-lock loop paid the lock/unlock
+	// cost per expired key — under high refresh rates (e.g. many 1s-TTL
+	// fallback entries) that turned into heavy contention with concurrent
+	// Store's heap.Push. Collect first, release, then do the per-key
+	// TestAndSet work lock-free w.r.t. heapMu.
+	//
+	// Back the collection slice with a stack array so the common low-
+	// expiration tick allocates nothing. Once append exceeds the stack
+	// capacity it falls back to heap allocation, which is fine — that
+	// only happens on burst ticks where the alloc cost is amortized.
+	var stackBuf [expiredStackLimit]expEntry[K]
+	expired := stackBuf[:0]
+	c.heapMu.Lock()
+	for len(c.expHeap) > 0 && !c.expHeap[0].expirationTime.After(now) {
+		expired = append(expired, heap.Pop(&c.expHeap).(expEntry[K]))
+	}
+	c.heapMu.Unlock()
 
+	for _, top := range expired {
 		c.m.TestAndSet(top.key, func(cur *elem[V], present bool) (newV *elem[V], setV, delV bool) {
 			if !present {
 				return nil, false, false

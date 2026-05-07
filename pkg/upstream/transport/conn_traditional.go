@@ -28,11 +28,36 @@ var (
 // multiplexes dozens of queries on one connection, let alone thousands.
 const pendingSlabCap = 256
 
-// slabSlot is one inline entry in the pending-query index. A nil ch marks
-// the slot free.
+// udpResendMax bounds how many extra copies of the same query a UDP
+// exchange will retransmit before giving up. The 1-second resend ticker
+// could otherwise fire ~10 times against a silently-dead peer (under
+// udpPipelineIdle = 5min and replyWaitLimit = 10s), each amplifying
+// upstream bandwidth without changing the outcome. Three total sends
+// (initial + 2 resends) matches typical stub resolver behavior.
+const udpResendMax = 2
+
+// pendingEntry holds the reply channel and the question metadata for one
+// in-flight query. The qname/qtype pair is used by readLoop to verify
+// that an inbound frame really belongs to the recorded waiter — this
+// closes a misroute hazard where a late response arrives after qid
+// recycling and would otherwise be delivered to whichever new exchange
+// happened to grab the same qid.
+//
+// qname is stored as a private copy of the wire-format QNAME, lower-cased
+// (ASCII only) so the case-insensitive comparison against an upstream
+// echo can be a plain bytes.Equal. Empty qname means "no match check"
+// (used by the zero-q benchmark path).
+type pendingEntry struct {
+	qname []byte
+	qtype uint16
+	ch    chan *[]byte
+}
+
+// slabSlot is one inline entry in the pending-query index. A nil entry.ch
+// marks the slot free.
 type slabSlot struct {
-	qid uint16
-	ch  chan *[]byte
+	qid   uint16
+	entry pendingEntry
 }
 
 // pendingTable maps in-flight DNS qids to the goroutine waiting for the
@@ -58,7 +83,7 @@ type pendingTable struct {
 	slabUsed int
 
 	locate   map[uint16]int16
-	overflow map[uint16]chan *[]byte
+	overflow map[uint16]pendingEntry
 
 	// cursor hints at the next qid to try. Wraps around the full 16-bit
 	// space; pickQidLocked rejects collisions with live entries.
@@ -116,10 +141,26 @@ func (p *pendingTable) pickQidLocked() (uint16, bool) {
 
 // add registers a reply channel under a fresh qid and returns the pair.
 // capLimit bounds total occupancy; a value of 0 means "only the 16-bit
-// qid space caps us" (used by the benchmark path).
+// qid space caps us" (used by the benchmark path). qname/qtype identify
+// the question section the upstream is expected to echo; the table keeps
+// a private lower-cased copy of qname so subsequent caller mutations of
+// the source slice cannot disturb the readLoop comparison. Pass an empty
+// qname to skip the match check (legacy benchmark only).
 // Returns (0, nil) when no slot is available.
-func (p *pendingTable) add(capLimit int) (uint16, chan *[]byte) {
+func (p *pendingTable) add(capLimit int, qname []byte, qtype uint16) (uint16, chan *[]byte) {
 	ch := make(chan *[]byte, 1)
+
+	var qnameCopy []byte
+	if len(qname) > 0 {
+		qnameCopy = make([]byte, len(qname))
+		for i, b := range qname {
+			// ASCII fold only — DNS labels are 7-bit ASCII per RFC 1035.
+			if b >= 'A' && b <= 'Z' {
+				b += 'a' - 'A'
+			}
+			qnameCopy[i] = b
+		}
+	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -137,10 +178,12 @@ func (p *pendingTable) add(capLimit int) (uint16, chan *[]byte) {
 		return 0, nil
 	}
 
+	entry := pendingEntry{qname: qnameCopy, qtype: qtype, ch: ch}
+
 	if p.slabUsed < pendingSlabCap {
 		for i := range p.slab {
-			if p.slab[i].ch == nil {
-				p.slab[i] = slabSlot{qid: qid, ch: ch}
+			if p.slab[i].entry.ch == nil {
+				p.slab[i] = slabSlot{qid: qid, entry: entry}
 				p.slabUsed++
 				p.locate[qid] = int16(i)
 				return qid, ch
@@ -150,27 +193,29 @@ func (p *pendingTable) add(capLimit int) (uint16, chan *[]byte) {
 	}
 
 	if p.overflow == nil {
-		p.overflow = make(map[uint16]chan *[]byte)
+		p.overflow = make(map[uint16]pendingEntry)
 	}
-	p.overflow[qid] = ch
+	p.overflow[qid] = entry
 	p.locate[qid] = -1
 	return qid, ch
 }
 
-// lookup returns the reply channel currently registered for qid, or nil
-// if no entry exists.
-func (p *pendingTable) lookup(qid uint16) chan<- *[]byte {
+// lookup returns the entry currently registered for qid. The returned
+// pendingEntry has a nil ch when no entry exists. The qname slice in the
+// returned value is owned by the table and remains valid until the next
+// remove for this qid.
+func (p *pendingTable) lookup(qid uint16) pendingEntry {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.locate == nil {
-		return nil
+		return pendingEntry{}
 	}
 	loc, ok := p.locate[qid]
 	if !ok {
-		return nil
+		return pendingEntry{}
 	}
 	if loc >= 0 {
-		return p.slab[loc].ch
+		return p.slab[loc].entry
 	}
 	return p.overflow[qid]
 }
@@ -193,6 +238,59 @@ func (p *pendingTable) remove(qid uint16) {
 		return
 	}
 	delete(p.overflow, qid)
+}
+
+// extractQuestion parses the QNAME (raw wire bytes, no compression) and
+// QTYPE from a packed DNS message. Compression pointers in the question
+// section are illegal per RFC 1035 §4.1.4, so the parser rejects them.
+// Returns ok=false on any malformed framing; readLoop and addQueueC use
+// that to drop the frame without delivering.
+func extractQuestion(msg []byte) (qname []byte, qtype uint16, ok bool) {
+	const hdrLen = 12
+	if len(msg) < hdrLen+5 { // header + at least root-label + qtype + qclass
+		return nil, 0, false
+	}
+	p := hdrLen
+	start := p
+	for p < len(msg) {
+		l := int(msg[p])
+		if l == 0 { // root label terminator
+			p++
+			break
+		}
+		// Top two bits non-zero ⇒ pointer (0xc0) or reserved — disallowed
+		// in the question section. 64..191 is structurally illegal because
+		// max label length is 63.
+		if l > 63 {
+			return nil, 0, false
+		}
+		if p+1+l > len(msg) {
+			return nil, 0, false
+		}
+		p += 1 + l
+	}
+	if p+4 > len(msg) {
+		return nil, 0, false
+	}
+	return msg[start:p], binary.BigEndian.Uint16(msg[p:]), true
+}
+
+// equalNameNoCase compares two raw wire-format QNAMEs case-insensitively
+// (ASCII only, matching RFC 1035 conformance). The stored side is already
+// lower-cased by add(); we only need to fold the response side.
+func equalNameNoCase(stored, fromWire []byte) bool {
+	if len(stored) != len(fromWire) {
+		return false
+	}
+	for i, b := range fromWire {
+		if b >= 'A' && b <= 'Z' {
+			b += 'a' - 'A'
+		}
+		if b != stored[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // --- TraditionalDnsConn ---
@@ -262,7 +360,7 @@ func (dc *TraditionalDnsConn) exchange(ctx context.Context, q []byte) (*[]byte, 
 	default:
 	}
 
-	qid, respCh := dc.addQueueC()
+	qid, respCh := dc.addQueueC(q)
 	if respCh == nil {
 		return nil, ErrTDCTooManyQueries
 	}
@@ -289,6 +387,7 @@ func (dc *TraditionalDnsConn) exchange(ctx context.Context, q []byte) (*[]byte, 
 	resend, stopResend := dc.startResendTicker()
 	defer stopResend()
 
+	resends := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -302,6 +401,14 @@ func (dc *TraditionalDnsConn) exchange(ctx context.Context, q []byte) (*[]byte, 
 			binary.BigEndian.PutUint16(*resp, orig)
 			return resp, nil
 		case <-resend:
+			if resends >= udpResendMax {
+				// Peer hasn't answered after udpResendMax+1 attempts; stop
+				// amplifying. Tear the conn down so future queries redial
+				// instead of inheriting the suspect socket.
+				dc.CloseWithErr(fmt.Errorf("udp resend exhausted (qid=%d)", qid))
+				return nil, dc.closeErr
+			}
+			resends++
 			if err := dc.writeQuery(q, qid); err != nil {
 				dc.CloseWithErr(fmt.Errorf("write err, %w", err))
 				return nil, err
@@ -360,16 +467,37 @@ func (dc *TraditionalDnsConn) readLoop() {
 		}
 		dc.awaitingReply.Store(false)
 
+		// Reject frames that can't even hold a DNS header. readResp's
+		// underlying readers already enforce this for normal paths, but
+		// keeping the assertion local guards against any future
+		// transport that might surface a short read here.
+		if len(*frame) < dnsHeaderLen {
+			pool.ReleaseBuf(frame)
+			continue
+		}
 		rid := binary.BigEndian.Uint16(*frame)
-		ch := dc.getQueueC(rid)
-		if ch == nil {
+		entry := dc.pending.lookup(rid)
+		if entry.ch == nil {
 			// No waiter — caller timed out, or peer echoed a qid we
 			// never issued. Drop and move on.
 			pool.ReleaseBuf(frame)
 			continue
 		}
+		// Verify the response's question matches the stored question.
+		// This defends against qid recycling: if exchange A frees qid X
+		// and exchange B reserves the same X for an unrelated query, A's
+		// late response would otherwise be delivered as B's reply. With
+		// the match check, the stale frame is dropped and B continues
+		// waiting for its real reply (or times out cleanly).
+		if len(entry.qname) > 0 {
+			respQname, respQtype, ok := extractQuestion(*frame)
+			if !ok || respQtype != entry.qtype || !equalNameNoCase(entry.qname, respQname) {
+				pool.ReleaseBuf(frame)
+				continue
+			}
+		}
 		select {
-		case ch <- frame:
+		case entry.ch <- frame:
 		default:
 			// Waiter's channel is buffered(1); a full channel means the
 			// waiter already left (ctx cancel, resend duplicate). Drop.
@@ -407,15 +535,20 @@ func (dc *TraditionalDnsConn) CloseWithErr(err error) {
 // --- internal queue accessors retained for the benchmark in conn_test.go
 // which operates on a zero-value TraditionalDnsConn. ---
 
-func (dc *TraditionalDnsConn) addQueueC() (uint16, chan *[]byte) {
+// addQueueC reserves a fresh qid + reply channel for the query bytes q.
+// Returns (0, nil) when the pending table is full or q is malformed
+// enough that we can't extract its question section. q must NOT include
+// any TCP length header — pass the raw DNS message starting at the
+// 12-byte DNS header.
+func (dc *TraditionalDnsConn) addQueueC(q []byte) (uint16, chan *[]byte) {
 	// Pass 0 so only the qid-space bound applies; the caller-facing cap is
 	// enforced by ReserveNewQuery. This mirrors the original behaviour
 	// where addQueueC only guarded against 65536 simultaneous qids.
-	return dc.pending.add(0)
-}
-
-func (dc *TraditionalDnsConn) getQueueC(qid uint16) chan<- *[]byte {
-	return dc.pending.lookup(qid)
+	qname, qtype, ok := extractQuestion(q)
+	if !ok {
+		return 0, nil
+	}
+	return dc.pending.add(0, qname, qtype)
 }
 
 func (dc *TraditionalDnsConn) deleteQueueC(qid uint16) {

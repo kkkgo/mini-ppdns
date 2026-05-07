@@ -183,6 +183,86 @@ func TestCache_HeapStaleEntryIgnored(t *testing.T) {
 	}
 }
 
+func TestCache_HeapCompactBoundsStaleGrowth(t *testing.T) {
+	// Simulate a workload that refreshes the same key many times with a
+	// future TTL — exactly the pathology that used to make expHeap grow
+	// without bound (stale entries only drain at the old expiration time).
+	// After the janitor's compaction runs, the heap must collapse down to
+	// roughly the live map size.
+	c := New[testKey, int](Opts{Size: 1024, CleanerInterval: time.Hour})
+	defer c.Close()
+
+	exp := time.Now().Add(time.Hour)
+	const refreshes = 4096
+	for i := 0; i < refreshes; i++ {
+		c.Store(1, i, exp)
+	}
+	if c.Len() != 1 {
+		t.Fatalf("map should still have 1 entry, got %d", c.Len())
+	}
+	c.heapMu.Lock()
+	staleLen := len(c.expHeap)
+	c.heapMu.Unlock()
+	if staleLen < refreshes {
+		t.Fatalf("expected heap to hold all stale entries pre-compact, got %d", staleLen)
+	}
+
+	c.maybeCompactHeap()
+
+	c.heapMu.Lock()
+	compactedLen := len(c.expHeap)
+	c.heapMu.Unlock()
+	if compactedLen != c.Len() {
+		t.Fatalf("heap len after compact = %d, want %d (map size)", compactedLen, c.Len())
+	}
+
+	// Post-compact: the live value must still be retrievable with the
+	// correct expiration, and a subsequent evictExpired at that expiration
+	// must remove the map entry (proving the rebuilt heap keyed on the
+	// current expiration, not any stale one).
+	v, gotExp, ok := c.Get(1)
+	if !ok || v != refreshes-1 || !gotExp.Equal(exp) {
+		t.Fatalf("after compact Get = (%d, %v, %v), want (%d, %v, true)",
+			v, gotExp, ok, refreshes-1, exp)
+	}
+	c.evictExpired(exp.Add(time.Second))
+	if _, _, ok := c.Get(1); ok {
+		t.Fatal("after evictExpired past exp: entry should be gone")
+	}
+}
+
+// TestCache_StoreEnforcesSizeCap is a regression test for the Store
+// implementation switching from concurrent_map.TestAndSet to Set. The
+// previous TestAndSet path silently bypassed the per-shard cap that
+// concurrent_map.Set enforces (testAndSet has no len() check; set
+// random-evicts when full). With many distinct keys inserted into a
+// small cache, Len must remain bounded by the configured cap.
+//
+// The cap is applied per shard (MapShardSize=32), so a Size of 64
+// yields a per-shard cap of 2 and a global ceiling of 64. We insert
+// 32 * 32 = 1024 distinct keys to make every shard saturate well past
+// its cap; if eviction fails, Len() would blow far past 64.
+func TestCache_StoreEnforcesSizeCap(t *testing.T) {
+	const sizeCap = 64
+	c := New[testKey, int](Opts{Size: sizeCap, CleanerInterval: time.Hour})
+	defer c.Close()
+
+	exp := time.Now().Add(time.Minute)
+	for i := testKey(0); i < 1024; i++ {
+		c.Store(i, int(i), exp)
+	}
+
+	got := c.Len()
+	if got > sizeCap {
+		t.Fatalf("Len after 1024 inserts = %d; expected <= sizeCap=%d (cap not enforced)", got, sizeCap)
+	}
+	// Sanity: cache must be non-empty too — a zero count would mean Set
+	// is dropping every store, which would break the cache outright.
+	if got == 0 {
+		t.Fatal("Len = 0; cache appears to be dropping every Store")
+	}
+}
+
 func TestCache_EvictExpiredPopsInOrder(t *testing.T) {
 	c := New[testKey, int](Opts{Size: 1024, CleanerInterval: time.Hour})
 	defer c.Close()

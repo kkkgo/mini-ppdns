@@ -201,14 +201,37 @@ func (pr *ptrResolver) reload() {
 	logDebugPTRLoaded(pr.logger, len(newPTR), len(newFwd))
 }
 
-// ipToPTRName converts an IPv4 address string to its in-addr.arpa PTR name.
+// ipToPTRName converts an IP address string to its reverse PTR name.
+// Returns the in-addr.arpa form for IPv4 and the nibble-reversed
+// ip6.arpa form for IPv6. Returns "" if ip cannot be parsed.
 func ipToPTRName(ip string) string {
 	addr, err := netip.ParseAddr(ip)
-	if err != nil || !addr.Is4() {
+	if err != nil {
 		return ""
 	}
-	b := addr.As4()
-	return fmt.Sprintf("%d.%d.%d.%d.in-addr.arpa.", b[3], b[2], b[1], b[0])
+	addr = addr.Unmap()
+	if addr.Is4() {
+		b := addr.As4()
+		return fmt.Sprintf("%d.%d.%d.%d.in-addr.arpa.", b[3], b[2], b[1], b[0])
+	}
+	if addr.Is6() {
+		b := addr.As16()
+		// 32 nibbles, each rendered as "x." (low nibble of byte 15 first,
+		// high nibble of byte 15 next, ..., high nibble of byte 0 last).
+		// Pre-sized buffer: 32 nibbles * 2 chars + len("ip6.arpa.") = 73.
+		var sb strings.Builder
+		sb.Grow(73)
+		const hex = "0123456789abcdef"
+		for i := 15; i >= 0; i-- {
+			sb.WriteByte(hex[b[i]&0x0f])
+			sb.WriteByte('.')
+			sb.WriteByte(hex[b[i]>>4])
+			sb.WriteByte('.')
+		}
+		sb.WriteString("ip6.arpa.")
+		return sb.String()
+	}
+	return ""
 }
 
 func (pr *ptrResolver) loadLeaseFile(path string, m map[string]string, modTimes map[string]time.Time) {
@@ -226,8 +249,15 @@ func (pr *ptrResolver) loadLeaseFile(path string, m map[string]string, modTimes 
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		line := scanner.Text()
+		// Strip inline comments before tokenizing so a hand-edited lease
+		// like `... laptop-1 # Alice's macbook` keeps "laptop-1" as the
+		// hostname instead of swallowing "Alice's" into the client-id.
+		if idx := strings.IndexByte(line, '#'); idx >= 0 {
+			line = line[:idx]
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
 		// dnsmasq lease format: timestamp mac ip hostname client-id
@@ -313,18 +343,26 @@ func (pr *ptrResolver) Lookup(ptrName string) string {
 
 // LookupIP returns the IPs for a forward query name, or nil if not found.
 // It lazily checks for file changes (at most once per 5 seconds).
+// The returned slice is a fresh copy: callers may freely append/mutate
+// without aliasing into the resolver's internal map.
 func (pr *ptrResolver) LookupIP(name string) []net.IP {
 	pr.maybeReload()
 	pr.mu.RLock()
 	defer pr.mu.RUnlock()
-	return pr.fwdMap[strings.ToLower(name)]
+	src := pr.fwdMap[strings.ToLower(name)]
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]net.IP, len(src))
+	copy(out, src)
+	return out
 }
 
 // isPrivatePTR checks if a PTR query name corresponds to a private IP address.
-// Covers IPv4 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 and
-// IPv6 ULA (fc00::/7) and link-local (fe80::/10).
+// Covers IPv4 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16,
+// 127.0.0.0/8 (loopback), and IPv6 ULA (fc00::/7) and link-local (fe80::/10).
 func isPrivatePTR(qname string) bool {
-	qname = strings.ToLower(qname)
+	qname = lowerASCIIName(qname)
 	if strings.HasSuffix(qname, ".in-addr.arpa.") {
 		trimmed := qname[:len(qname)-len(".in-addr.arpa.")]
 		octets, ok := parseIPv4ArpaLabels(trimmed)
@@ -332,7 +370,7 @@ func isPrivatePTR(qname string) bool {
 			return false
 		}
 		addr := netip.AddrFrom4(octets)
-		return addr.IsPrivate() || addr.IsLinkLocalUnicast()
+		return addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLoopback()
 	}
 	if strings.HasSuffix(qname, ".ip6.arpa.") {
 		trimmed := strings.TrimSuffix(qname, ".ip6.arpa.")
@@ -345,6 +383,11 @@ func isPrivatePTR(qname string) bool {
 			if len(p) != 1 {
 				return false
 			}
+			// Accept both 'a'-'f' and 'A'-'F' explicitly even though the
+			// caller normalized qname via strings.ToLower above. RFC 1035
+			// names are case-insensitive on the wire, so an upstream that
+			// preserves client casing or a future refactor that drops the
+			// outer ToLower must not silently misroute IPv6 PTR queries.
 			c := p[0]
 			var v byte
 			switch {
@@ -352,6 +395,8 @@ func isPrivatePTR(qname string) bool {
 				v = c - '0'
 			case c >= 'a' && c <= 'f':
 				v = c - 'a' + 10
+			case c >= 'A' && c <= 'F':
+				v = c - 'A' + 10
 			default:
 				return false
 			}

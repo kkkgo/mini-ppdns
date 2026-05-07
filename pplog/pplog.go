@@ -11,13 +11,44 @@ import (
 
 const (
 	channelSize = 4096
+
+	// writeTimeout caps how long a single UDP send is allowed to block.
+	// UDP writes are usually non-blocking, but Linux can stall a sendmsg
+	// for seconds while ARP resolves a fresh next-hop, while a routing
+	// reload reshuffles the FIB, or while the socket buffer is full
+	// because the kernel queue is back-pressuring. None of those should
+	// block the pplog sender goroutine — every packet stuck in Write is
+	// a packet not being drained from r.ch, and a stalled drain backs up
+	// into Reporter.Report's non-blocking send and causes log drops on
+	// otherwise-healthy traffic. 100ms is generous for localhost/LAN
+	// collectors and short enough that one stuck destination cannot
+	// cascade into a runaway drop counter.
+	writeTimeout = 100 * time.Millisecond
 )
+
+// sealBufBytes sizes sealBufPool buffers to hold both the inner plaintext
+// (InnerHeaderSize + payload) AND the AEAD ciphertext that SealTo appends
+// after it. The math:
+//
+//   inner plaintext  = InnerHeaderSize + payload   (lives in buf[0:innerLen])
+//   AEAD ciphertext  = inner + AEADOverhead        (appended at buf[innerLen:])
+//   buf must hold     = innerLen + ciphertextLen
+//                     = 2*innerLen + AEADOverhead
+//                     = 2*InnerHeaderSize + 2*payload + AEADOverhead
+//
+// At payload == MaxInnerPayload the requirement is
+// 2*InnerHeaderSize + 2*MaxInnerPayload + AEADOverhead. The previous
+// formula omitted one InnerHeaderSize term, leaving the buffer 7 bytes
+// short of the worst case — when payload approached the limit, SealTo's
+// internal append grew the slice via a fresh heap allocation, defeating
+// the entire reason this pool exists.
+const sealBufBytes = 2*InnerHeaderSize + 2*MaxInnerPayload + AEADOverhead
 
 // sealBufPool reuses temporary buffers for seal() to avoid per-call heap allocations.
 // Each buffer is large enough to hold inner plaintext + AEAD ciphertext.
 var sealBufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, MaxPacketSize)
+		b := make([]byte, sealBufBytes)
 		return &b
 	},
 }
@@ -127,7 +158,13 @@ func (r *Reporter) nextSeqAndCipher() (uint32, *Cipher) {
 
 // Report sends a query log entry. Non-blocking: drops if channel is full.
 func (r *Reporter) Report(entry *QueryEntry) {
-	r.lastReport.Store(time.Now().UnixNano())
+	// Single time.Now() shared between lastReport (UnixNano) and the entry
+	// timestamp (Unix). The two reads were microseconds apart and produced
+	// the same Unix second 99.99% of the time anyway; folding them into one
+	// vDSO call saves a syscall per Report on the hot path and removes the
+	// theoretical edge case where the two reads straddle a second boundary.
+	now := time.Now()
+	r.lastReport.Store(now.UnixNano())
 
 	level := r.level
 	if level > 4 {
@@ -139,7 +176,7 @@ func (r *Reporter) Report(entry *QueryEntry) {
 		r.drop.Add(1)
 		return
 	}
-	ts := uint32(time.Now().Unix())
+	ts := uint32(now.Unix())
 
 	// Encode payload into temp buffer, with fitPayload for level 3-4
 	var payloadBuf [MaxPacketSize]byte
@@ -280,23 +317,48 @@ func (r *Reporter) heartbeat() {
 	}
 }
 
+// writePkt sends one packet under a bounded write deadline so a wedged
+// destination (ARP stall, routing churn, full socket buffer) cannot block
+// the sender goroutine indefinitely and back-pressure r.ch into dropping
+// otherwise-healthy log entries. Errors are counted, not surfaced — pplog
+// is best-effort.
+func (r *Reporter) writePkt(pkt []byte) {
+	_ = r.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	if _, err := r.conn.Write(pkt); err != nil {
+		r.writeErr.Add(1)
+	}
+}
+
+// drainTimeout caps the total time the sender spends flushing pending
+// packets after Close. Without it, a wedged destination (kernel send
+// buffer full, routing churn) combined with channelSize=4096 and
+// writeTimeout=100ms could keep Close blocked for ~410s — long enough
+// to stall an entire shutdown sequence. pplog is best-effort, so once
+// the cap elapses we count the rest as drops and return.
+const drainTimeout = 1 * time.Second
+
 // sender is the single goroutine that writes packets to UDP.
 func (r *Reporter) sender() {
 	defer r.wg.Done()
 	for {
 		select {
 		case pkt := <-r.ch:
-			if _, err := r.conn.Write(pkt); err != nil {
-				r.writeErr.Add(1)
-			}
+			r.writePkt(pkt)
 		case <-r.done:
-			// Drain remaining packets
+			// Drain remaining packets, but bound the total time so
+			// shutdown isn't held hostage by a slow/wedged peer.
+			deadline := time.Now().Add(drainTimeout)
 			for {
 				select {
 				case pkt := <-r.ch:
-					if _, err := r.conn.Write(pkt); err != nil {
-						r.writeErr.Add(1)
+					if time.Now().After(deadline) {
+						// Past the drain budget: account for the
+						// packet as dropped and skip the Write so
+						// remaining channel content empties quickly.
+						r.drop.Add(1)
+						continue
 					}
+					r.writePkt(pkt)
 				default:
 					return
 				}

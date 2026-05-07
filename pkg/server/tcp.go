@@ -226,6 +226,18 @@ func serveTCPConn(
 		go func(req *dns.Msg) {
 			defer handlerWg.Done()
 			defer func() { <-querySlot }()
+			// Recover so a panic deep in Handle (miekg/dns has historically
+			// panicked on pathological wire data) drops just this query
+			// instead of tearing down the whole resolver process. The
+			// querySlot release is deferred above so it runs even on panic;
+			// the outer connection loop continues serving siblings.
+			defer func() {
+				if rec := recover(); rec != nil {
+					logger.Errorw("tcp handler panic recovered",
+						mlog.String("recover", fmt.Sprint(rec)),
+						mlog.Stringer("from", tcpRemoteAddr(c)))
+				}
+			}()
 
 			r := h.Handle(connCtx, req, QueryMeta{
 				ClientAddr: tcpRemoteAddr(c),
@@ -249,8 +261,16 @@ func serveTCPConn(
 func packServFail(req *dns.Msg) (*[]byte, bool) {
 	resp := new(dns.Msg)
 	dnsutil.SetReply(resp, req)
+	// Propagate the client's EDNS0 advertised UDP size so the SERVFAIL
+	// response carries an OPT pseudo-record when the query did. RFC 6891
+	// §6.1.1 requires OPT in replies to OPT-bearing queries; without this,
+	// strict resolvers can reject the synthesized SERVFAIL as malformed.
+	resp.UDPSize = req.UDPSize
 	resp.Rcode = dns.RcodeServerFailure
-	buf, err := pool.PackTCPBuffer(resp)
+	// SERVFAIL is a tiny synthetic reply (header + question + maybe OPT),
+	// so route through the small-buffer pack to avoid burning a 128 KiB
+	// pool slot per error response.
+	buf, err := pool.PackTCPBufferSmall(resp)
 	if err != nil {
 		return nil, false
 	}

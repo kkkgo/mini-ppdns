@@ -228,6 +228,11 @@ func main() {
 		var expanded []string
 		seen := make(map[string]bool)
 		for _, a := range args.Listen {
+			// Bare IPs without :port resolve to port 0 in net.ResolveUDPAddr,
+			// silently binding to a random ephemeral port — DNS clients on
+			// :53 then see no listener. Default to :53 for any entry the
+			// user gave without an explicit port.
+			a = ensureListenPort(a)
 			for _, e := range expandWildcardListen(a) {
 				if !seen[e] {
 					seen[e] = true
@@ -247,9 +252,10 @@ func main() {
 		}
 		cmdArgs := []string{}
 		for _, arg := range os.Args[1:] {
-			if arg != "-d" && arg != "-d=true" {
-				cmdArgs = append(cmdArgs, arg)
+			if isDaemonFlagArg(arg) {
+				continue
 			}
+			cmdArgs = append(cmdArgs, arg)
 		}
 		cmd := exec.Command(execPath, cmdArgs...)
 		cmd.Stdin = nil
@@ -275,7 +281,7 @@ func main() {
 	cnFwd := &miniForwarder{
 		upstreams: tryCNUpstreams,
 		addresses: tryCNAddrs,
-		qtime:     time.Duration(args.QTime*10) * time.Millisecond,
+		qtime:     time.Duration(args.QTime) * 10 * time.Millisecond,
 		logger:    logger,
 	}
 
@@ -505,6 +511,19 @@ func initTimezone() {
 	time.Local = time.FixedZone("UTC+8", 8*60*60)
 }
 
+// isDaemonFlagArg reports whether arg is any form of the -d boolean flag
+// recognized by Go's flag package (-d, --d, -d=<bool>, --d=<bool>). We
+// strip every form — not just the "true" variants — so that the forked
+// child never inherits a -d anything and cannot recursively fork. Any
+// value form that set Daemon=false would never have reached this branch
+// anyway, so filtering them too is harmless.
+func isDaemonFlagArg(arg string) bool {
+	if arg == "-d" || arg == "--d" {
+		return true
+	}
+	return strings.HasPrefix(arg, "-d=") || strings.HasPrefix(arg, "--d=")
+}
+
 // formatUpstreamAddr normalizes an upstream DNS string into a URL that
 // upstream.NewUpstream accepts: it adds udp:// when no scheme is present and
 // fills in the default port 53 when missing. Bare IP literals — including
@@ -519,6 +538,16 @@ func formatUpstreamAddr(addr string) string {
 	}
 	if !strings.Contains(addr, "://") {
 		addr = "udp://" + addr
+	} else {
+		// Unbracketed IPv6 literals after the scheme (e.g. "udp://::1",
+		// "udp://fe80::1") confuse url.Parse — Host captures the whole
+		// "::1" but Hostname() returns garbage like ":" because the parser
+		// treats the first colon as the user/port separator. Bracket the
+		// host portion up-front so the downstream url.Parse sees a valid
+		// RFC 3986 authority. We only bracket when the host parses as a
+		// real IPv6 address; plain hostnames with a single colon (host:port)
+		// are left untouched.
+		addr = bracketIPv6InURL(addr)
 	}
 	u, err := url.Parse(addr)
 	if err != nil || u.Host == "" {
@@ -528,6 +557,38 @@ func formatUpstreamAddr(addr string) string {
 		host := u.Hostname()
 		u.Host = net.JoinHostPort(host, "53")
 		addr = u.String()
+	}
+	return addr
+}
+
+// bracketIPv6InURL rewrites "scheme://<unbracketed-ipv6>[...]" to
+// "scheme://[<ipv6>][...]" when the authority begins with a parseable
+// IPv6 literal. Inputs without a scheme, already-bracketed hosts, or hosts
+// that are not valid IPv6 addresses are returned unchanged.
+func bracketIPv6InURL(addr string) string {
+	schemeEnd := strings.Index(addr, "://")
+	if schemeEnd < 0 {
+		return addr
+	}
+	head := addr[:schemeEnd+3]
+	rest := addr[schemeEnd+3:]
+	if rest == "" || rest[0] == '[' {
+		return addr
+	}
+	// Isolate the authority (up to the first path/query/fragment char).
+	end := strings.IndexAny(rest, "/?#")
+	if end < 0 {
+		end = len(rest)
+	}
+	authority := rest[:end]
+	suffix := rest[end:]
+	// A single colon is host:port; two or more suggest IPv6. Delegate the
+	// final decision to netip so we only bracket real IPv6 literals.
+	if strings.Count(authority, ":") < 2 {
+		return addr
+	}
+	if ip, err := netip.ParseAddr(authority); err == nil {
+		return head + "[" + ip.String() + "]" + suffix
 	}
 	return addr
 }

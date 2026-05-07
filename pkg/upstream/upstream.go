@@ -181,8 +181,13 @@ func buildUDPUpstream(urlHost string, dialer *net.Dialer, opt Opt) (Upstream, er
 			MaxConcurrentQueryWhileDialing: udpPipelineConcurrent,
 			Logger:                         opt.Logger,
 		}),
+		// Forward Logger and IdleTimeout so TCP fallback errors (dial
+		// failures, idle resets) appear in the same log stream as UDP, and
+		// so a user-tuned IdleTimeout actually applies to the fallback path.
 		t: transport.NewReuseConnTransport(transport.ReuseConnOpts{
 			DialContext: dialTCPFallback,
+			Logger:      opt.Logger,
+			IdleTimeout: opt.IdleTimeout,
 		}),
 	}, nil
 }
@@ -258,9 +263,11 @@ func (u *udpWithFallback) ExchangeContext(ctx context.Context, q []byte) (*[]byt
 }
 
 func (u *udpWithFallback) Close() error {
-	u.u.Close()
-	u.t.Close()
-	return nil
+	// Surface both child errors so a partial close failure isn't lost.
+	// Either child returning success is the common case (Close errors on
+	// already-shut sockets are advisory at best) so errors.Join produces
+	// nil when both return nil — no allocation in the fast path.
+	return errors.Join(u.u.Close(), u.t.Close())
 }
 
 // ---- Connection event observer ----
@@ -305,13 +312,24 @@ func wrapConn(c net.Conn, ob EventObserver) net.Conn {
 	if _, noop := ob.(nopEO); noop {
 		return c
 	}
-	ob.OnEvent(EventConnOpen)
+	safeOnEvent(ob, EventConnOpen)
 	return &connWrapper{Conn: c, ob: ob}
 }
 
 func (c *connWrapper) Close() error {
 	if c.closed.CompareAndSwap(false, true) {
-		c.ob.OnEvent(EventConnClose)
+		safeOnEvent(c.ob, EventConnClose)
 	}
 	return c.Conn.Close()
+}
+
+// safeOnEvent funnels EventObserver callbacks through a recover so a
+// panic in third-party observer code (metrics/tracing/etc.) cannot tear
+// down the resolver process. The event is dropped on panic; recovery
+// path stays silent because the observer interface has no logger handle.
+func safeOnEvent(ob EventObserver, evt Event) {
+	defer func() {
+		_ = recover()
+	}()
+	ob.OnEvent(evt)
 }

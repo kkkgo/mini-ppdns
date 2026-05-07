@@ -335,13 +335,16 @@ func (c *reusableConn) readLoop() {
 			return
 		}
 
-		// Refresh idle deadline before advertising the conn for reuse,
-		// and put it back in the pool *before* handing the frame to the
-		// waiter. Otherwise a fast-turnaround second exchange could
-		// observe the conn as busy and dial a new one unnecessarily.
-		c.c.SetReadDeadline(time.Now().Add(c.t.idleTimeout))
-		c.t.setIdle(c)
-
+		// Deliver the frame BEFORE advertising the conn for reuse.
+		// Earlier code put setIdle first so a fast follow-up exchange
+		// would not redial — but if the original waiter had already
+		// abandoned (ctx cancel after the server replied), the buffered
+		// resp would sit in replyCh while another caller pops the conn,
+		// and that caller's exchange would consume the stale frame as
+		// if it were its own reply. The exchange() write side already
+		// drains stale replies under c.mu (line ~399-405), so swapping
+		// the order keeps fast-path reuse safe AND closes the racing
+		// "stale frame stamped with new caller's qid" misroute hazard.
 		select {
 		case c.replyCh <- resp:
 		default:
@@ -355,6 +358,12 @@ func (c *reusableConn) readLoop() {
 			c.shutdown(errRespChanFull, false)
 			return
 		}
+
+		// Refresh idle read deadline and advertise for reuse only after
+		// the frame is safely delivered (or buffered for a still-pending
+		// drain by the rightful waiter).
+		c.c.SetReadDeadline(time.Now().Add(c.t.idleTimeout))
+		c.t.setIdle(c)
 	}
 }
 

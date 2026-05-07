@@ -116,6 +116,14 @@ func parseForceFallEntry(s string) (prefixes []netip.Prefix, negated bool, err e
 		if err != nil {
 			return nil, negated, fmt.Errorf("invalid range end IP %s: %w", parts[1], err)
 		}
+		// rangeToPrefix is IPv4-only by design — IPv6 ranges are
+		// vanishingly rare in deployment and a 128-bit two-half
+		// implementation would be pure code surface for no real win. Tell
+		// the user directly rather than letting them stare at a generic
+		// "invalid IP range" and wonder whether their syntax is wrong.
+		if start.Is6() || end.Is6() {
+			return nil, negated, fmt.Errorf("IPv6 range %s-%s is not supported; use CIDR or single addresses", parts[0], parts[1])
+		}
 		prefixes = rangeToPrefix(start, end)
 		if len(prefixes) == 0 {
 			return nil, negated, fmt.Errorf("invalid IP range %s-%s", parts[0], parts[1])

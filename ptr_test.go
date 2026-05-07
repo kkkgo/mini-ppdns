@@ -27,7 +27,11 @@ func TestIpToPTRName(t *testing.T) {
 		{"255.255.255.255", "255.255.255.255.in-addr.arpa."},
 		{"0.0.0.0", "0.0.0.0.in-addr.arpa."},
 		{"invalid", ""},
-		{"::1", ""}, // IPv6 not supported
+		// IPv6: nibble-reversed ip6.arpa (RFC 3596 §2.5).
+		{"::1", "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa."},
+		{"2001:db8::1", "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa."},
+		// IPv4-mapped IPv6 (::ffff:1.2.3.4) unmaps to its IPv4 form.
+		{"::ffff:1.2.3.4", "4.3.2.1.in-addr.arpa."},
 	}
 	for _, tt := range tests {
 		got := ipToPTRName(tt.ip)

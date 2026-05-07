@@ -19,9 +19,19 @@ func stripAnsi(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for i := 0; i < len(s); {
+		// CSI sequences are ESC '[' followed by zero or more parameter
+		// bytes (0x30–0x3F) and intermediate bytes (0x20–0x2F), then a
+		// final byte in 0x40–0x7E. The previous implementation only
+		// handled SGR ('m'); other terminators (K, J, H, ...) leaked
+		// through as raw control bytes into log files and the pplog
+		// reporter stream.
 		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
 			j := i + 2
-			for j < len(s) && s[j] != 'm' {
+			for j < len(s) {
+				c := s[j]
+				if c >= 0x40 && c <= 0x7E {
+					break
+				}
 				j++
 			}
 			if j < len(s) {
@@ -137,6 +147,16 @@ func (l *Logger) Close() error {
 	return nil
 }
 
+// writeOut serializes a single buf write through l.mu using defer Unlock.
+// Direct Lock + writeLocked + Unlock without defer would deadlock the
+// logger forever if l.out.Write ever panicked (custom writer, exhausted
+// resource, etc.), since later log calls would all block on l.mu.
+func (l *Logger) writeOut(buf []byte) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.writeLocked(buf)
+}
+
 // writeLocked writes buf to the output while holding l.mu. If writing to a
 // file fails (disk full, read-only FS, closed fd), a one-shot notice plus the
 // failing line is emitted to os.Stderr so operators can still see that logs
@@ -229,9 +249,7 @@ func (l *Logger) output(prefix, msg string) {
 		buf = append(buf, '\n')
 	}
 
-	l.mu.Lock()
-	l.writeLocked(buf)
-	l.mu.Unlock()
+	l.writeOut(buf)
 
 	*bufp = buf
 	bufPool.Put(bufp)
@@ -273,9 +291,7 @@ func (l *Logger) outputf(prefix, format string, args ...interface{}) string {
 		buf = append(buf, '\n')
 	}
 
-	l.mu.Lock()
-	l.writeLocked(buf)
-	l.mu.Unlock()
+	l.writeOut(buf)
 
 	*bufp = buf
 	bufPool.Put(bufp)
@@ -301,9 +317,7 @@ func (l *Logger) InfoBuild(fn func(buf []byte, color bool) []byte) {
 	if len(buf) == 0 || buf[len(buf)-1] != '\n' {
 		buf = append(buf, '\n')
 	}
-	l.mu.Lock()
-	l.writeLocked(buf)
-	l.mu.Unlock()
+	l.writeOut(buf)
 	*bufp = buf
 	bufPool.Put(bufp)
 	if reportMsg != "" {
@@ -328,9 +342,7 @@ func (l *Logger) DebugBuild(fn func(buf []byte, color bool) []byte) {
 	if len(buf) == 0 || buf[len(buf)-1] != '\n' {
 		buf = append(buf, '\n')
 	}
-	l.mu.Lock()
-	l.writeLocked(buf)
-	l.mu.Unlock()
+	l.writeOut(buf)
 	*bufp = buf
 	bufPool.Put(bufp)
 }
@@ -352,9 +364,7 @@ func (l *Logger) ErrorBuild(fn func(buf []byte, color bool) []byte) {
 	if len(buf) == 0 || buf[len(buf)-1] != '\n' {
 		buf = append(buf, '\n')
 	}
-	l.mu.Lock()
-	l.writeLocked(buf)
-	l.mu.Unlock()
+	l.writeOut(buf)
 	*bufp = buf
 	bufPool.Put(bufp)
 	if reportMsg != "" {
@@ -457,11 +467,6 @@ func (l *Logger) Fatal(msg string) {
 	os.Exit(1)
 }
 
-// With returns the same logger, kept for signature compatibility during transition
-func (l *Logger) With(args ...interface{}) *Logger {
-	return l
-}
-
 func Nop() *Logger {
 	return &Logger{level: levelOff, color: false, out: io.Discard}
 }
@@ -499,9 +504,7 @@ func (l *Logger) outputw(prefix, msg string, fields []Field) string {
 
 	buf = append(buf, '\n')
 
-	l.mu.Lock()
-	l.writeLocked(buf)
-	l.mu.Unlock()
+	l.writeOut(buf)
 
 	*bufp = buf
 	bufPool.Put(bufp)
