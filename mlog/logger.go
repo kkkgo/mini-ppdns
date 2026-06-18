@@ -158,10 +158,14 @@ func (l *Logger) writeOut(buf []byte) {
 }
 
 // writeLocked writes buf to the output while holding l.mu. If writing to a
-// file fails (disk full, read-only FS, closed fd), a one-shot notice plus the
-// failing line is emitted to os.Stderr so operators can still see that logs
-// are being lost. Subsequent failures are suppressed until a successful write
-// resets writeErrReported.
+// file fails (disk full, read-only FS, closed fd), every failing line is
+// mirrored to os.Stderr so log content is not lost, while a one-shot notice
+// explaining the fallback is printed only once. writeErrReported de-dupes
+// the notice (not the mirroring) and resets on the next successful write.
+//
+// The previous behavior suppressed everything — notice and content — after
+// the first failure, so a disk-full event silently dropped every subsequent
+// line even though the "falling back to stderr" notice promised otherwise.
 func (l *Logger) writeLocked(buf []byte) {
 	_, err := l.out.Write(buf)
 	if err == nil {
@@ -170,9 +174,14 @@ func (l *Logger) writeLocked(buf []byte) {
 		}
 		return
 	}
-	if l.file != nil && !l.writeErrReported {
-		l.writeErrReported = true
-		fmt.Fprintf(os.Stderr, "mlog: log file write failed: %v; falling back to stderr\n", err)
+	if l.file != nil {
+		if !l.writeErrReported {
+			l.writeErrReported = true
+			fmt.Fprintf(os.Stderr, "mlog: log file write failed: %v; mirroring subsequent logs to stderr\n", err)
+		}
+		// Always mirror the failing line so logs survive while the file
+		// remains unwritable. If stderr is also broken there is nothing
+		// further we can do, so its error is intentionally ignored.
 		os.Stderr.Write(buf)
 	}
 }
@@ -206,8 +215,16 @@ func appendTimestamp(buf []byte, t time.Time) []byte {
 	return buf
 }
 
-// appendInt appends an integer with zero-padding to width.
+// appendInt appends an integer with zero-padding to width. Defensively
+// folds negatives to 0 — the only call sites pass calendar/clock fields
+// that are non-negative by construction, but `val % 10` on a negative
+// would emit non-ASCII bytes ('0' + (-3) is below '0'). Cheap to guard
+// here so a future caller can't accidentally produce malformed log
+// timestamps.
 func appendInt(buf []byte, val int, width int) []byte {
+	if val < 0 {
+		val = 0
+	}
 	var tmp [4]byte
 	pos := len(tmp)
 	for i := 0; i < width; i++ {
@@ -351,6 +368,9 @@ func (l *Logger) DebugBuild(fn func(buf []byte, color bool) []byte) {
 // The "[ERROR] " prefix is added automatically and colorized when supported.
 // The reporter receives an ANSI-stripped copy of the user message.
 func (l *Logger) ErrorBuild(fn func(buf []byte, color bool) []byte) {
+	if l.level > levelError {
+		return
+	}
 	bufp := bufPool.Get().(*[]byte)
 	buf := (*bufp)[:0]
 	buf = appendTimestamp(buf, time.Now())
@@ -429,6 +449,9 @@ func (l *Logger) Warnf(format string, args ...interface{}) {
 }
 
 func (l *Logger) Errorf(format string, args ...interface{}) {
+	if l.level > levelError {
+		return
+	}
 	msg := l.outputf("[ERROR] ", format, args...)
 	l.reportEvent(3, "[ERROR] "+msg)
 }
@@ -457,11 +480,19 @@ func (l *Logger) Warn(msg string) {
 }
 
 func (l *Logger) Error(msg string) {
+	if l.level > levelError {
+		return
+	}
 	l.output("[ERROR] ", msg)
 	l.reportEvent(3, "[ERROR] "+msg)
 }
 
+// Fatal honors the Nop level guard: a no-op logger must not exit the
+// process. In production loggers Fatal still terminates as advertised.
 func (l *Logger) Fatal(msg string) {
+	if l.level > levelError {
+		return
+	}
 	l.output("[ERROR] ", msg)
 	l.reportEvent(4, "[FATAL] "+msg)
 	os.Exit(1)
@@ -562,12 +593,19 @@ func (l *Logger) Warnw(msg string, fields ...Field) {
 
 // Errorw logs an error message with structured fields.
 func (l *Logger) Errorw(msg string, fields ...Field) {
+	if l.level > levelError {
+		return
+	}
 	reportMsg := l.outputw("[ERROR] ", msg, fields)
 	l.reportEvent(3, "[ERROR] "+reportMsg)
 }
 
 // Fatalw logs a fatal error with structured fields, then exits.
+// Honors the Nop level guard like Fatal.
 func (l *Logger) Fatalw(msg string, fields ...Field) {
+	if l.level > levelError {
+		return
+	}
 	reportMsg := l.outputw("[ERROR] ", msg, fields)
 	l.reportEvent(4, "[FATAL] "+reportMsg)
 	os.Exit(1)

@@ -57,9 +57,19 @@ func TestIsPrivatePTR(t *testing.T) {
 		{"1.1.168.192.in-addr.arpa.", true},
 		// 169.254.0.0/16 (link-local)
 		{"1.1.254.169.in-addr.arpa.", true},
+		// 127.0.0.0/8 (loopback)
+		{"1.0.0.127.in-addr.arpa.", true},
 		// Public IPs
 		{"4.4.8.8.in-addr.arpa.", false},
 		{"1.1.1.1.in-addr.arpa.", false},
+		// IPv6 loopback ::1 (low nibble of byte 15 first → "1.0...0.")
+		{"1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.", true},
+		// IPv6 ULA fc00::1 (last two nibbles are c.f for byte 0 = 0xfc)
+		{"1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.c.f.ip6.arpa.", true},
+		// IPv6 link-local fe80::1 (last two nibbles are e.f for byte 0 = 0xfe; byte 1 = 0x80)
+		{"1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.e.f.ip6.arpa.", true},
+		// IPv6 public 2001:db8::1 (byte 0 = 0x20, byte 1 = 0x01, byte 2 = 0x0d, byte 3 = 0xb8)
+		{"1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.", false},
 		// Not in-addr.arpa
 		{"example.com.", false},
 		// Malformed

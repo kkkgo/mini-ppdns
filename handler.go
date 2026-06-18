@@ -156,6 +156,7 @@ type miniHandler struct {
 	trustRcodes      map[int]bool
 	lite             bool
 	bogusPriv        bool         // return NXDOMAIN for private PTR not found locally
+	blockSVCB        bool         // block SVCB/HTTPS queries to prevent DNS split bypass
 	ptrResolver      *ptrResolver // nil if no lease/hosts files configured
 
 	pplogReporter *pplog.Reporter
@@ -583,18 +584,26 @@ func cloneRRsWithTTL(src []dns.RR, ttl uint32) []dns.RR {
 }
 
 // cloneExtraWithTTL is like cloneRRsWithTTL but preserves the OPT pseudo-
-// record's TTL (which encodes EDNS flags, not a cache lifetime).
+// record's TTL (which encodes EDNS flags, not a cache lifetime). nil
+// entries are skipped to keep the function tolerant of malformed cached
+// Extra slices — matches cloneRRsWithTTL's contract.
 func cloneExtraWithTTL(src []dns.RR, ttl uint32) []dns.RR {
 	if len(src) == 0 {
 		return nil
 	}
-	out := make([]dns.RR, len(src))
-	for i, rr := range src {
+	out := make([]dns.RR, 0, len(src))
+	for _, rr := range src {
+		if rr == nil {
+			continue
+		}
 		c := rr.Clone()
 		if dns.RRToType(c) != dns.TypeOPT {
 			c.Header().TTL = ttl
 		}
-		out[i] = c
+		out = append(out, c)
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
@@ -712,7 +721,19 @@ func (h *miniHandler) applyLiteMode(r *dns.Msg, qtype uint16, qname string) {
 				if !strings.EqualFold(rr.Header().Name, finalName) {
 					continue // skip records not in the chain
 				}
-				rr.Header().Name = qname
+				// Clone before rewriting Name. cacheSnapshot copies only the
+				// slice header — RR pointers stay shared with whatever
+				// cacheSnapshot is about to store. Mutating rr.Header().Name
+				// in place would (a) write through to the upstream-decoded
+				// Msg the caller still holds and (b) bake the current query's
+				// case into the cached RR, so subsequent cache hits for the
+				// same name in different case would echo the first caller's
+				// case in the Answer section. cacheSnapshot's contract says
+				// RRs are immutable once stored; preserve that here.
+				cloned := rr.Clone()
+				cloned.Header().Name = qname
+				ans = append(ans, cloned)
+				continue
 			}
 			ans = append(ans, rr)
 		}
@@ -764,7 +785,13 @@ func (h *miniHandler) process(ctx context.Context, qCtx *query_context.Context) 
 	q := qCtx.QQuestion()
 	// DNS names are case-insensitive; normalize so Example.COM and example.com share a cache entry.
 	cacheKey := CacheKey{Name: lowerASCIIName(q.Name), Qtype: q.Qtype, Qclass: q.Qclass}
-	if h.tryCacheHit(qCtx, cacheKey) {
+	// forceFall clients must not observe (or pollute) the shared cache: the
+	// cache key has no route dimension, so a main-DNS NOERROR cached by a
+	// normal client would leak straight through to a force_fall client and
+	// silently bypass the fallback routing policy. Skipping tryCacheHit here,
+	// and tryCacheStore on the write side inside execFallbackAndFinalize,
+	// keeps force_fall queries fully on the fallback path.
+	if !route.forceFall && h.tryCacheHit(qCtx, cacheKey) {
 		return nil
 	}
 	localResp, localNoData, handled := h.execLocal(ctx, qCtx, route, cacheKey)
@@ -782,7 +809,7 @@ func (h *miniHandler) tryStaticRewrite(qCtx *query_context.Context) bool {
 	q := qCtx.QQuestion()
 
 	// Reject AAAA, SVCB, HTTPS queries
-	if q.Qtype == dns.TypeSVCB || q.Qtype == dns.TypeHTTPS || (h.aaaaMode == "no" && q.Qtype == dns.TypeAAAA) {
+	if (h.blockSVCB && (q.Qtype == dns.TypeSVCB || q.Qtype == dns.TypeHTTPS)) || (h.aaaaMode == "no" && q.Qtype == dns.TypeAAAA) {
 		// Pick a route label so debug logs and pplog telemetry line up with
 		// the hosts/local-ptr/bogus-priv paths instead of disappearing
 		// silently. SVCB and HTTPS were previously logged nowhere, and the
@@ -1134,6 +1161,13 @@ func (h *miniHandler) execFallbackAndFinalize(ctx context.Context, qCtx *query_c
 
 	fallIsNoData := rFall != nil && rFall.Rcode == dns.RcodeSuccess && len(rFall.Answer) == 0
 
+	// forceFall queries are isolated from the shared cache on both read
+	// (process()) and write sides. Mirror that here: storing a force_fall
+	// response under the shared cacheKey would let a normal client picking
+	// up the entry within fallbackTTL bypass the main upstream they were
+	// supposed to use. The TTL is short (1s) but the leak is real.
+	cacheWrites := !route.forceFall
+
 	// If both local and fall returned NODATA, prefer localForward result
 	// (it may contain useful SOA/CNAME records with original TTL)
 	if localNoData != nil && (fallIsNoData || rFall == nil) {
@@ -1141,16 +1175,18 @@ func (h *miniHandler) execFallbackAndFinalize(ctx context.Context, qCtx *query_c
 			h.applyLiteMode(localNoData, q.Qtype, q.Name)
 		}
 		qCtx.SetResponse(localNoData)
-		snap, ttl := cacheSnapshot(localNoData)
-		// Match the trust_rcode and aaaa=noerror branches: a NODATA reply
-		// without an SOA in Authority has no minimum TTL, but we still
-		// want it cached for at least one second so an immediately-retried
-		// query doesn't re-traverse the upstream pipeline. Without this
-		// floor, NODATA responses missing an SOA silently bypass the cache.
-		if ttl == 0 {
-			ttl = 1
+		if cacheWrites {
+			snap, ttl := cacheSnapshot(localNoData)
+			// Match the trust_rcode and aaaa=noerror branches: a NODATA reply
+			// without an SOA in Authority has no minimum TTL, but we still
+			// want it cached for at least one second so an immediately-retried
+			// query doesn't re-traverse the upstream pipeline. Without this
+			// floor, NODATA responses missing an SOA silently bypass the cache.
+			if ttl == 0 {
+				ttl = 1
+			}
+			h.dnsCache.Store(cacheKey, snap, time.Now().Add(time.Duration(ttl)*time.Second))
 		}
-		h.dnsCache.Store(cacheKey, snap, time.Now().Add(time.Duration(ttl)*time.Second))
 	} else if rFall != nil {
 		if h.lite {
 			h.applyLiteMode(rFall, q.Qtype, q.Name)
@@ -1171,8 +1207,10 @@ func (h *miniHandler) execFallbackAndFinalize(ctx context.Context, qCtx *query_c
 				ext.Header().TTL = fallbackTTL
 			}
 		}
-		snap, _ := cacheSnapshot(qCtx.R())
-		h.dnsCache.Store(cacheKey, snap, time.Now().Add(time.Duration(fallbackTTL)*time.Second))
+		if cacheWrites {
+			snap, _ := cacheSnapshot(qCtx.R())
+			h.dnsCache.Store(cacheKey, snap, time.Now().Add(time.Duration(fallbackTTL)*time.Second))
+		}
 	} else if errFall != nil && localResp != nil {
 		// Fallback failed entirely (timeout / network error). Surface the
 		// main-DNS response that was logged earlier (NXDOMAIN/REFUSED/NODATA)
@@ -1182,11 +1220,13 @@ func (h *miniHandler) execFallbackAndFinalize(ctx context.Context, qCtx *query_c
 			h.applyLiteMode(localResp, q.Qtype, q.Name)
 		}
 		qCtx.SetResponse(localResp)
-		snap, ttl := cacheSnapshot(localResp)
-		if ttl == 0 {
-			ttl = 1
+		if cacheWrites {
+			snap, ttl := cacheSnapshot(localResp)
+			if ttl == 0 {
+				ttl = 1
+			}
+			h.dnsCache.Store(cacheKey, snap, time.Now().Add(time.Duration(ttl)*time.Second))
 		}
-		h.dnsCache.Store(cacheKey, snap, time.Now().Add(time.Duration(ttl)*time.Second))
 	}
 
 	switch {
@@ -1205,7 +1245,19 @@ func (h *miniHandler) execFallbackAndFinalize(ctx context.Context, qCtx *query_c
 	default:
 		rcodeStr := "NXDOMAIN or timeout"
 		if rFall != nil {
-			rcodeStr = dns.RcodeToString[rFall.Rcode]
+			// Surface NODATA explicitly so this path's label matches
+			// the local-resolver branch (which already says "NODATA").
+			// Without this, a fallback NOERROR with empty Answer would
+			// log as "NOERROR" while an identical local-resolver result
+			// logged as "NODATA" — splitting one observable into two.
+			if rFall.Rcode == dns.RcodeSuccess && len(rFall.Answer) == 0 {
+				rcodeStr = "NODATA"
+			} else {
+				rcodeStr = dns.RcodeToString[rFall.Rcode]
+				if rcodeStr == "" {
+					rcodeStr = "RCODE_" + strconv.Itoa(int(rFall.Rcode))
+				}
+			}
 		}
 		logFallQuery(h.logger, route.fallRoute, qCtx.ServerMeta.ClientAddr, upFall, q.Qtype, q.Name, rcodeStr, durFall, nil)
 	}

@@ -239,7 +239,6 @@ func (pr *ptrResolver) loadLeaseFile(path string, m map[string]string, modTimes 
 	if err != nil {
 		return
 	}
-	modTimes[path] = info.ModTime()
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -276,17 +275,20 @@ func (pr *ptrResolver) loadLeaseFile(path string, m map[string]string, modTimes 
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		// Record no modTime on a mid-scan failure so the next maybeReload
+		// re-reads this file instead of trusting the partial data we just
+		// loaded. Updating modTime here would freeze the partial result in
+		// place until the file's mtime changed again.
 		pr.logger.Warnw("lease file scan error", mlog.String("path", path), mlog.Err(err))
+		return
 	}
+	modTimes[path] = info.ModTime()
 }
 
 func (pr *ptrResolver) loadHostsFile(path string, ptrMap map[string]string, fwdMap map[string][]net.IP, modTimes map[string]time.Time) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return
-	}
-	if modTimes != nil {
-		modTimes[path] = info.ModTime()
 	}
 
 	f, err := os.Open(path)
@@ -328,7 +330,15 @@ func (pr *ptrResolver) loadHostsFile(path string, ptrMap map[string]string, fwdM
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		// Same as loadLeaseFile: skip the modTime update on a mid-scan
+		// failure so the next reload retries instead of trusting partial
+		// data. (modTimes is nil for auto-detected hosts files, which are
+		// loaded once and never watched — guarded below.)
 		pr.logger.Warnw("hosts file scan error", mlog.String("path", path), mlog.Err(err))
+		return
+	}
+	if modTimes != nil {
+		modTimes[path] = info.ModTime()
 	}
 }
 
@@ -354,13 +364,21 @@ func (pr *ptrResolver) LookupIP(name string) []net.IP {
 		return nil
 	}
 	out := make([]net.IP, len(src))
-	copy(out, src)
+	for i, ip := range src {
+		// net.IP is a []byte. copy(out, src) would duplicate only the slice
+		// headers, leaving each out[i] aliasing the resolver's stored bytes —
+		// a caller mutating an address in place (out[0][0] = ...) would then
+		// corrupt fwdMap. Clone each address so the returned slice is truly
+		// independent, as the doc comment promises.
+		out[i] = append(net.IP(nil), ip...)
+	}
 	return out
 }
 
 // isPrivatePTR checks if a PTR query name corresponds to a private IP address.
 // Covers IPv4 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16,
-// 127.0.0.0/8 (loopback), and IPv6 ULA (fc00::/7) and link-local (fe80::/10).
+// 127.0.0.0/8 (loopback), IPv6 ULA (fc00::/7), link-local (fe80::/10),
+// and IPv6 loopback (::1).
 func isPrivatePTR(qname string) bool {
 	qname = lowerASCIIName(qname)
 	if strings.HasSuffix(qname, ".in-addr.arpa.") {
@@ -409,7 +427,7 @@ func isPrivatePTR(qname string) bool {
 			}
 		}
 		addr := netip.AddrFrom16(bytes16)
-		return addr.IsPrivate() || addr.IsLinkLocalUnicast()
+		return addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLoopback()
 	}
 	return false
 }

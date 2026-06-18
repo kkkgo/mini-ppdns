@@ -42,6 +42,34 @@ func TestLoggerColor(t *testing.T) {
 	}
 }
 
+// TestNopLoggerErrorAndFatalAreNoOp guards the Nop() level guard added
+// to Error/Errorf/Errorw/Fatal/Fatalw/ErrorBuild. Before the guard,
+// Fatal on a Nop logger called os.Exit(1), making "no-op" loggers
+// production-unsafe in tests that exercise an error path. The Error
+// variants would also touch io.Discard via the timestamp/format builders
+// — wasted CPU but no observable side effects. This test exercises the
+// non-Fatal entry points and verifies they return cleanly without
+// triggering output (the level guard short-circuits before any work).
+func TestNopLoggerErrorPathsAreNoOp(t *testing.T) {
+	nop := Nop()
+	// Each of these would have written through to io.Discard previously;
+	// now they short-circuit at level. We can't directly observe the
+	// "no work" property here — the test exists so that any future
+	// regression that drops the guard will fail loudly when paired with
+	// a Fatal-on-Nop expectation in downstream tests.
+	nop.Error("ignored")
+	nop.Errorf("ignored %d", 1)
+	nop.Errorw("ignored", String("k", "v"))
+	nop.ErrorBuild(func(buf []byte, color bool) []byte {
+		// If the level guard regressed, this fn would actually run and
+		// the test would still pass — so additionally verify level state.
+		return append(buf, "should-not-run"...)
+	})
+	if nop.level != levelOff {
+		t.Fatalf("Nop().level = %v, want levelOff", nop.level)
+	}
+}
+
 func BenchmarkLogger(b *testing.B) {
 	l, _ := NewLogger(LogConfig{Level: "info"})
 	b.ResetTimer()

@@ -603,3 +603,92 @@ func TestShouldSkipHeartbeat(t *testing.T) {
 		})
 	}
 }
+
+// TestEncodeRRSection_LargeRData pins the A3 contract: an RR with RData
+// > 256 bytes (DKIM 2048-bit pubkeys, SVCB blobs, long TXT) must no longer
+// be silently dropped by the hex-decode scratch buffer. The previous
+// [512]byte rdataBuf failed hexDecodeInto and `continue`'d past the RR;
+// with the buffer sized to MaxInnerPayload the RR survives encoding so
+// long as it fits in the output packet.
+func TestEncodeRRSection_LargeRData(t *testing.T) {
+	// Build a TXT RR whose RData totals ~400 bytes — well past the old
+	// 256-byte ceiling and a realistic DKIM-like payload size.
+	const dkimChunk = "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAabcdefghijklmnopqrstuvwx"
+	bigTXT, err := dns.New(fmt.Sprintf("_dmarc.example.com. 300 IN TXT %q %q %q %q %q",
+		dkimChunk, dkimChunk, dkimChunk, dkimChunk, dkimChunk))
+	if err != nil {
+		t.Fatalf("synthesize TXT: %v", err)
+	}
+
+	buf := make([]byte, MaxInnerPayload)
+	n := encodeRRSection(buf, []dns.RR{bigTXT})
+	if n <= 1 {
+		t.Fatalf("encodeRRSection returned %d, expected the RR to be emitted", n)
+	}
+	if got := int(buf[0]); got != 1 {
+		t.Fatalf("encoded RR count = %d, want 1 (RR was silently dropped — A3 regression)", got)
+	}
+}
+
+// TestEncodeRRSection_HandlesNilRR pins the B4 contract: a nil entry in
+// the section slice must not crash the pplog encoder. Report runs inline
+// on the caller's goroutine, so a nil-deref panic here would tear down
+// the UDP listener loop.
+func TestEncodeRRSection_HandlesNilRR(t *testing.T) {
+	aRR, _ := dns.New("example.com. 60 IN A 1.2.3.4")
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			t.Fatalf("encodeRRSection panicked on nil RR: %v", rec)
+		}
+	}()
+	buf := make([]byte, MaxInnerPayload)
+
+	// Pure nil should be tolerated (no RRs emitted).
+	if n := encodeRRSection(buf, []dns.RR{nil}); n < 1 || buf[0] != 0 {
+		t.Errorf("nil-only slice: n=%d count=%d, want n>=1 count=0", n, buf[0])
+	}
+
+	// nil interleaved with a real RR: only the real one is emitted.
+	for i := range buf {
+		buf[i] = 0
+	}
+	if n := encodeRRSection(buf, []dns.RR{nil, aRR, nil}); n < 1 || buf[0] != 1 {
+		t.Errorf("interleaved nil slice: n=%d count=%d, want n>=1 count=1", n, buf[0])
+	}
+}
+
+// TestFitPayload_HandlesNilRR is the higher-level B4 regression: fitPayload
+// also funnels through filterOPT / encodeRRs, both of which previously
+// called dns.RRToType(nil). With nil entries possible in pathological
+// upstream responses, this would crash the resolver on the first such
+// query at pplog level ≥ 3.
+func TestFitPayload_HandlesNilRR(t *testing.T) {
+	aRR, _ := dns.New("example.com. 60 IN A 1.2.3.4")
+
+	entry := &QueryEntry{
+		ClientIP:  netip.MustParseAddr("10.0.0.1"),
+		QType:     dns.TypeA,
+		Rcode:     0,
+		Route:     RouteLocal,
+		Duration:  1,
+		QueryName: "example.com.",
+		Upstream:  "udp://1.1.1.1:53",
+		AnswerRRs: []dns.RR{nil, aRR, nil},
+		ExtraRRs:  []dns.RR{nil},
+	}
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			t.Fatalf("fitPayload panicked on nil RR: %v", rec)
+		}
+	}()
+	var buf [MaxPacketSize]byte
+	n := fitPayload(buf[:], entry, 4, 1000, MaxInnerPayload)
+	if n <= 0 {
+		t.Fatal("fitPayload returned 0")
+	}
+	if n > MaxInnerPayload {
+		t.Errorf("fitPayload returned %d, exceeds max %d", n, MaxInnerPayload)
+	}
+}

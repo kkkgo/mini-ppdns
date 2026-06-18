@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,10 +51,47 @@ func newLazyDnsConn(
 	}
 
 	go func() {
+		// A panic inside dial() — typically a misbehaving custom
+		// DialContext or a future stdlib edge case — must not crash the
+		// resolver process. It also must not leave dialFinished unclosed:
+		// every ReserveNewQuery + ExchangeReserved on this lazyDnsConn
+		// blocks on <-dialFinished, so silently leaking it would deadlock
+		// the entire transport. Recover, synthesize a dial error so callers
+		// see something other than ErrLazyConnCannotReserveQueryExchanger,
+		// and close dialFinished under lc.mu (matching the normal-path
+		// lock ordering with Close()).
+		defer func() {
+			rec := recover()
+			if rec == nil {
+				return
+			}
+			lc.mu.Lock()
+			defer lc.mu.Unlock()
+			if lc.closed {
+				return
+			}
+			lc.dialErr = fmt.Errorf("dial panic: %v", rec)
+			select {
+			case <-lc.dialFinished:
+				// Close() already closed it before we got here.
+			default:
+				close(lc.dialFinished)
+			}
+		}()
 		dc, err := dial(dialCtx)
 		cancelDial()
 		if err != nil {
 			logger.Warnw("failed to dial dns conn", mlog.Err(err))
+			// A conforming dial returns (nil, err) on failure, but a
+			// misbehaving one may hand back a live conn alongside the error.
+			// Close it now and drop the reference: the slow path below would
+			// otherwise store it in lc.c with dialErr set, and
+			// reserveExchanger drops such a dead lazyDnsConn without calling
+			// lc.Close(), leaking the underlying socket.
+			if dc != nil {
+				dc.Close()
+				dc = nil
+			}
 		}
 		lc.mu.Lock()
 		if lc.closed { // lc was closed and dial was canceled

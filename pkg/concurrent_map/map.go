@@ -190,7 +190,12 @@ func (s *shard[K, V]) len() int {
 func (s *shard[K, V]) flush() {
 	s.l.Lock()
 	defer s.l.Unlock()
-	s.m = make(map[K]V)
+	// clear (Go 1.21+) reuses the existing hash table buckets so a
+	// large flushed map's memory is dropped incrementally as old keys
+	// are overwritten, instead of handing the whole backing storage
+	// to the GC at once. For caches that flush after burst growth
+	// (DNS reload, hook switchover) this dampens the GC spike.
+	clear(s.m)
 }
 
 func (s *shard[K, V]) rangeReadOnly(f func(k K, v V) bool) bool {
