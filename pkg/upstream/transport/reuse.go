@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -17,6 +18,12 @@ import (
 // Most authoritative servers answer or SERVFAIL within 3-5 s; six
 // buys a little headroom on slow links while still redialing quickly.
 const reuseConnQueryTimeout = 6 * time.Second
+
+// maxIdleConns caps how many parked idle conns a transport hoards. A
+// burst of dialed-but-abandoned conns (caller ctx cancelled mid-dial)
+// would otherwise pile into the idle LIFO faster than idleTimeout reaps
+// them; past the cap, setIdle closes the conn instead of parking it.
+const maxIdleConns = 16
 
 // ReuseConnTransport drives the non-pipelined "one query at a time per
 // connection" mode used for plain TCP (no DoT pipelining). It keeps a
@@ -38,6 +45,9 @@ type ReuseConnTransport struct {
 	// conns. Push and pop are O(1); mid-list removal (on shutdown) is
 	// O(1) via each node's prev/next pointers instead of a map scan.
 	idleHead *reusableConn
+	// idleLen tracks the length of the idle LIFO so setIdle can enforce
+	// maxIdleConns without walking the list.
+	idleLen int
 
 	// testWaitRespTimeout, when positive, overrides reuseConnQueryTimeout
 	// so tests can trigger the "peer went silent" path without the full
@@ -196,20 +206,34 @@ func (t *ReuseConnTransport) takeAnyIdle() (*reusableConn, error) {
 }
 
 // setIdle puts c back onto the idle LIFO, unless the transport has been
-// closed in the meantime or c was already unlinked from t.conns.
+// closed in the meantime or c was already unlinked from t.conns. When the
+// idle pool is already at maxIdleConns, c is dropped and closed instead of
+// parked, so a cancel flood can't grow the pool without bound.
 func (t *ReuseConnTransport) setIdle(c *reusableConn) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.closed {
+		t.mu.Unlock()
 		return
 	}
 	if _, ok := t.conns[c]; !ok {
+		t.mu.Unlock()
 		return
 	}
 	if c.onIdle {
 		// Defensive: already linked — don't double-insert. Reaching
 		// this is a logic error upstream (setIdle called twice), but
 		// silently ignoring is safer than corrupting the list.
+		t.mu.Unlock()
+		return
+	}
+	if t.idleLen >= maxIdleConns {
+		// Pool is full. Evict this conn from the transport and close it
+		// outside the lock. We've already removed it from t.conns (and it
+		// was never on the idle list), so shutdown's byTransport=true path
+		// correctly skips re-doing that cleanup.
+		delete(t.conns, c)
+		t.mu.Unlock()
+		c.shutdown(errIdlePoolFull, true)
 		return
 	}
 	c.prev = nil
@@ -219,6 +243,8 @@ func (t *ReuseConnTransport) setIdle(c *reusableConn) {
 	}
 	t.idleHead = c
 	c.onIdle = true
+	t.idleLen++
+	t.mu.Unlock()
 }
 
 // unlinkIdleLocked removes c from the idle list. Caller must hold t.mu
@@ -237,6 +263,7 @@ func (t *ReuseConnTransport) unlinkIdleLocked(c *reusableConn) {
 	}
 	c.prev, c.next = nil, nil
 	c.onIdle = false
+	t.idleLen--
 }
 
 // Close closes the transport and every conn. Idempotent.
@@ -298,6 +325,15 @@ func (t *ReuseConnTransport) registerConn(raw NetConn) *reusableConn {
 	t.conns[rc] = struct{}{}
 	t.mu.Unlock()
 
+	// Arm an initial read deadline before the read loop starts. Without it,
+	// a conn that is dialed and then immediately parked idle (caller's ctx
+	// cancelled during the dial — see dialNew's callCtx.Done branch) without
+	// ever being exchanged would block readLoop's first ReadRawMsgFromTCP on
+	// a deadline-less Read forever, leaking the goroutine and the fd: the
+	// idleTimeout deadline is otherwise only armed after the first successful
+	// read. exchange() always runs after registerConn returns, so its tighter
+	// SetDeadline overrides this whenever the conn is actually used.
+	rc.c.SetReadDeadline(time.Now().Add(t.idleTimeout))
 	go rc.readLoop()
 	return rc
 }
@@ -307,6 +343,7 @@ var (
 	errUnexpectedResp     = errors.New("reusableConn: unexpected response while idle")
 	errConcurrentExchange = errors.New("reusableConn: concurrent exchange on same conn")
 	errRespChanFull       = errors.New("reusableConn: reply channel unexpectedly full")
+	errIdlePoolFull       = errors.New("reusableConn: idle pool full, dropping conn")
 )
 
 // readLoop pulls frames off the wire and hands them to the one
@@ -315,6 +352,17 @@ var (
 // waitingResp, so under correct usage the channel has at most one frame
 // pending at a time.
 func (c *reusableConn) readLoop() {
+	defer func() {
+		if rec := recover(); rec != nil {
+			// Funnel any deep-stack panic (typically from a misbehaving
+			// custom NetConn or future miekg/dns decode edge case) into the
+			// normal shutdown path. Without this an unrecovered panic in
+			// this goroutine would crash the whole resolver process; with
+			// it, ReuseConnTransport cleanly evicts the conn and the next
+			// exchange redials.
+			c.shutdown(fmt.Errorf("readLoop panic: %v", rec), false)
+		}
+	}()
 	for {
 		resp, err := dnsutils.ReadRawMsgFromTCP(c.c)
 		if err != nil {
@@ -433,6 +481,15 @@ func (c *reusableConn) exchange(ctx context.Context, q *[]byte) (*[]byte, error)
 	case <-c.closedCh:
 		return nil, c.closeErr
 	case <-ctx.Done():
+		// Clear waitingResp before bailing so the conn — if returned to
+		// idle by the caller layer — doesn't trip the concurrent-exchange
+		// shutdown the next time it's picked up. readLoop also clears
+		// waitingResp on its next received frame, but on a silent peer
+		// that frame may never come; without this branch, every ctx
+		// cancel forced an unnecessary reconnect.
+		c.mu.Lock()
+		c.waitingResp = false
+		c.mu.Unlock()
 		return nil, context.Cause(ctx)
 	}
 }

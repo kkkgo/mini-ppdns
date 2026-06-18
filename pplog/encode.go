@@ -102,8 +102,16 @@ func EncodeInnerHeader(buf []byte, seq uint32, level byte, payloadLen uint16) in
 }
 
 // EncodeQueryEntry encodes a query log entry at the given level into buf (after header).
-// Returns the number of bytes written (payload length).
+// Returns the number of bytes written (payload length). Returns 0 if buf is
+// too small to hold even the fixed-prefix fields.
 func EncodeQueryEntry(buf []byte, entry *QueryEntry, level int, ts uint32) int {
+	// Bare minimum for the fixed-prefix fields:
+	//   ts(4) + flags(1) + clientIP(min 4) + qtype(2) + rcode(1) + qnameLen(1)
+	// = 13 bytes. Bail out before any out-of-range write so a misuse of the
+	// buffer surfaces as a zero return rather than a panic.
+	if len(buf) < 13 {
+		return 0
+	}
 	off := 0
 
 	// Timestamp (4 bytes)
@@ -305,9 +313,15 @@ func fitPayload(buf []byte, entry *QueryEntry, level int, ts uint32, maxSize int
 
 // filterOPT returns RRs with OPT records removed, reusing the input slice to avoid allocation.
 // WARNING: This modifies the input slice in place. Caller must not reuse the original slice.
+// nil entries are also dropped — dns.RRToType(nil) would otherwise panic
+// inside pplog's hot path (Report runs inline; a panic here is not
+// covered by handler-side recover and would crash the process).
 func filterOPT(rrs []dns.RR) []dns.RR {
 	n := 0
 	for _, rr := range rrs {
+		if rr == nil {
+			continue
+		}
 		if dns.RRToType(rr) != dns.TypeOPT {
 			rrs[n] = rr
 			n++
@@ -323,8 +337,12 @@ func encodeRRSection(buf []byte, rrs []dns.RR) int {
 	// Fast path: scan for OPT first; the common case has none, in which case
 	// we can pass the slice straight through with zero allocation. Only copy
 	// when an OPT actually needs to be filtered out.
+	// Skip nil entries — see filterOPT for the rationale.
 	hasOPT := false
 	for _, rr := range rrs {
+		if rr == nil {
+			continue
+		}
 		if dns.RRToType(rr) == dns.TypeOPT {
 			hasOPT = true
 			break
@@ -350,12 +368,29 @@ func encodeRRs(buf []byte, rrs []dns.RR) int {
 	buf[off] = byte(count)
 	off++
 
-	// Stack-local buffer for hex decode, avoids per-RR heap allocation
-	var rdataBuf [512]byte
+	// Stack-local buffer for hex decode, avoids per-RR heap allocation.
+	// Sized to MaxInnerPayload because a single RR's RData cannot exceed
+	// the inner-payload budget the encoder is writing into: the packet
+	// length check below (off+8+rdLen > len(buf)) is the final gate on
+	// whether an RR fits, but if hexDecodeInto rejects the RR up front
+	// (the previous [512]byte limit refused anything past 256 B of RData)
+	// the RR is silently dropped from telemetry — DKIM 2048-bit pubkeys,
+	// SVCB/HTTPS parameter blocks, and long TXT records were the typical
+	// casualties. Binding the buffer to MaxInnerPayload makes "can we
+	// decode it" follow "can it fit in the packet at all" and removes the
+	// silent drop entirely.
+	var rdataBuf [MaxInnerPayload]byte
 
 	written := 0
 	for i := 0; i < count; i++ {
 		rr := rrs[i]
+		if rr == nil {
+			// Defensive: skip nil entries so a malformed Answer slice can't
+			// crash the pplog sender (Report runs inline on the caller's
+			// goroutine; a panic here would propagate to e.g. the UDP read
+			// loop and tear the process down).
+			continue
+		}
 		hdr := rr.Header()
 		rrType := dns.RRToType(rr)
 

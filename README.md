@@ -82,6 +82,9 @@ lite=yes
 # trust_rcode=0,3
 # bogus-priv功能（默认启用，等效于OpenWRT的 option boguspriv '1'） 设置为0可以关闭此功能
 # boguspriv=1
+# 禁止SVCB记录避免DNS分流失效，默认为yes
+# 设置为no就不禁止SVCB type 64 65
+# block_svcb=yes
 # 手动指定DHCP lease文件路径，用于本地PTR记录解析（支持逗号分隔多个文件）
 # 初始化时所有文件都不存在则不启用PTR解析，该功能在openwrt等路由器系统上会自动查找可用配置，无需指定
 # lease_file=

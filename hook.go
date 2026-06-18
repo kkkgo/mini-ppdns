@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"codeberg.org/miekg/dns"
@@ -62,20 +62,48 @@ type hookMonitor struct {
 	// cmdWg tracks in-flight switch-exec goroutines so main can wait for
 	// them to finish before closing the logger.
 	cmdWg sync.WaitGroup
+	// cmdMu guards cmdClosed. Pairing every cmdWg.Add with the cmdClosed
+	// check under this lock prevents the run loop from calling Add(1)
+	// concurrently with the cmdWg.Wait() in Wait() — that race is a
+	// sync.WaitGroup misuse panic that could fire during shutdown when a
+	// check happens to succeed right after shutdownCtx is cancelled.
+	cmdMu     sync.Mutex
+	cmdClosed bool
+}
+
+// cmdAdd registers one tracked command goroutine. It returns false once
+// Wait() has been called (shutdown started), in which case the caller must
+// not start the goroutine. Holding cmdMu across the cmdClosed check and the
+// Add guarantees Add never races the Wait inside Wait().
+func (hm *hookMonitor) cmdAdd() bool {
+	hm.cmdMu.Lock()
+	defer hm.cmdMu.Unlock()
+	if hm.cmdClosed {
+		return false
+	}
+	hm.cmdWg.Add(1)
+	return true
 }
 
 // Wait blocks until all hook-spawned command goroutines have returned.
+// After Wait returns (or even begins), no further tracked goroutines can
+// start — cmdAdd will refuse them.
 func (hm *hookMonitor) Wait() {
+	hm.cmdMu.Lock()
+	hm.cmdClosed = true
+	hm.cmdMu.Unlock()
 	hm.cmdWg.Wait()
 }
 
 // runCmdTracked runs cmdStr while holding a reference in cmdWg so that
-// graceful shutdown can wait for it.
+// graceful shutdown can wait for it. No-op once shutdown has started.
 func (hm *hookMonitor) runCmdTracked(cmdStr string) {
 	if cmdStr == "" {
 		return
 	}
-	hm.cmdWg.Add(1)
+	if !hm.cmdAdd() {
+		return
+	}
 	go func() {
 		defer hm.cmdWg.Done()
 		runExecCmd(hm.shutdownCtx, hm.logger, cmdStr)
@@ -120,9 +148,9 @@ func (hm *hookMonitor) run(ctx context.Context) {
 				hm.logger.Warnw("[hook] main DNS marked DOWN, switching to fallback",
 					mlog.Int("failures", failCount))
 				// Wait retryTime before executing switch_fall_exec so fallback DNS
-				// is active and available for the script (e.g. sending notifications)
-				if hm.cfg.SwitchFallExec != "" {
-					hm.cmdWg.Add(1)
+				// is active and available for the script (e.g. sending notifications).
+				// cmdAdd (not a bare cmdWg.Add) so this can't race main's Wait().
+				if hm.cfg.SwitchFallExec != "" && hm.cmdAdd() {
 					go func(cmd string) {
 						defer hm.cmdWg.Done()
 						select {
@@ -150,16 +178,34 @@ func (hm *hookMonitor) run(ctx context.Context) {
 }
 
 // shellCommand creates an exec.Cmd that runs cmdStr through the system shell.
-// Uses SHELL env var on Unix (fallback /bin/sh), cmd.exe on Windows.
+// Uses SHELL env var (fallback /bin/sh). The shell is started in a new
+// process group (Setpgid) so that when ctx is cancelled, the custom
+// Cancel handler can SIGKILL the entire group with kill(-pgid). Without
+// this, exec.CommandContext only kills the direct shell child, leaving
+// any backgrounded grandchildren ("&" jobs in scripts) as orphans that
+// outlive the resolver and stall shutdown.
 func shellCommand(ctx context.Context, cmdStr string) *exec.Cmd {
-	if runtime.GOOS == "windows" {
-		return exec.CommandContext(ctx, "cmd", "/C", cmdStr)
-	}
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "/bin/sh"
 	}
-	return exec.CommandContext(ctx, shell, "-c", cmdStr)
+	cmd := exec.CommandContext(ctx, shell, "-c", cmdStr)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		// cmd.Process is non-nil whenever Cancel runs (CommandContext
+		// only fires Cancel after Start). Send SIGKILL to -pid which
+		// the kernel interprets as the process group leader's group.
+		if cmd.Process != nil {
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return nil
+	}
+	// WaitDelay caps how long Wait blocks after Cancel before forcibly
+	// closing copy goroutines. Five seconds is comfortably above any
+	// realistic SIGKILL propagation time but short enough that a stuck
+	// grandchild's open stdout pipe doesn't extend shutdown indefinitely.
+	cmd.WaitDelay = 5 * time.Second
+	return cmd
 }
 
 func (hm *hookMonitor) check(ctx context.Context) error {

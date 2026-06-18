@@ -52,6 +52,7 @@ func main() {
 		leaseFileStr = flag.String("lease_file", "", "DHCP lease files for PTR resolution (comma separated, e.g. /tmp/dhcp.leases)")
 		hostsFileStr = flag.String("hosts_file", "", "Hosts files for PTR resolution (comma separated, e.g. /etc/hosts)")
 		bogusPrivPtr = flag.Bool("boguspriv", true, "Return NXDOMAIN for private IP PTR queries not found locally (default true)")
+		blockSVCBPtr = flag.Bool("block_svcb", true, "Block SVCB(64)/HTTPS(65) queries to prevent DNS split bypass (default true)")
 	)
 
 	flag.Parse()
@@ -143,6 +144,19 @@ func main() {
 		args.BogusPriv = true
 	}
 	// Otherwise, config file value is already set and takes precedence
+
+	// block_svcb: CLI flag > config file > default (true)
+	blockSVCBCLI := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "block_svcb" {
+			blockSVCBCLI = true
+		}
+	})
+	if blockSVCBCLI {
+		args.BlockSVCB = *blockSVCBPtr
+	} else if !args.BlockSVCBSet {
+		args.BlockSVCB = true
+	}
 
 	// Normalize and validate enum-like config values (case-insensitive).
 	args.AAAA = strings.ToLower(strings.TrimSpace(args.AAAA))
@@ -377,6 +391,7 @@ func main() {
 		trustRcodes:      trustRcodes,
 		lite:             args.Lite == "yes",
 		bogusPriv:        args.BogusPriv,
+		blockSVCB:        args.BlockSVCB,
 		ptrResolver:      ptr,
 		pplogReporter:    pplogReporter,
 		pplogLevel:       args.PPLogLevel,

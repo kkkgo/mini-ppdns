@@ -165,6 +165,19 @@ func ServeUDP(c *net.UDPConn, h Handler, opts UDPServerOpts) error {
 		go func(msg *dns.Msg, from netip.AddrPort, dst net.IP) {
 			defer handlerWg.Done()
 			defer func() { <-sem }()
+			// Recover so a panic deep in Handle (miekg/dns has historically
+			// panicked on pathological wire data) drops just this query
+			// instead of tearing down the whole resolver process. Mirrors
+			// the TCP per-query handler in serveTCPConn. sem release and
+			// handlerWg done both run via earlier defers so cleanup is
+			// guaranteed on the panic path.
+			defer func() {
+				if rec := recover(); rec != nil {
+					logger.Errorw("udp handler panic recovered",
+						mlog.String("recover", fmt.Sprint(rec)),
+						mlog.Stringer("from", from))
+				}
+			}()
 
 			payload := h.Handle(listenerCtx, msg,
 				QueryMeta{ClientAddr: from.Addr(), FromUDP: true},
@@ -172,6 +185,12 @@ func ServeUDP(c *net.UDPConn, h Handler, opts UDPServerOpts) error {
 			if payload == nil {
 				return
 			}
+			// Defer the release so a panic in oobWriter or
+			// WriteMsgUDPAddrPort can't leak the pooled (up to 64 KiB)
+			// buffer — the recover above would otherwise swallow the panic
+			// and skip a plain trailing ReleaseBuf. Mirrors the upstream
+			// Exec goroutine's deferred-release pattern.
+			defer pool.ReleaseBuf(payload)
 			var oob []byte
 			if oobWriter != nil && dst != nil {
 				oob = oobWriter(dst)
@@ -181,7 +200,6 @@ func ServeUDP(c *net.UDPConn, h Handler, opts UDPServerOpts) error {
 					mlog.Stringer("client", from),
 					mlog.Err(err))
 			}
-			pool.ReleaseBuf(payload)
 		}(q, remote, dstIP)
 	}
 }

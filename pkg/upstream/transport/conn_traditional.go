@@ -458,6 +458,15 @@ func (dc *TraditionalDnsConn) readResp() (*[]byte, error) {
 // readLoop fans inbound frames into the pending-query table. Runs for
 // the life of the connection and exits on any read error.
 func (dc *TraditionalDnsConn) readLoop() {
+	defer func() {
+		if rec := recover(); rec != nil {
+			// A panic here would otherwise crash the whole process (Go does
+			// not isolate goroutine panics). Convert it into a normal conn
+			// close so the transport layer can redial and waiting exchanges
+			// see ErrTDCClosed instead of an indefinite hang.
+			dc.CloseWithErr(fmt.Errorf("readLoop panic: %v", rec))
+		}
+	}()
 	for {
 		dc.c.SetReadDeadline(time.Now().Add(dc.idleTimeout))
 		frame, err := dc.readResp()

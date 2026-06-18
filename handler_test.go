@@ -2125,3 +2125,195 @@ func TestCacheSnapshotDropsQuestion(t *testing.T) {
 		t.Fatalf("expected snapshot Question to be nil (load path overwrites it), got len=%d", len(snap.Question))
 	}
 }
+
+// TestApplyLiteMode_DoesNotMutateUpstreamRR pins the A1 contract: the
+// CNAME-chain rewrite in applyLiteMode must not write through to the RR
+// objects produced by the upstream decoder. cacheSnapshot copies only the
+// slice header and stores the original RR pointers — mutating an RR's
+// Header().Name in place would propagate into every cache hit and into
+// any other caller still holding the upstream Msg.
+func TestApplyLiteMode_DoesNotMutateUpstreamRR(t *testing.T) {
+	logger, _ := mlog.NewLogger(mlog.LogConfig{Level: "error"})
+	handler := &miniHandler{logger: logger, lite: true}
+
+	cname, _ := dns.New("query.example.com. 300 IN CNAME alias.example.com.")
+	a1, _ := dns.New("alias.example.com. 60 IN A 1.2.3.4")
+	a2, _ := dns.New("alias.example.com. 60 IN A 5.6.7.8")
+
+	// Capture the pre-applyLiteMode Name for each A RR so we can detect
+	// any in-place mutation after the call returns.
+	preNames := []string{a1.Header().Name, a2.Header().Name}
+	preCNAME := cname.Header().Name
+
+	r := new(dns.Msg)
+	r.Answer = []dns.RR{cname, a1, a2}
+
+	handler.applyLiteMode(r, dns.TypeA, "Query.Example.COM.")
+
+	// The original RR objects must retain their upstream Names.
+	if got := a1.Header().Name; got != preNames[0] {
+		t.Errorf("a1 Name mutated: got %q, want %q", got, preNames[0])
+	}
+	if got := a2.Header().Name; got != preNames[1] {
+		t.Errorf("a2 Name mutated: got %q, want %q", got, preNames[1])
+	}
+	if got := cname.Header().Name; got != preCNAME {
+		t.Errorf("cname Name mutated: got %q, want %q", got, preCNAME)
+	}
+
+	// r.Answer now holds the filtered clones, which DO carry the rewritten qname.
+	if len(r.Answer) != 2 {
+		t.Fatalf("expected 2 filtered A answers, got %d", len(r.Answer))
+	}
+	for i, rr := range r.Answer {
+		if rr == a1 || rr == a2 {
+			t.Errorf("r.Answer[%d] reuses the upstream RR pointer — Clone was skipped", i)
+		}
+		if rr.Header().Name != "Query.Example.COM." {
+			t.Errorf("r.Answer[%d] Name = %q, want rewritten %q", i, rr.Header().Name, "Query.Example.COM.")
+		}
+	}
+}
+
+// TestForceFallSkipsSharedCache pins the A2 contract: forceFall queries
+// must not hit the shared dnsCache (which could leak main-DNS answers
+// into the force-fall path) and must not Store into it (which could leak
+// fall answers back to normal clients within the 1-second fallback TTL).
+func TestForceFallSkipsSharedCache(t *testing.T) {
+	logger, _ := mlog.NewLogger(mlog.LogConfig{Level: "error"})
+
+	var localCalls, fallCalls atomic.Int32
+	localAddr, localSrv, err := mockServer(func(_ context.Context, w dns.ResponseWriter, r *dns.Msg) {
+		localCalls.Add(1)
+		resp := new(dns.Msg)
+		dnsutil.SetReply(resp, r)
+		rr, _ := dns.New(r.Question[0].Header().Name + " 300 IN A 10.0.0.1")
+		resp.Answer = []dns.RR{rr}
+		resp.WriteTo(w)
+	})
+	if err != nil {
+		t.Fatalf("local mock server: %v", err)
+	}
+	defer localSrv.Shutdown(context.Background())
+
+	fallAddr, fallSrv, err := mockServer(func(_ context.Context, w dns.ResponseWriter, r *dns.Msg) {
+		fallCalls.Add(1)
+		resp := new(dns.Msg)
+		dnsutil.SetReply(resp, r)
+		rr, _ := dns.New(r.Question[0].Header().Name + " 300 IN A 99.99.99.99")
+		resp.Answer = []dns.RR{rr}
+		resp.WriteTo(w)
+	})
+	if err != nil {
+		t.Fatalf("fall mock server: %v", err)
+	}
+	defer fallSrv.Shutdown(context.Background())
+
+	uLocal, _ := upstream.NewUpstream("udp://"+localAddr, upstream.Opt{Logger: logger})
+	uFall, _ := upstream.NewUpstream("udp://"+fallAddr, upstream.Opt{Logger: logger})
+	localFwd := &miniForwarder{
+		upstreams: []upstream.Upstream{uLocal},
+		addresses: []string{"udp://" + localAddr},
+		qtime:     time.Second,
+		logger:    logger,
+	}
+	fallFwd := &miniForwarder{
+		upstreams: []upstream.Upstream{uFall},
+		addresses: []string{"udp://" + fallAddr},
+		qtime:     time.Second,
+		logger:    logger,
+	}
+
+	ffMatcher := &forceFallMatcher{}
+	ffPrefix, _, err := parseForceFallEntry("192.168.5.0/24")
+	if err != nil {
+		t.Fatalf("parseForceFallEntry: %v", err)
+	}
+	ffMatcher.includePrefixes = append(ffMatcher.includePrefixes, ffPrefix...)
+
+	handler := &miniHandler{
+		logger:           logger,
+		localForward:     localFwd,
+		cnForward:        fallFwd,
+		dnsCache:         cache.New[CacheKey, *dns.Msg](cache.Opts{Size: 10}),
+		forceFallMatcher: ffMatcher,
+	}
+
+	runQuery := func(client string) *dns.Msg {
+		q := new(dns.Msg)
+		dnsutil.SetQuestion(q, "example.com.", dns.TypeA)
+		ctx := query_context.NewContext(q)
+		ctx.ServerMeta.ClientAddr = netip.MustParseAddr(client)
+		if err := handler.process(context.Background(), ctx); err != nil {
+			t.Fatalf("process error: %v", err)
+		}
+		return ctx.R()
+	}
+
+	// Step 1: normal client primes the shared cache with the main-DNS answer.
+	r1 := runQuery("10.10.10.10")
+	if r1 == nil || len(r1.Answer) == 0 {
+		t.Fatal("normal client got nil/empty response")
+	}
+	if got := r1.Answer[0].(*dns.A).A.String(); got != "10.0.0.1" {
+		t.Fatalf("normal client got %s, want 10.0.0.1", got)
+	}
+	if localCalls.Load() != 1 || fallCalls.Load() != 0 {
+		t.Fatalf("after normal query: local=%d fall=%d, want local=1 fall=0",
+			localCalls.Load(), fallCalls.Load())
+	}
+
+	// Step 2: forceFall client must NOT see the cached main-DNS answer.
+	// It must traverse the fallback path and receive the fall server's answer.
+	r2 := runQuery("192.168.5.7")
+	if r2 == nil || len(r2.Answer) == 0 {
+		t.Fatal("forceFall client got nil/empty response")
+	}
+	if got := r2.Answer[0].(*dns.A).A.String(); got != "99.99.99.99" {
+		t.Fatalf("forceFall leaked from shared cache: got %s, want 99.99.99.99", got)
+	}
+	if fallCalls.Load() == 0 {
+		t.Fatal("forceFall client did not reach fallback upstream")
+	}
+
+	// Step 3: a normal client immediately after must still get the main-DNS
+	// answer (cache write must not have been poisoned by the forceFall path).
+	preLocal := localCalls.Load()
+	r3 := runQuery("10.10.10.10")
+	if r3 == nil || len(r3.Answer) == 0 {
+		t.Fatal("normal client (post-forceFall) got nil/empty response")
+	}
+	if got := r3.Answer[0].(*dns.A).A.String(); got != "10.0.0.1" {
+		t.Fatalf("normal client post-forceFall got %s, want 10.0.0.1", got)
+	}
+	if localCalls.Load() != preLocal {
+		t.Fatalf("normal client post-forceFall hit upstream instead of cache: local calls went %d -> %d",
+			preLocal, localCalls.Load())
+	}
+}
+
+// TestCloneExtraWithTTL_SkipsNil pins the A4 contract: nil entries in
+// the source slice are skipped instead of causing a nil-pointer panic in
+// rr.Clone(). Matches cloneRRsWithTTL's pre-existing behaviour.
+func TestCloneExtraWithTTL_SkipsNil(t *testing.T) {
+	rr, _ := dns.New("example.com. 3600 IN A 1.1.1.1")
+
+	out := cloneExtraWithTTL([]dns.RR{nil, rr, nil}, 7)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 clone, got %d", len(out))
+	}
+	if out[0] == rr {
+		t.Error("expected a clone, got the source pointer")
+	}
+	if out[0].Header().TTL != 7 {
+		t.Errorf("cloned TTL = %d, want 7", out[0].Header().TTL)
+	}
+	// All-nil input collapses to nil.
+	if cloneExtraWithTTL([]dns.RR{nil, nil}, 7) != nil {
+		t.Error("expected nil output for all-nil input")
+	}
+	// Empty input stays nil.
+	if cloneExtraWithTTL(nil, 7) != nil {
+		t.Error("expected nil output for empty input")
+	}
+}

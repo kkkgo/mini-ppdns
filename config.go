@@ -26,6 +26,8 @@ type ConfigArgs struct {
 	HostsFile    []string // hosts files (e.g. /etc/hosts)
 	BogusPriv    bool     // return NXDOMAIN for private PTR queries not found locally
 	BogusPrivSet bool     // whether boguspriv was explicitly set in config file
+	BlockSVCB    bool     // block SVCB(64)/HTTPS(65) records to prevent DNS split bypass
+	BlockSVCBSet bool     // whether block_svcb was explicitly set in config file
 
 	PPLogUUID      string
 	PPLogServer    string
@@ -128,6 +130,10 @@ func parseINI(filename string, m *ConfigArgs, logger *mlog.Logger) error {
 					lv := strings.ToLower(v)
 					m.BogusPriv = lv == "1" || lv == "yes" || lv == "true"
 					m.BogusPrivSet = true
+				case "block_svcb":
+					lv := strings.ToLower(v)
+					m.BlockSVCB = lv == "1" || lv == "yes" || lv == "true"
+					m.BlockSVCBSet = true
 				case "lease_file":
 					for _, lf := range strings.Split(v, ",") {
 						lf = strings.TrimSpace(lf)
