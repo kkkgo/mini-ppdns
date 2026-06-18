@@ -14,12 +14,12 @@ import (
 // the readLoop recover regression tests.
 type panickyNetConn struct{}
 
-func (panickyNetConn) Read(_ []byte) (int, error)             { panic("simulated read panic") }
-func (panickyNetConn) Write(p []byte) (int, error)            { return len(p), nil }
-func (panickyNetConn) Close() error                           { return nil }
-func (panickyNetConn) SetDeadline(_ time.Time) error          { return nil }
-func (panickyNetConn) SetReadDeadline(_ time.Time) error      { return nil }
-func (panickyNetConn) SetWriteDeadline(_ time.Time) error     { return nil }
+func (panickyNetConn) Read(_ []byte) (int, error)         { panic("simulated read panic") }
+func (panickyNetConn) Write(p []byte) (int, error)        { return len(p), nil }
+func (panickyNetConn) Close() error                       { return nil }
+func (panickyNetConn) SetDeadline(_ time.Time) error      { return nil }
+func (panickyNetConn) SetReadDeadline(_ time.Time) error  { return nil }
+func (panickyNetConn) SetWriteDeadline(_ time.Time) error { return nil }
 
 // minimalQuery is the smallest valid DNS query wire format that
 // addQueueC's extractQuestion will accept: 12-byte header + root QNAME

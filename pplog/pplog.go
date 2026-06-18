@@ -30,11 +30,11 @@ const (
 // (InnerHeaderSize + payload) AND the AEAD ciphertext that SealTo appends
 // after it. The math:
 //
-//   inner plaintext  = InnerHeaderSize + payload   (lives in buf[0:innerLen])
-//   AEAD ciphertext  = inner + AEADOverhead        (appended at buf[innerLen:])
-//   buf must hold     = innerLen + ciphertextLen
-//                     = 2*innerLen + AEADOverhead
-//                     = 2*InnerHeaderSize + 2*payload + AEADOverhead
+//	inner plaintext  = InnerHeaderSize + payload   (lives in buf[0:innerLen])
+//	AEAD ciphertext  = inner + AEADOverhead        (appended at buf[innerLen:])
+//	buf must hold     = innerLen + ciphertextLen
+//	                  = 2*innerLen + AEADOverhead
+//	                  = 2*InnerHeaderSize + 2*payload + AEADOverhead
 //
 // At payload == MaxInnerPayload the requirement is
 // 2*InnerHeaderSize + 2*MaxInnerPayload + AEADOverhead. The previous
