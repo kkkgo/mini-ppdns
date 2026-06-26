@@ -61,28 +61,32 @@ start() {
 }
 
 stop() {
-	if killall mini-ppdns >/dev/null 2>&1; then
+	if ! is_running; then
 		remove_pidfile
-		echo "mini-ppdns all stopped."
+		echo "mini-ppdns is not running."
 		return
 	fi
-	_pid=$(pidof mini-ppdns)
-	if [ -n "$_pid" ]; then
-		echo "find mini-ppdns pid: $_pid"
-		kill $_pid
-		remove_pidfile
-		echo "mini-ppdns stopped."
-		return
+	# Send SIGTERM to every instance, then WAIT for it to actually exit.
+	# The daemon's graceful shutdown is capped at ~5s internally, so poll a
+	# little longer before escalating. Without this wait, restart() would
+	# relaunch while the old process is still draining (is_running still
+	# true), start() would see it "running" and refuse to start, and nothing
+	# would be left running once the old process finally exits.
+	killall mini-ppdns >/dev/null 2>&1
+	_i=0
+	while is_running && [ "$_i" -lt 8 ]; do
+		sleep 1
+		_i=$((_i + 1))
+	done
+	# Escalate to SIGKILL if a wedged process refused SIGTERM, so a restart
+	# can always reclaim the listen port instead of forcing a reboot.
+	if is_running; then
+		echo "mini-ppdns did not stop in time, sending SIGKILL."
+		killall -9 mini-ppdns >/dev/null 2>&1
+		sleep 1
 	fi
-	_pid=$(ps -ef | grep "mini-ppdns" | grep "config" | head -n 1 | cut -d" " -f1)
-	if [ -n "$_pid" ]; then
-		echo "find mini-ppdns pid: $_pid"
-		kill "$_pid"
-		remove_pidfile
-		echo "mini-ppdns stopped."
-		return
-	fi
-	echo "mini-ppdns is not running."
+	remove_pidfile
+	echo "mini-ppdns stopped."
 }
 
 restart() {
