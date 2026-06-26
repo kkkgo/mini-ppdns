@@ -307,6 +307,14 @@ func (l *Logger) Color() bool {
 	return l.color
 }
 
+// IsTerminal reports whether fd refers to a terminal (TTY/console). Exposed
+// so callers (e.g. daemon setup) can decide whether to redirect a process's
+// std streams away from an interactive terminal — a backgrounded resolver
+// should never write its log stream to the controlling terminal.
+func IsTerminal(fd uintptr) bool {
+	return isTerminal(fd)
+}
+
 func (l *Logger) IsDebug() bool {
 	return l.level <= levelDebug
 }

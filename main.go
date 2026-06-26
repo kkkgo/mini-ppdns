@@ -273,8 +273,23 @@ func main() {
 		}
 		cmd := exec.Command(execPath, cmdArgs...)
 		cmd.Stdin = nil
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		// A backgrounded resolver must not write its log stream to the
+		// controlling terminal: logging ultimately blocks on the underlying
+		// fd, so under -debug a full/stalled terminal buffer would back up the
+		// writer. Send the daemon's stdout/stderr to /dev/null (cmd.Std*=nil
+		// makes os/exec wire the fd to os.DevNull) whenever they point at a
+		// terminal. If they were explicitly redirected to a file or pipe (not
+		// a TTY), inherit them so intentional log capture still works.
+		if mlog.IsTerminal(os.Stdout.Fd()) {
+			cmd.Stdout = nil
+		} else {
+			cmd.Stdout = os.Stdout
+		}
+		if mlog.IsTerminal(os.Stderr.Fd()) {
+			cmd.Stderr = nil
+		} else {
+			cmd.Stderr = os.Stderr
+		}
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 		err = cmd.Start()
 		if err != nil {
