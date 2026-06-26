@@ -2,7 +2,62 @@ package mlog
 
 import (
 	"testing"
+	"time"
 )
+
+// blockingWriter is a sink whose Write blocks until gate is closed,
+// simulating a stalled console/pty/pipe whose kernel buffer is full and is
+// not being drained.
+type blockingWriter struct{ gate chan struct{} }
+
+func (w *blockingWriter) Write(p []byte) (int, error) {
+	<-w.gate
+	return len(p), nil
+}
+
+// TestLoggerAsyncDoesNotBlockOnStalledSink pins the wedge fix: when the log
+// sink blocks on Write, the logging hot path must NOT block. Before the async
+// writer, every log call did the Write while holding l.mu, so a stalled sink
+// (a daemon's inherited terminal/pipe filling up under -debug) blocked every
+// query handler on l.mu, the UDP server's concurrency slots filled, and the
+// resolver stopped answering ("drop 4096"). With the async writer, a stalled
+// sink drops log lines instead of blocking callers.
+func TestLoggerAsyncDoesNotBlockOnStalledSink(t *testing.T) {
+	bw := &blockingWriter{gate: make(chan struct{})}
+	l := &Logger{
+		level:       levelDebug,
+		out:         bw,
+		logCh:       make(chan *[]byte, 8),
+		closeNotify: make(chan struct{}),
+	}
+	l.wg.Add(1)
+	go l.writeLoop()
+
+	// The writer goroutine blocks forever in bw.Write on the first line; the
+	// 8-slot queue then fills. Every subsequent call must still return
+	// promptly (drop, not block).
+	const n = 2000
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < n; i++ {
+			l.Debugw("hot-path line", Int("i", i))
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("logging blocked while the sink was stalled — the resolver would wedge")
+	}
+	if l.dropped.Load() == 0 {
+		t.Fatal("expected dropped lines under a stalled sink, got 0")
+	}
+
+	// Release the sink and shut the writer down cleanly (no goroutine leak).
+	close(bw.gate)
+	_ = l.Close()
+}
 
 func TestLogger(t *testing.T) {
 	l, err := NewLogger(LogConfig{Level: "debug"})

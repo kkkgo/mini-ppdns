@@ -4,11 +4,21 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// asyncQueueCap bounds how many formatted log lines may be queued for the
+// background writer before new lines are dropped. A stalled sink (slow
+// console/pty/pipe whose kernel buffer fills and is not drained) backs up
+// here instead of blocking the calling goroutine; once full, lines are
+// dropped and counted. 4096 absorbs multi-second sink stalls at realistic
+// DNS log rates while capping worst-case memory at a few MiB of pooled
+// buffers.
+const asyncQueueCap = 4096
 
 // stripAnsi removes ANSI escape sequences from a string.
 // Uses a fast path to skip processing when no escape sequences are present.
@@ -96,6 +106,21 @@ type Logger struct {
 	// (e.g. disk full), we emit exactly one fallback notice to os.Stderr
 	// instead of silently dropping every subsequent log line.
 	writeErrReported bool
+
+	// Async write pipeline. Formatted lines are handed to logCh and drained
+	// by a single writer goroutine; the actual (potentially blocking) Write
+	// happens only on that goroutine. A stalled sink therefore drops log
+	// lines (counted in dropped) instead of blocking the caller. This is
+	// load-bearing: previously every log call did the Write while holding
+	// l.mu, so a wedged sink (e.g. a daemon's inherited terminal/pipe whose
+	// buffer fills under -debug) blocked every query handler on l.mu and the
+	// resolver stopped answering. logCh/closeNotify are nil for loggers built
+	// without the async writer (Nop), where enqueue writes synchronously.
+	logCh       chan *[]byte
+	closeNotify chan struct{}
+	closeOnce   sync.Once
+	wg          sync.WaitGroup
+	dropped     atomic.Uint64
 }
 
 // loadReporter returns the currently attached EventReporter, or nil.
@@ -131,20 +156,111 @@ func NewLogger(lc LogConfig) (*Logger, error) {
 		lvl = levelError
 	}
 
-	return &Logger{
-		level: lvl,
-		color: color,
-		out:   out,
-		file:  file,
-	}, nil
+	lg := &Logger{
+		level:       lvl,
+		color:       color,
+		out:         out,
+		file:        file,
+		logCh:       make(chan *[]byte, asyncQueueCap),
+		closeNotify: make(chan struct{}),
+	}
+	lg.wg.Add(1)
+	go lg.writeLoop()
+	return lg, nil
 }
 
-// Close closes the underlying log file if one was opened.
+// Close stops the background writer (flushing what is already queued, bounded
+// so a wedged sink can't hang shutdown) and closes the underlying log file if
+// one was opened.
 func (l *Logger) Close() error {
+	l.closeOnce.Do(func() {
+		if l.closeNotify != nil {
+			close(l.closeNotify)
+		}
+	})
+	if l.logCh != nil {
+		done := make(chan struct{})
+		go func() {
+			l.wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}
 	if l.file != nil {
 		return l.file.Close()
 	}
 	return nil
+}
+
+// enqueue hands a fully-formatted line to the background writer. On a healthy
+// sink this is a non-blocking channel send; when the queue is full (sink
+// backed up) the line is dropped and counted so a stalled sink can never
+// block the calling (hot-path) goroutine. A logger with no async writer
+// (logCh == nil, e.g. Nop) writes synchronously under l.mu.
+func (l *Logger) enqueue(bufp *[]byte) {
+	if l.logCh == nil {
+		l.writeOut(*bufp)
+		bufPool.Put(bufp)
+		return
+	}
+	select {
+	case l.logCh <- bufp:
+		// Handed off; the writer goroutine returns bufp to the pool.
+	default:
+		l.dropped.Add(1)
+		bufPool.Put(bufp)
+	}
+}
+
+// writeLoop is the single goroutine that performs the actual sink writes, so
+// the Write call (which may block on a stalled sink) never runs on a caller's
+// goroutine. It exits after closeNotify fires, draining whatever is already
+// queued first.
+func (l *Logger) writeLoop() {
+	defer l.wg.Done()
+	for {
+		select {
+		case bufp := <-l.logCh:
+			l.writeOut(*bufp)
+			bufPool.Put(bufp)
+			if l.dropped.Load() > 0 {
+				l.flushDroppedNotice()
+			}
+		case <-l.closeNotify:
+			for {
+				select {
+				case bufp := <-l.logCh:
+					l.writeOut(*bufp)
+					bufPool.Put(bufp)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// flushDroppedNotice emits a single line accounting for log lines dropped
+// while the sink was backed up, so operators see that logs were lost rather
+// than silently missing them. Runs only on the writer goroutine.
+func (l *Logger) flushDroppedNotice() {
+	n := l.dropped.Swap(0)
+	if n == 0 {
+		return
+	}
+	bufp := bufPool.Get().(*[]byte)
+	buf := (*bufp)[:0]
+	buf = appendTimestamp(buf, time.Now())
+	buf = l.appendPrefix(buf, "[WARN] ")
+	buf = append(buf, "mlog: dropped "...)
+	buf = strconv.AppendUint(buf, n, 10)
+	buf = append(buf, " log line(s) under sink backpressure\n"...)
+	l.writeOut(buf)
+	*bufp = buf
+	bufPool.Put(bufp)
 }
 
 // writeOut serializes a single buf write through l.mu using defer Unlock.
@@ -255,7 +371,13 @@ func (l *Logger) appendPrefix(buf []byte, prefix string) []byte {
 // output writes a fully-formed log line directly to the writer.
 // The entire line is assembled in a pooled []byte buffer — no string conversion,
 // no intermediate allocations from log.Logger.Output().
-func (l *Logger) output(prefix, msg string) {
+func (l *Logger) output(prefix, msg string) { l.outputSync(prefix, msg, false) }
+
+// outputSync builds a plain (non-field) line and emits it. With sync=false the
+// line is handed to the async writer (default hot path); with sync=true it is
+// written straight to the sink under l.mu — used by Fatal so the message is
+// guaranteed flushed before os.Exit.
+func (l *Logger) outputSync(prefix, msg string, sync bool) {
 	bufp := bufPool.Get().(*[]byte)
 	buf := (*bufp)[:0]
 
@@ -266,10 +388,13 @@ func (l *Logger) output(prefix, msg string) {
 		buf = append(buf, '\n')
 	}
 
-	l.writeOut(buf)
-
 	*bufp = buf
-	bufPool.Put(bufp)
+	if sync {
+		l.writeOut(buf)
+		bufPool.Put(bufp)
+	} else {
+		l.enqueue(bufp)
+	}
 }
 
 // needReport returns true if a reporter is attached and active.
@@ -308,10 +433,8 @@ func (l *Logger) outputf(prefix, format string, args ...interface{}) string {
 		buf = append(buf, '\n')
 	}
 
-	l.writeOut(buf)
-
 	*bufp = buf
-	bufPool.Put(bufp)
+	l.enqueue(bufp)
 	return msg
 }
 
@@ -334,9 +457,8 @@ func (l *Logger) InfoBuild(fn func(buf []byte, color bool) []byte) {
 	if len(buf) == 0 || buf[len(buf)-1] != '\n' {
 		buf = append(buf, '\n')
 	}
-	l.writeOut(buf)
 	*bufp = buf
-	bufPool.Put(bufp)
+	l.enqueue(bufp)
 	if reportMsg != "" {
 		l.reportEvent(1, reportMsg)
 	}
@@ -359,9 +481,8 @@ func (l *Logger) DebugBuild(fn func(buf []byte, color bool) []byte) {
 	if len(buf) == 0 || buf[len(buf)-1] != '\n' {
 		buf = append(buf, '\n')
 	}
-	l.writeOut(buf)
 	*bufp = buf
-	bufPool.Put(bufp)
+	l.enqueue(bufp)
 }
 
 // ErrorBuild writes an error log line whose body is assembled by fn.
@@ -384,9 +505,8 @@ func (l *Logger) ErrorBuild(fn func(buf []byte, color bool) []byte) {
 	if len(buf) == 0 || buf[len(buf)-1] != '\n' {
 		buf = append(buf, '\n')
 	}
-	l.writeOut(buf)
 	*bufp = buf
-	bufPool.Put(bufp)
+	l.enqueue(bufp)
 	if reportMsg != "" {
 		l.reportEvent(3, "[ERROR] "+reportMsg)
 	}
@@ -493,7 +613,7 @@ func (l *Logger) Fatal(msg string) {
 	if l.level > levelError {
 		return
 	}
-	l.output("[ERROR] ", msg)
+	l.outputSync("[ERROR] ", msg, true)
 	l.reportEvent(4, "[FATAL] "+msg)
 	os.Exit(1)
 }
@@ -515,6 +635,13 @@ func Nop() *Logger {
 // outputw writes a structured log line with fields to the writer.
 // Returns the message portion for event reporting.
 func (l *Logger) outputw(prefix, msg string, fields []Field) string {
+	return l.outputwSync(prefix, msg, fields, false)
+}
+
+// outputwSync is outputw with an explicit sync flag. sync=true writes straight
+// to the sink under l.mu (used by Fatalw so the final line is flushed before
+// os.Exit); sync=false hands the line to the async writer.
+func (l *Logger) outputwSync(prefix, msg string, fields []Field, sync bool) string {
 	bufp := bufPool.Get().(*[]byte)
 	buf := (*bufp)[:0]
 
@@ -535,10 +662,13 @@ func (l *Logger) outputw(prefix, msg string, fields []Field) string {
 
 	buf = append(buf, '\n')
 
-	l.writeOut(buf)
-
 	*bufp = buf
-	bufPool.Put(bufp)
+	if sync {
+		l.writeOut(buf)
+		bufPool.Put(bufp)
+	} else {
+		l.enqueue(bufp)
+	}
 	return reportMsg
 }
 
@@ -606,7 +736,7 @@ func (l *Logger) Fatalw(msg string, fields ...Field) {
 	if l.level > levelError {
 		return
 	}
-	reportMsg := l.outputw("[ERROR] ", msg, fields)
+	reportMsg := l.outputwSync("[ERROR] ", msg, fields, true)
 	l.reportEvent(4, "[FATAL] "+reportMsg)
 	os.Exit(1)
 }
