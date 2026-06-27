@@ -42,9 +42,9 @@ start() {
 		read_pidfile
 		_cur_pid=$(get_cur_pid)
 		if [ -n "$_saved_pid" ] && [ "$_saved_pid" = "$_cur_pid" ]; then
-			echo "mini-ppdns running OK. (started at: $_saved_time)"
+			echo "mini-ppdns running OK. (started at: $_saved_time) PID: $_cur_pid"
 		else
-			echo "mini-ppdns running OK."
+			echo "mini-ppdns running OK. PID: $_cur_pid"
 		fi
 		exit 0
 	fi

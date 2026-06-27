@@ -176,14 +176,23 @@ func (ote *lazyDnsConnEarlyReservedExchanger) ExchangeReserved(ctx context.Conte
 	// (miekg/dns has a history of panics on pathological wire data). If Done
 	// were skipped, a later ReserveNewQuery on this lazyDnsConn would block
 	// forever on earlyReserveCallWg.Wait, deadlocking every future query on
-	// this transport. The mu/reservedQuery defer is layered separately so its
-	// ordering with Done is unambiguous (LIFO: Done first, then mu unlock).
-	defer ote.earlyReserveCallWg.Done()
+	// this transport.
+	//
+	// Done() MUST fire before this returning goroutine contends for ote.mu.
+	// The fastPath-transition path in ReserveNewQuery holds ote.mu while
+	// calling earlyReserveCallWg.Wait(); if Done were gated behind ote.mu
+	// here, that waiter (holding ote.mu and, above it, the PipelineTransport
+	// mutex) would block this goroutine on ote.mu before it could decrement
+	// the WaitGroup — a deadlock that wedges every forward on the transport.
+	// So register the mu/reservedQuery cleanup FIRST and the Done() LAST, so
+	// LIFO runs Done() first (lock-free), then the mu section — matching
+	// WithdrawReserved's Done-before-mu ordering.
 	defer func() {
 		ote.mu.Lock()
 		ote.reservedQuery--
 		ote.mu.Unlock()
 	}()
+	defer ote.earlyReserveCallWg.Done()
 
 	select {
 	case <-ctx.Done():
