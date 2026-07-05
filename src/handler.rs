@@ -222,9 +222,9 @@ impl Handler {
                     &info,
                     client,
                 );
-                return FastOutcome::Done(Some(self.build_cached(
-                    &msg, &info, &cached, ttl_left, udp_limit,
-                )));
+                return FastOutcome::Done(Some(
+                    self.build_cached(&msg, &info, &cached, ttl_left, udp_limit),
+                ));
             }
         }
 
