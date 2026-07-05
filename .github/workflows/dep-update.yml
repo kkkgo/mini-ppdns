@@ -1,28 +1,36 @@
-name: Update deps.
-
+name: Update deps
 on:
   schedule:
-     - cron: '30 01 * * 2'
-  push:
-    paths-ignore:
-      - 'README.md'
-      - '.github/**'
-      - 'LICENSE'
+    - cron: '30 01 * * 2' # 01:30 UTC every Tuesday (same as the Go workflow)
   workflow_dispatch:
+
 permissions:
   contents: write
+
 jobs:
-  dep-test:
+  update:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@main
-      - name: build test
-        run: docker build -t dep .
-      - name: update dep
-        run: docker run --name dep -v $(pwd):/src dep
-      - uses: EndBug/add-and-commit@main
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+
+      - name: Update dependencies
+        run: cargo update --verbose
+
+      - name: Verify (fmt / clippy / test / build)
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --all
+          cargo build --release
+
+      - name: Commit updated lockfile
+        uses: EndBug/add-and-commit@main
         with:
           author_name: Github Actions
           author_email: actions@github.com
           committer_email: actions@github.com
-          message: 'Update dependencies'
+          message: 'Update dependencies (cargo update)'
+          add: Cargo.lock
