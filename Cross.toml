@@ -1,0 +1,5 @@
+# cross-rs configuration. Forward the build-time version stamp (and the
+# reproducible-build epoch) into the per-target Docker build containers so
+# `option_env!("MINI_PPDNS_VERSION")` in main.rs picks it up.
+[build.env]
+passthrough = ["MINI_PPDNS_VERSION", "SOURCE_DATE_EPOCH"]

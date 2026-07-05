@@ -47,3 +47,7 @@ release/
 buildlocal*.sh
 buildlocal*.yaml
 /pplog-server
+git/
+
+# Rust build artifacts
+/target
