@@ -1,0 +1,27 @@
+[package]
+name = "mini-ppdns"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Tiny DNS failover forwarder"
+license = "GPL-3.0"
+
+[[bin]]
+name = "mini-ppdns"
+path = "src/main.rs"
+
+[dependencies]
+chacha20poly1305 = "0.11.0"
+domain = "0.12.1"
+getrandom = "0.4.3"
+if-addrs = "0.13"
+libc = "0.2.186"
+sha2 = "0.11.0"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal", "io-util", "process"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
