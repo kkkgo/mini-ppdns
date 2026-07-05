@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    paths-ignore:
+      - '.github/**'
+      - 'LICENSE'
+      - '*.md'
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@master
+
+      - name: Test
+        run: cargo test --all
+
+  build:
+    name: Build ${{ matrix.uname_m }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl,        uname_m: x86_64,   buildstd: false }
+          - { target: aarch64-unknown-linux-musl,       uname_m: aarch64,  buildstd: false }
+          - { target: armv7-unknown-linux-musleabihf,   uname_m: armv7l,   buildstd: false }
+          - { target: arm-unknown-linux-musleabihf,     uname_m: armv6l,   buildstd: false }
+          - { target: i686-unknown-linux-musl,          uname_m: i686,     buildstd: false }
+          # cross has no riscv64 musl image, so this one is glibc-dynamic
+          # (riscv64 Linux runs full glibc distros — acceptable, no MIPS-style
+          # FPU-less concern).
+          - { target: riscv64gc-unknown-linux-gnu,      uname_m: riscv64,  buildstd: false }
+          # MIPS targets are Rust tier 3 (no prebuilt std) → nightly + build-std.
+          # Soft-float is applied via .cargo/config.toml (matches Go's
+          # GOMIPS=softfloat); build-std recompiles std with the same ABI.
+          - { target: mips-unknown-linux-musl,          uname_m: mips,     buildstd: true }
+          - { target: mipsel-unknown-linux-musl,        uname_m: mipsel,   buildstd: true }
+          - { target: mips64-unknown-linux-muslabi64,   uname_m: mips64,   buildstd: true }
+          - { target: mips64el-unknown-linux-muslabi64, uname_m: mips64el, buildstd: true }
+    steps:
+      - uses: actions/checkout@main
+        with:
+          fetch-depth: 0
+
+      - name: Compute reproducible version
+        run: |
+          LAST=$(git log -1 --format=%H -- '*.rs' Cargo.toml Cargo.lock)
+          [ -z "$LAST" ] && LAST=$(git rev-parse HEAD)
+          HASH=$(git rev-parse --short "$LAST")
+          EPOCH=$(git log -1 --format=%ct "$LAST")
+          DATE=$(date -u -d "@${EPOCH}" +%Y%m%d)
+          echo "MINI_PPDNS_VERSION=kkkgo/ppdns:mini-ppdns ${DATE} ${HASH}" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=${EPOCH}" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        run: |
+          if [ "${{ matrix.buildstd }}" = "true" ]; then
+            rustup toolchain install nightly --profile minimal --component rust-src
+          else
+            rustup toolchain install stable --profile minimal
+          fi
+
+      - name: Install cross
+        uses: taiki-e/install-action@main
+        with:
+          tool: cross
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.buildstd }}" = "true" ]; then
+            cross +nightly build --release --target ${{ matrix.target }} \
+              -Z build-std=std,panic_abort
+          else
+            cross build --release --target ${{ matrix.target }}
+          fi
+          mkdir -p out
+          cp "target/${{ matrix.target }}/release/mini-ppdns" "out/mini-ppdns_${{ matrix.uname_m }}"
+
+      - uses: actions/upload-artifact@main
+        with:
+          name: bin-${{ matrix.uname_m }}
+          path: out/*
+          if-no-files-found: warn
+
+  publish:
+    name: Push binaries to release branch
+    needs: build
+    # Publish whatever built even if some (e.g. tier-3 MIPS) targets failed.
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@main
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@main
+        with:
+          path: dl
+          pattern: bin-*
+          merge-multiple: true
+
+      - name: Push to release branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ ! -d dl ] || [ -z "$(ls -A dl 2>/dev/null)" ]; then
+            echo "No binaries were produced; nothing to publish."
+            exit 1
+          fi
+          ls -l dl
+          SRC=$(git rev-parse HEAD)
+
+          # Render the release README with download links pointing at this repo.
+          sed "s|__REPO__|${REPO}|g" .github/release-README.md > /tmp/README.md
+
+          git config --global user.name "Github Actions"
+          git config --global user.email "actions@github.com"
+
+          if git clone --branch release --single-branch \
+              "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" release_branch; then
+            echo "Cloned existing release branch"
+          else
+            git clone --single-branch \
+              "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" release_branch
+            (cd release_branch && git checkout --orphan release && git rm -rf .)
+          fi
+
+          cd release_branch
+          git checkout --orphan release_new
+          git rm -rf . 2>/dev/null || true
+          cp /tmp/README.md ./README.md
+          cp ../dl/mini-ppdns_* .
+          git add .
+          git commit -m "release: ${SRC}"
+          git push origin release_new:release --force
