@@ -34,6 +34,35 @@ const MAX_CONCURRENT_TCP: usize = 1024;
 const MAX_TCP_CONNS: usize = 2048;
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
+/// UDP receive-loop shards per listen address. The fast path (cache hit /
+/// static rewrite) runs inline in the receive loop, so one loop caps
+/// throughput at one core; SO_REUSEPORT shards let the kernel spread flows
+/// across several loops. Capped at 4 — beyond that, upstream IO, not intake,
+/// is the limit.
+fn udp_shards() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(4)
+}
+
+/// Bind a nonblocking UDP socket, optionally with SO_REUSEPORT (needed to
+/// bind several shards to one address).
+fn bind_udp_shard(addr: std::net::SocketAddr, reuseport: bool) -> std::io::Result<UdpSocket> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    if reuseport {
+        sock.set_reuse_port(true)?;
+    }
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    UdpSocket::from_std(sock.into())
+}
+
 /// Build everything and serve until SIGINT/SIGTERM. Blocks on a fresh Tokio
 /// runtime. Returns an error string on fatal setup failure.
 pub fn run(
@@ -47,7 +76,40 @@ pub fn run(
         .enable_all()
         .build()
         .map_err(|e| format!("failed to build runtime: {e}"))?;
-    rt.block_on(serve(cfg, listen, matcher, dns_upstreams, fall_upstreams))
+    #[cfg(feature = "profiling")]
+    let guard = pprof::ProfilerGuardBuilder::default()
+        .frequency(1997)
+        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .build()
+        .ok();
+
+    let result = rt.block_on(serve(cfg, listen, matcher, dns_upstreams, fall_upstreams));
+
+    #[cfg(feature = "profiling")]
+    if let Some(g) = guard {
+        if let Ok(report) = g.report().build() {
+            if let Ok(f) = std::fs::File::create("flamegraph.svg") {
+                let _ = report.flamegraph(f);
+                eprintln!("wrote flamegraph.svg");
+            }
+            // Folded stacks (leaf-first per frame) for exact self-time analysis.
+            let mut folded = String::new();
+            for (frames, count) in report.data.iter() {
+                let mut names: Vec<String> = Vec::new();
+                for f in frames.frames.iter().rev() {
+                    for sym in f.iter().rev() {
+                        names.push(sym.name());
+                    }
+                }
+                folded.push_str(&names.join(";"));
+                folded.push_str(&format!(" {count}\n"));
+            }
+            let _ = std::fs::write("folded.txt", folded);
+            eprintln!("wrote folded.txt");
+        }
+    }
+
+    result
 }
 
 fn build_upstreams(list: &[String]) -> Vec<Arc<Upstream>> {
@@ -206,16 +268,45 @@ async fn serve(
 
     let mut servers = Vec::new();
     for addr in &listen {
-        match UdpSocket::bind(addr).await {
-            Ok(sock) => {
-                servers.push(tokio::spawn(serve_udp(
-                    sock,
-                    handler.clone(),
-                    udp_sem.clone(),
-                    shutdown_rx.clone(),
-                )));
+        // Resolve once; SO_REUSEPORT-sharded receive loops (see `udp_shards`).
+        // If the sharded bind fails (e.g. SO_REUSEPORT unsupported), fall back
+        // to a single plain socket, preserving old behavior.
+        let parsed: Option<std::net::SocketAddr> = addr.parse().ok();
+        let shards = if parsed.is_some() { udp_shards() } else { 1 };
+        let mut bound = 0usize;
+        if let Some(sa) = parsed {
+            for _ in 0..shards {
+                match bind_udp_shard(sa, shards > 1) {
+                    Ok(sock) => {
+                        servers.push(tokio::spawn(serve_udp(
+                            sock,
+                            handler.clone(),
+                            udp_sem.clone(),
+                            shutdown_rx.clone(),
+                        )));
+                        bound += 1;
+                    }
+                    Err(_) if bound == 0 => break, // fall through to plain bind
+                    Err(e) => {
+                        // Partial shard failure: keep what we have.
+                        log::warn(&format!("udp shard bind {addr} err: {e}"));
+                        break;
+                    }
+                }
             }
-            Err(e) => log::error(&format!("listen udp://{addr} err: {e}")),
+        }
+        if bound == 0 {
+            match UdpSocket::bind(addr).await {
+                Ok(sock) => {
+                    servers.push(tokio::spawn(serve_udp(
+                        sock,
+                        handler.clone(),
+                        udp_sem.clone(),
+                        shutdown_rx.clone(),
+                    )));
+                }
+                Err(e) => log::error(&format!("listen udp://{addr} err: {e}")),
+            }
         }
         match TcpListener::bind(addr).await {
             Ok(l) => {

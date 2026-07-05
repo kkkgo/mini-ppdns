@@ -16,8 +16,23 @@ domain = "0.12.1"
 getrandom = "0.4.3"
 if-addrs = "0.13"
 libc = "0.2.186"
+socket2 = "0.6"
 sha2 = "0.11.0"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal", "io-util", "process"] }
+
+pprof = { version = "0.15", features = ["flamegraph"], optional = true }
+
+[features]
+profiling = ["dep:pprof"]
+
+[profile.profiling]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+panic = "unwind"
+strip = false
+debug = 1
 
 [profile.release]
 opt-level = "z"

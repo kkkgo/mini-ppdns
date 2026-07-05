@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{watch, Semaphore};
 
-use crate::handler::Handler;
+use crate::handler::{FastOutcome, Handler};
 use crate::util::unmap_ip;
 
 const UDP_RECV_BUF: usize = 4096;
@@ -27,7 +27,9 @@ fn is_shutdown(rx: &Shutdown) -> bool {
     *rx.borrow()
 }
 
-/// UDP receive loop: one datagram → one handler task → one reply.
+/// UDP receive loop: no-IO queries (static rewrite / cache hit) are answered
+/// inline — profiling showed per-datagram `tokio::spawn` dominating CPU on the
+/// hot path — and only queries needing upstream IO spawn a handler task.
 pub async fn serve_udp(
     sock: UdpSocket,
     handler: Arc<Handler>,
@@ -46,24 +48,36 @@ pub async fn serve_udp(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                // Non-blocking permit: when the UDP pool is saturated we drop
-                // this datagram and immediately go back to receiving. This keeps
-                // intake responsive under overload (no global 2.5s stall while a
-                // slow upstream holds permits), avoids draining stale packets out
-                // of the socket buffer, and leans on client retry. Acquire before
-                // the copy so a dropped datagram costs nothing.
-                // datagram costs nothing.
-                let Ok(permit) = sem.clone().try_acquire_owned() else { continue };
                 let req = buf[..n].to_vec();
-                let handler = handler.clone();
-                let sock = sock.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let client = unmap_ip(peer.ip());
-                    if let Some(resp) = handler.process(req, client, true).await {
-                        let _ = sock.send_to(&resp, peer).await;
+                let client = unmap_ip(peer.ip());
+                // Synchronous, bounded (~µs) fast path: parse + static rewrite +
+                // cache lookup. Running it inline avoids the per-task spawn and
+                // wakeup cost, and keeps cache hits served even while the permit
+                // pool is drained by a stalled upstream.
+                match handler.process_fast(req, client, true) {
+                    FastOutcome::Done(Some(resp)) => {
+                        // try_send_to never blocks intake; a full socket send
+                        // buffer (rare for UDP) drops the reply — client retries.
+                        let _ = sock.try_send_to(&resp, peer);
                     }
-                });
+                    FastOutcome::Done(None) => {}
+                    FastOutcome::Pending(p) => {
+                        // Non-blocking permit: when the UDP pool is saturated we
+                        // drop this datagram and immediately go back to receiving.
+                        // This keeps intake responsive under overload (no global
+                        // 2.5s stall while a slow upstream holds permits) and
+                        // leans on client retry.
+                        let Ok(permit) = sem.clone().try_acquire_owned() else { continue };
+                        let handler = handler.clone();
+                        let sock = sock.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if let Some(resp) = handler.process_slow(p, client).await {
+                                let _ = sock.send_to(&resp, peer).await;
+                            }
+                        });
+                    }
+                }
             }
         }
     }

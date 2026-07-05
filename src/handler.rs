@@ -129,13 +129,45 @@ fn rcode_label(rcode: Rcode, empty_answer: bool) -> String {
 
 const PAOPAO_DNS_WIRE: &[u8] = b"\x06paopao\x03dns\x00";
 
+/// Parsed state carried from the synchronous fast path to the upstream (slow)
+/// path, so nothing is parsed twice. Opaque outside this module.
+pub struct PendingQuery {
+    msg: Message<Vec<u8>>,
+    info: QueryInfo,
+    route: RouteDecision,
+    key: CacheKey,
+    udp_limit: Option<u16>,
+}
+
+/// Result of the synchronous fast path.
+pub enum FastOutcome {
+    /// Answered without upstream IO (None = drop the query).
+    Done(Option<Vec<u8>>),
+    /// Needs upstream IO; finish with `process_slow`. Boxed so the hot
+    /// `Done` variant stays small.
+    Pending(Box<PendingQuery>),
+}
+
 impl Handler {
     /// Process one query, returning the wire response to send (None = drop).
     pub async fn process(&self, req: Vec<u8>, client: IpAddr, is_udp: bool) -> Option<Vec<u8>> {
-        let msg = Message::from_octets(req).ok()?;
+        match self.process_fast(req, client, is_udp) {
+            FastOutcome::Done(resp) => resp,
+            FastOutcome::Pending(p) => self.process_slow(p, client).await,
+        }
+    }
+
+    /// The no-IO paths: parse, FORMERR, static rewrite (block/hosts/PTR), and
+    /// cache hit. Synchronous and bounded (~µs), so the UDP receive loop can
+    /// run it inline without spawning a task; only a `Pending` result pays the
+    /// per-task scheduling cost.
+    pub fn process_fast(&self, req: Vec<u8>, client: IpAddr, is_udp: bool) -> FastOutcome {
+        let Ok(msg) = Message::from_octets(req) else {
+            return FastOutcome::Done(None);
+        };
         let Some(info) = dns::extract_query(&msg) else {
             // No sole question → FORMERR.
-            return Some(self.build(
+            return FastOutcome::Done(Some(self.build(
                 &msg,
                 Rcode::FORMERR,
                 &Parts::empty(),
@@ -143,7 +175,7 @@ impl Handler {
                 None,
                 None,
                 None,
-            ));
+            )));
         };
 
         let udp_limit = if is_udp {
@@ -153,7 +185,7 @@ impl Handler {
         };
 
         if let Some(resp) = self.try_static_rewrite(&msg, &info, client, udp_limit) {
-            return Some(resp);
+            return FastOutcome::Done(Some(resp));
         }
 
         let route = self.resolve_route(&info, client);
@@ -190,10 +222,31 @@ impl Handler {
                     &info,
                     client,
                 );
-                return Some(self.build_cached(&msg, &info, &cached, ttl_left, udp_limit));
+                return FastOutcome::Done(Some(self.build_cached(
+                    &msg, &info, &cached, ttl_left, udp_limit,
+                )));
             }
         }
 
+        FastOutcome::Pending(Box::new(PendingQuery {
+            msg,
+            info,
+            route,
+            key,
+            udp_limit,
+        }))
+    }
+
+    /// Finish a query the fast path couldn't answer: forward to the main DNS
+    /// and/or fallback upstreams.
+    pub async fn process_slow(&self, p: Box<PendingQuery>, client: IpAddr) -> Option<Vec<u8>> {
+        let PendingQuery {
+            msg,
+            info,
+            route,
+            key,
+            udp_limit,
+        } = *p;
         let query = dns::build_upstream_query(&info);
         let local = if route.force {
             LocalResult::none()
