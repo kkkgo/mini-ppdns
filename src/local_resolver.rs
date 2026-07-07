@@ -252,9 +252,9 @@ impl NameFilter {
     }
 
     fn may_contain_hash(&self, h: u64) -> bool {
-        Self::bits_of(h)
-            .into_iter()
-            .all(|i| self.words[i / WORD_BITS].load(Ordering::Relaxed) & (1 << (i % WORD_BITS)) != 0)
+        Self::bits_of(h).into_iter().all(|i| {
+            self.words[i / WORD_BITS].load(Ordering::Relaxed) & (1 << (i % WORD_BITS)) != 0
+        })
     }
 }
 
