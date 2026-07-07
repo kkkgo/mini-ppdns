@@ -4,12 +4,12 @@
 //!
 //! Order: static rewrites → route decision → cache → main DNS → fallback.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use domain::base::iana::{Class, Rcode, Rtype};
+use domain::base::iana::{Class, Opcode, Rcode, Rtype};
 use domain::base::{Message, Ttl};
 use domain::rdata::{Aaaa, AllRecordData, Ptr, A};
 
@@ -79,10 +79,13 @@ impl Parts {
     }
 
     fn min_ttl(&self) -> u32 {
-        [&self.answers, &self.authority, &self.additional]
-            .into_iter()
-            .filter_map(|s| dns::min_ttl(s))
-            .min()
+        // Positive entries live as long as their answers; negative/NODATA
+        // entries as long as the authority (SOA). Padding sections must not
+        // shorten the entry: an additional record with TTL 0 would otherwise
+        // collapse a long-lived answer to 1s.
+        dns::min_ttl(&self.answers)
+            .or_else(|| dns::min_ttl(&self.authority))
+            .or_else(|| dns::min_ttl(&self.additional))
             .unwrap_or(0)
     }
 }
@@ -165,17 +168,19 @@ impl Handler {
         let Ok(msg) = Message::from_octets(req) else {
             return FastOutcome::Done(None);
         };
+        // A response must never be processed as a query (RFC 1035 §7.3):
+        // answering one would forward it upstream and reply to the "client".
+        if msg.header().qr() {
+            return FastOutcome::Done(None);
+        }
+        // Non-QUERY opcodes (IQUERY/STATUS/NOTIFY/UPDATE) are not supported;
+        // forwarding them as plain queries would silently change semantics.
+        if msg.header().opcode() != Opcode::QUERY {
+            return FastOutcome::Done(Some(self.reject(&msg, Rcode::NOTIMP, is_udp)));
+        }
         let Some(info) = dns::extract_query(&msg) else {
             // No sole question → FORMERR.
-            return FastOutcome::Done(Some(self.build(
-                &msg,
-                Rcode::FORMERR,
-                &Parts::empty(),
-                None,
-                None,
-                None,
-                None,
-            )));
+            return FastOutcome::Done(Some(self.reject(&msg, Rcode::FORMERR, is_udp)));
         };
 
         let udp_limit = if is_udp {
@@ -189,11 +194,12 @@ impl Handler {
         }
 
         let route = self.resolve_route(&info, client);
-        let key = CacheKey {
-            name: info.qname_lower.clone(),
-            qtype: info.qtype.to_int(),
-            qclass: info.qclass.to_int(),
-        };
+        let key = CacheKey::with_hash(
+            info.qname_lower.clone(),
+            info.qtype.to_int(),
+            info.qclass.to_int(),
+            info.name_hash,
+        );
 
         if !route.force {
             if let Some((cached, ttl_left)) = self.cache.get(&key) {
@@ -263,6 +269,15 @@ impl Handler {
         )
     }
 
+    /// Build a question-echoing error response (FORMERR/NOTIMP). The client's
+    /// EDNS is still echoed even though the query wasn't processed
+    /// (RFC 6891 §7), and the UDP size budget still applies.
+    fn reject(&self, msg: &Message<Vec<u8>>, rcode: Rcode, is_udp: bool) -> Vec<u8> {
+        let edns = dns::edns_of(msg);
+        let udp_limit = is_udp.then(|| dns::udp_response_limit(edns));
+        self.build(msg, rcode, &Parts::empty(), edns, udp_limit, None, None)
+    }
+
     /// Answers needing no upstream: AAAA/SVCB/HTTPS blocking, hosts forward
     /// lookups, local PTR, and bogus-priv.
     fn try_static_rewrite(
@@ -307,7 +322,7 @@ impl Handler {
         // Forward lookup from hosts files / [hosts] config.
         if qt == Rtype::A || qt == Rtype::AAAA {
             if let Some(res) = &self.resolver {
-                let ips = res.lookup_ip(&info.qname_lower);
+                let ips = res.lookup_ip(&info.qname_lower, info.name_hash);
                 if !ips.is_empty() {
                     if let Some(out) = self.hosts_response(msg, info, client, &ips, udp_limit) {
                         self.dlog("hosts", info, client, None, "NOERROR", None, None);
@@ -796,19 +811,24 @@ impl Handler {
                 self.apply_lite(&mut fp, info);
             }
             let label = rcode_label(fp.rcode, fp.answers.is_empty());
-            // Fallback results are short-lived (TTL=1) so recovery switches back fast.
+            // Failover answers (main failed / hook-down) are short-lived (TTL=1)
+            // so recovery switches back fast. force_fall is policy routing, not
+            // failover: those clients always use the fallback, so their answers
+            // keep the upstream TTLs — forcing TTL=1 would only make them
+            // re-resolve every second, uncached.
+            let ttl_override = if flabel == "force_fall" { None } else { Some(1) };
             let out = self.build(
                 msg,
                 fp.rcode,
                 &fp,
                 info.client_edns,
                 udp_limit,
-                Some(1),
+                ttl_override,
                 Some(info.qtype),
             );
             self.dlog(flabel, info, client, Some(&up), &label, dur, None);
             if cache_writes {
-                self.store(key, fp, Some(1));
+                self.store(key, fp, ttl_override);
             }
             return out;
         }
@@ -962,22 +982,28 @@ impl Parts {
 }
 
 /// Follow the CNAME chain from `start_lower` (lower-cased wire name), returning
-/// the final target as lower-cased wire bytes. Bounded by the record count.
+/// the final target as lower-cased wire bytes. One pass builds an owner→target
+/// map so long chains stay O(n) — rescanning the answers per hop is O(n²),
+/// measurable on a hostile 64 KiB TCP response. The hop count is bounded by
+/// the link count, which also terminates cycles.
 fn resolve_cname_chain(answers: &[OwnedRecord], start_lower: &[u8]) -> Vec<u8> {
-    let mut current = start_lower.to_vec();
-    for _ in 0..answers.len() {
-        let mut found = false;
-        for r in answers {
-            if r.rtype() == Rtype::CNAME && name_eq_lower(r.owner(), &current) {
-                if let AllRecordData::Cname(c) = r.data() {
-                    current = lower_wire(c.cname().as_slice());
-                    found = true;
-                    break;
-                }
-            }
+    let mut links: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    for r in answers {
+        if r.rtype() != Rtype::CNAME {
+            continue;
         }
-        if !found {
-            break;
+        if let AllRecordData::Cname(c) = r.data() {
+            // First record wins on a duplicate owner, like the scan it replaces.
+            links
+                .entry(lower_wire(r.owner().as_slice()))
+                .or_insert_with(|| lower_wire(c.cname().as_slice()));
+        }
+    }
+    let mut current = start_lower.to_vec();
+    for _ in 0..links.len() {
+        match links.get(&current) {
+            Some(next) => current = next.clone(),
+            None => break,
         }
     }
     current
@@ -1171,6 +1197,57 @@ mod tests {
         assert_eq!(parse_resp(&out).header().rcode(), Rcode::NXDOMAIN);
     }
 
+    // ---- message hygiene ----
+
+    #[tokio::test]
+    async fn qr_response_is_dropped() {
+        let h = mk(dead(), dead());
+        let mut q = client_query("example.com.", Rtype::A);
+        q[2] |= 0x80; // QR=1: a response, not a query
+        let out = h.process(q, "127.0.0.1".parse().unwrap(), true).await;
+        assert!(out.is_none(), "a response must be dropped, not answered");
+    }
+
+    #[tokio::test]
+    async fn non_query_opcode_gets_notimp() {
+        let h = mk(dead(), dead());
+        let mut q = client_query("example.com.", Rtype::A);
+        q[2] |= 0x28; // opcode 5 (UPDATE), RD preserved
+        let out = h
+            .process(q, "127.0.0.1".parse().unwrap(), true)
+            .await
+            .expect("a response");
+        assert_eq!(parse_resp(&out).header().rcode(), Rcode::NOTIMP);
+        assert_eq!(answer_count(&out), 0);
+    }
+
+    #[tokio::test]
+    async fn formerr_echoes_edns() {
+        // Two questions → FORMERR, but the client's OPT is still echoed
+        // (RFC 6891 §7).
+        let h = mk(dead(), dead());
+        let mut b = MessageBuilder::new_vec();
+        b.header_mut().set_rd(true);
+        let mut q = b.question();
+        q.push((Name::<Vec<u8>>::from_str("a.example.").unwrap(), Rtype::A))
+            .unwrap();
+        q.push((Name::<Vec<u8>>::from_str("b.example.").unwrap(), Rtype::A))
+            .unwrap();
+        let mut add = q.additional();
+        add.opt(|opt| {
+            opt.set_udp_payload_size(1232);
+            Ok(())
+        })
+        .unwrap();
+        let out = h
+            .process(add.finish(), "127.0.0.1".parse().unwrap(), true)
+            .await
+            .expect("a response");
+        let resp = parse_resp(&out);
+        assert_eq!(resp.header().rcode(), Rcode::FORMERR);
+        assert!(resp.opt().is_some(), "OPT echoed per RFC 6891");
+    }
+
     // ---- routing / forwarding (mock upstreams) ----
 
     #[tokio::test]
@@ -1181,11 +1258,11 @@ mod tests {
         assert_eq!(answer_count(&out), 1);
         assert_eq!(first_ttl(&out), Some(60));
         // The NOERROR+answer was stored.
-        let key = CacheKey {
-            name: b"\x07example\x03com\x00".to_vec(),
-            qtype: Rtype::A.to_int(),
-            qclass: Class::IN.to_int(),
-        };
+        let key = CacheKey::new(
+            b"\x07example\x03com\x00".to_vec(),
+            Rtype::A.to_int(),
+            Class::IN.to_int(),
+        );
         assert!(h.cache.get(&key).is_some());
     }
 
@@ -1193,11 +1270,11 @@ mod tests {
     async fn cache_hit_served_without_upstream() {
         // Pre-populate; upstreams are dead, so a response proves a cache read.
         let h = mk(dead(), dead());
-        let key = CacheKey {
-            name: b"\x07example\x03com\x00".to_vec(),
-            qtype: Rtype::A.to_int(),
-            qclass: Class::IN.to_int(),
-        };
+        let key = CacheKey::new(
+            b"\x07example\x03com\x00".to_vec(),
+            Rtype::A.to_int(),
+            Class::IN.to_int(),
+        );
         h.cache.store(
             key,
             Arc::new(CachedMsg {
@@ -1223,10 +1300,20 @@ mod tests {
             .include
             .push(parse_prefix("127.0.0.1/32").unwrap());
         let out = ask(&h, "example.com.", Rtype::A, "127.0.0.1").await;
-        // Fallback answers get TTL forced to 1.
-        assert_eq!(first_ttl(&out), Some(1));
+        // Policy-routed clients keep the upstream TTL (only failover gets 1).
+        assert_eq!(first_ttl(&out), Some(60));
         // force_fall clients never touch the shared cache.
         assert!(h.cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hook_down_fallback_ttl_stays_short() {
+        let fall = spawn_mock(|q| answer(q, Rcode::NOERROR, &[([2, 2, 2, 2], 60)])).await;
+        let mut h = mk(dead(), vec![fall]);
+        h.hook_failed = Some(Arc::new(AtomicBool::new(true)));
+        let out = ask(&h, "example.com.", Rtype::A, "127.0.0.1").await;
+        // Failover (hook-down) answers stay TTL=1 for fast switch-back.
+        assert_eq!(first_ttl(&out), Some(1));
     }
 
     #[tokio::test]
@@ -1292,6 +1379,17 @@ mod tests {
         ];
         let end = resolve_cname_chain(&answers, b"\x03www\x07example\x03com\x00");
         assert_eq!(end, b"\x04edge\x07example\x03org\x00".to_vec());
+    }
+
+    #[test]
+    fn cname_chain_cycle_terminates() {
+        let answers = vec![
+            cname_rec("a.example.", "b.example."),
+            cname_rec("b.example.", "a.example."),
+        ];
+        // Hop count is bounded by the link count (2): a → b → a, then stop.
+        let end = resolve_cname_chain(&answers, b"\x01a\x07example\x00");
+        assert_eq!(end, b"\x01a\x07example\x00".to_vec());
     }
 
     fn info_for(name: &str, qtype: Rtype) -> QueryInfo {

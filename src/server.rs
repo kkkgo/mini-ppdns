@@ -20,6 +20,10 @@ use crate::util::unmap_ip;
 
 const UDP_RECV_BUF: usize = 4096;
 const TCP_IDLE: Duration = Duration::from_secs(3);
+/// Cap on an accepted TCP query. Real queries are a few hundred bytes even
+/// with EDNS + TSIG; honoring the full 64 KiB a length prefix can claim would
+/// let a connection flood pin MAX_TCP_CONNS × 64 KiB (~128 MiB) of buffers.
+const TCP_MAX_QUERY: usize = 4096;
 
 type Shutdown = watch::Receiver<bool>;
 
@@ -137,7 +141,7 @@ async fn handle_tcp_conn(
             _ => break, // idle, EOF, or error
         }
         let len = u16::from_be_bytes(len_buf) as usize;
-        if len == 0 {
+        if len == 0 || len > TCP_MAX_QUERY {
             break;
         }
         let mut req = vec![0u8; len];
@@ -162,12 +166,18 @@ async fn handle_tcp_conn(
                 Ok(l) => l,
                 Err(_) => break,
             };
-            if stream.write_all(&l.to_be_bytes()).await.is_err()
-                || stream.write_all(&resp).await.is_err()
-            {
-                break;
+            // Bound the write like the reads: a client that stops reading
+            // would otherwise park this task — and its connection permit —
+            // forever once the socket send buffer fills.
+            let write = async {
+                stream.write_all(&l.to_be_bytes()).await?;
+                stream.write_all(&resp).await?;
+                stream.flush().await
+            };
+            match tokio::time::timeout(TCP_IDLE, write).await {
+                Ok(Ok(())) => {}
+                _ => break, // timed out or write error
             }
-            let _ = stream.flush().await;
         }
     }
 }

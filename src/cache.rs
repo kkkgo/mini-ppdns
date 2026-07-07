@@ -12,34 +12,59 @@ use std::time::{Duration, Instant};
 use domain::base::iana::Rcode;
 
 use crate::dns::OwnedRecord;
+use crate::util::{fnv1a, fnv1a_continue};
 
 /// How many entries to sample when choosing a cap-eviction victim.
 const EVICT_SAMPLE: usize = 8;
 
+/// Cap on a stored entry's lifetime, whatever TTL the upstream claims: a
+/// broken/hostile upstream can advertise ~136 years, which would pin the entry
+/// until restart. A day matches common resolver practice (Unbound caps at a
+/// day, BIND at a week).
+const MAX_TTL_SECS: u32 = 86_400;
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
+    /// `util::fnv1a` of `name`. First field so the derived `PartialEq`
+    /// rejects mismatched keys on one u64 compare before touching the name
+    /// bytes. Always derived from `name` (constructor-enforced), so equality
+    /// and hashing stay consistent.
+    name_hash: u64,
     pub name: Vec<u8>,
     pub qtype: u16,
     pub qclass: u16,
 }
 
 impl CacheKey {
-    /// FNV-1a over the key, used to pick a shard.
+    /// Build a key, hashing `name` here (tests only).
+    #[cfg(test)]
+    pub fn new(name: Vec<u8>, qtype: u16, qclass: u16) -> Self {
+        let name_hash = fnv1a(&name);
+        CacheKey {
+            name_hash,
+            name,
+            qtype,
+            qclass,
+        }
+    }
+
+    /// Build a key from the per-query hash computed in `dns::extract_query`,
+    /// so the hot path never re-hashes the name.
+    pub fn with_hash(name: Vec<u8>, qtype: u16, qclass: u16, name_hash: u64) -> Self {
+        debug_assert_eq!(name_hash, fnv1a(&name), "name_hash must be fnv1a(name)");
+        CacheKey {
+            name_hash,
+            name,
+            qtype,
+            qclass,
+        }
+    }
+
+    /// Shard selector: continue the name's FNV over qtype/qclass — the same
+    /// value as hashing the whole key in one run, without re-reading the name.
     fn shard_hash(&self) -> u64 {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for &b in &self.name {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        for b in self.qtype.to_be_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        for b in self.qclass.to_be_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h
+        let h = fnv1a_continue(self.name_hash, &self.qtype.to_be_bytes());
+        fnv1a_continue(h, &self.qclass.to_be_bytes())
     }
 }
 
@@ -107,10 +132,12 @@ impl Cache {
         }
     }
 
-    /// Store `msg` under `key` for `ttl_secs`. A zero TTL is treated as 1s so an
-    /// immediately-retried query still hits the cache.
+    /// Store `msg` under `key` for `ttl_secs`, clamped to `[1, MAX_TTL_SECS]`:
+    /// a zero TTL is treated as 1s so an immediately-retried query still hits
+    /// the cache, and an oversized TTL must not pin the entry (see
+    /// `MAX_TTL_SECS`).
     pub fn store(&self, key: CacheKey, msg: Arc<CachedMsg>, ttl_secs: u32) {
-        let ttl = ttl_secs.max(1);
+        let ttl = ttl_secs.clamp(1, MAX_TTL_SECS);
         let expires = Instant::now() + Duration::from_secs(ttl as u64);
         let mut shard = self.shard(&key).lock().unwrap();
         if shard.len() >= self.per_shard_cap && !shard.contains_key(&key) {
@@ -145,10 +172,12 @@ impl Cache {
         }
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.shards.iter().map(|s| s.lock().unwrap().len()).sum()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -159,11 +188,7 @@ mod tests {
     use super::*;
 
     fn key(name: &str, qtype: u16) -> CacheKey {
-        CacheKey {
-            name: name.as_bytes().to_vec(),
-            qtype,
-            qclass: 1,
-        }
+        CacheKey::new(name.as_bytes().to_vec(), qtype, 1)
     }
 
     fn msg() -> Arc<CachedMsg> {
@@ -182,6 +207,14 @@ mod tests {
         let (_, ttl) = c.get(&key("a", 1)).expect("hit");
         assert!((1..=300).contains(&ttl));
         assert!(c.get(&key("b", 1)).is_none());
+    }
+
+    #[test]
+    fn ttl_capped() {
+        let c = Cache::new(1024);
+        c.store(key("a", 1), msg(), u32::MAX);
+        let (_, ttl) = c.get(&key("a", 1)).expect("hit");
+        assert!(ttl <= MAX_TTL_SECS, "ttl {ttl} not capped");
     }
 
     #[test]

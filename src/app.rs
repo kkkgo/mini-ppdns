@@ -197,6 +197,29 @@ async fn serve(
             log::hl_value(cfg.hosts.len()),
             log::hl_value(cfg.boguspriv),
         ));
+        // Watch lease/hosts files from a background task. Lookups themselves
+        // never reload: they run inline in the UDP receive loops, where a
+        // synchronous re-read of a large hosts file would stall intake.
+        let watcher = r.clone();
+        let mut rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(
+                crate::local_resolver::RELOAD_INTERVAL_SECS,
+            ));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = rx.changed() => {
+                        if *rx.borrow() { break; }
+                    }
+                    _ = tick.tick() => {
+                        let w = watcher.clone();
+                        // Blocking pool: stat + potential full re-read.
+                        let _ = tokio::task::spawn_blocking(move || w.check_reload()).await;
+                    }
+                }
+            }
+        });
     }
 
     // pplog encrypted telemetry reporter (built before the hook so the hook can

@@ -1,8 +1,28 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
-//! Small networking helpers shared across modules.
+//! Small networking and hashing helpers shared across modules.
 
 use std::net::{IpAddr, Ipv6Addr};
+
+/// FNV-1a 64-bit — the crate's shared cheap non-cryptographic hash. A query
+/// name is hashed once (`dns::extract_query`) and the value reused by the
+/// resolver's negative filter and, via [`fnv1a_continue`], the cache's shard
+/// selection. Not DoS-resistant by design; every consumer bounds the damage
+/// elsewhere (per-shard caps, SipHash inside the shard maps, filter
+/// false-positive fallthrough).
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    fnv1a_continue(0xcbf29ce484222325, bytes)
+}
+
+/// Continue an FNV-1a hash over more bytes (exactly as if the two byte runs
+/// had been hashed as one).
+pub fn fnv1a_continue(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
 
 /// Join a host and port: any host containing a colon (IPv6 literal, possibly
 /// with a `%zone`) is bracketed.

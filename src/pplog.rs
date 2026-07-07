@@ -49,7 +49,9 @@ pub const RCODE_NODATA: u8 = 0xFF;
 /// Parse a UUID string (hyphens optional) into 16 bytes.
 pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
     let hex: String = s.chars().filter(|c| *c != '-').collect();
-    if hex.len() != 32 {
+    // len() counts bytes and the loop below slices by byte index, so non-ASCII
+    // input of the right byte length would slice mid-character and panic.
+    if hex.len() != 32 || !hex.is_ascii() {
         return None;
     }
     let mut out = [0u8; 16];
@@ -445,6 +447,8 @@ mod tests {
             ])
         );
         assert!(parse_uuid("too-short").is_none());
+        // 32 *bytes* of non-ASCII must be rejected, not sliced (would panic).
+        assert!(parse_uuid("€€€€€€€€€€aa").is_none());
     }
 
     #[test]

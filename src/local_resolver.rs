@@ -1,15 +1,14 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
 //! Local record resolution helpers — the name-conversion and classification
-//! subset. File loading, hot-reload, and the resolver struct itself land in a
-//! later phase (see plan.md §6 P3); the pure functions here are shared by the
-//! static-rewrite path and are fully unit-tested.
+//! subset. The pure functions here are shared by the static-rewrite path and
+//! are fully unit-tested.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use domain::base::Name;
 
@@ -155,11 +154,12 @@ fn hex_nibble(c: u8) -> Option<u8> {
     }
 }
 
-// ---- File-backed resolver (lease/hosts) with lazy hot-reload ----
+// ---- File-backed resolver (lease/hosts) with background hot-reload ----
 
 const DEFAULT_LEASE_FILES: &[&str] = &["/tmp/dhcp.leases", "/tmp/dnsmasq.leases"];
 const DEFAULT_HOSTS_FILES: &[&str] = &["/etc/hosts"];
-const RELOAD_INTERVAL_SECS: u32 = 5;
+/// Interval of the background file-watch task (see `app`).
+pub const RELOAD_INTERVAL_SECS: u64 = 5;
 
 /// Encode a presentation name into lower-cased uncompressed wire bytes, the
 /// form used as map keys (so a query's `qname_lower` matches directly). Lenient
@@ -194,13 +194,6 @@ pub fn hostname_to_name(s: &str) -> Option<OwnedName> {
     Name::from_octets(name_to_wire(s, false)?).ok()
 }
 
-fn now_secs() -> u32 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0)
-}
-
 #[derive(Default)]
 struct Maps {
     ptr: HashMap<Vec<u8>, String>,          // wire-lower(arpa) -> hostname
@@ -208,8 +201,59 @@ struct Maps {
     mod_times: HashMap<String, SystemTime>, // watched path -> mtime
 }
 
+/// Bits in [`NameFilter`] (8 KiB). Sized so typical lease/hosts tables
+/// (dozens to a few thousand names) test negative essentially always, while
+/// a huge adblock-style table merely saturates the filter toward "always
+/// maybe" — degrading to the pre-filter cost, never below it.
+const FILTER_BITS: usize = 1 << 16;
+
+/// Add-only Bloom filter (k=2) over lower-cased wire names, guarding the
+/// forward lookup that runs on *every* A/AAAA query: profiling showed the
+/// RwLock + HashMap probe costing ~6% of cache-hit-path CPU even when the
+/// table only held /etc/hosts boilerplate. Bits are set before the new maps
+/// are published and never cleared, so steady-state lookups get no false
+/// negatives; names a reload removed leave stale bits behind, costing one
+/// wasted map probe. Relaxed atomics: a lookup racing a reload may miss that
+/// reload's *new* names for an instant — it just gets the pre-reload answer
+/// once.
+struct NameFilter {
+    words: Box<[AtomicU64]>,
+}
+
+impl NameFilter {
+    fn new() -> Self {
+        NameFilter {
+            words: (0..FILTER_BITS / 64).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// The two bit positions for a name hash (`util::fnv1a` of the wire
+    /// name): low and high halves of the one hash.
+    fn bits_of(h: u64) -> [usize; 2] {
+        [
+            h as usize & (FILTER_BITS - 1),
+            (h >> 32) as usize & (FILTER_BITS - 1),
+        ]
+    }
+
+    fn insert(&self, name: &[u8]) {
+        for i in Self::bits_of(crate::util::fnv1a(name)) {
+            self.words[i >> 6].fetch_or(1 << (i & 63), Ordering::Relaxed);
+        }
+    }
+
+    fn may_contain_hash(&self, h: u64) -> bool {
+        Self::bits_of(h)
+            .into_iter()
+            .all(|i| self.words[i >> 6].load(Ordering::Relaxed) & (1 << (i & 63)) != 0)
+    }
+}
+
 /// In-memory resolver over DHCP lease + hosts files, plus `[hosts]` statics.
-/// Supports reverse (PTR) and forward (A/AAAA) lookups with a lazy 5s reload.
+/// Supports reverse (PTR) and forward (A/AAAA) lookups. Reload is driven by a
+/// periodic background task (see `app`), never by lookups: the lookup path
+/// runs inline in the UDP receive loops, where synchronous file IO would
+/// stall intake.
 pub struct PtrResolver {
     lease_files: Vec<String>,
     hosts_files: Vec<String>,      // explicit, watched for hot-reload
@@ -217,10 +261,8 @@ pub struct PtrResolver {
     static_ptr: HashMap<Vec<u8>, String>,
     static_fwd: HashMap<Vec<u8>, Vec<IpAddr>>,
     maps: RwLock<Maps>,
-    // Unix time (seconds) of the last file-change check. u32 (not i64) so the
-    // type exists on 32-bit MIPS, which has no 64-bit atomics; seconds fit
-    // until 2106 and this is only a reload throttle.
-    last_check: AtomicU32,
+    /// Lock-free negative filter over `maps.fwd` keys (see [`NameFilter`]).
+    fwd_filter: NameFilter,
 }
 
 impl PtrResolver {
@@ -272,7 +314,7 @@ impl PtrResolver {
             static_ptr,
             static_fwd,
             maps: RwLock::new(Maps::default()),
-            last_check: AtomicU32::new(now_secs()),
+            fwd_filter: NameFilter::new(),
         };
         r.reload();
         Some(r)
@@ -300,13 +342,18 @@ impl PtrResolver {
 
     /// Reverse lookup: PTR query wire name (lower-cased) → hostname.
     pub fn lookup(&self, qname_lower: &[u8]) -> Option<String> {
-        self.maybe_reload();
         self.maps.read().unwrap().ptr.get(qname_lower).cloned()
     }
 
-    /// Forward lookup: A/AAAA query wire name (lower-cased) → IPs.
-    pub fn lookup_ip(&self, qname_lower: &[u8]) -> Vec<IpAddr> {
-        self.maybe_reload();
+    /// Forward lookup: A/AAAA query wire name (lower-cased) → IPs. Runs on
+    /// every A/AAAA query, so the (overwhelmingly common) absent name is
+    /// rejected by the lock-free filter before paying for the RwLock +
+    /// HashMap probe. `name_hash` is the caller's per-query `util::fnv1a` of
+    /// `qname_lower` (`QueryInfo::name_hash`), so the name isn't re-hashed.
+    pub fn lookup_ip(&self, qname_lower: &[u8], name_hash: u64) -> Vec<IpAddr> {
+        if !self.fwd_filter.may_contain_hash(name_hash) {
+            return Vec::new();
+        }
         self.maps
             .read()
             .unwrap()
@@ -316,20 +363,9 @@ impl PtrResolver {
             .unwrap_or_default()
     }
 
-    fn maybe_reload(&self) {
-        let now = now_secs();
-        let last = self.last_check.load(Ordering::Relaxed);
-        // now < last guards a wall-clock step-back: fall through and resync.
-        if now >= last && now - last < RELOAD_INTERVAL_SECS {
-            return;
-        }
-        if self
-            .last_check
-            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            return;
-        }
+    /// Reload if any watched file changed. Runs blocking file IO — call it
+    /// from the background watcher task, never from the query path.
+    pub fn check_reload(&self) {
         if self.files_changed() {
             self.reload();
         }
@@ -378,6 +414,11 @@ impl PtrResolver {
         }
         for (k, v) in &self.static_fwd {
             fwd.insert(k.clone(), v.clone());
+        }
+        // Publish filter bits for every (possibly new) name BEFORE swapping
+        // the maps in, so a lookup that sees the new maps also sees the bits.
+        for k in fwd.keys() {
+            self.fwd_filter.insert(k);
         }
         let mut m = self.maps.write().unwrap();
         m.ptr = ptr;
@@ -558,6 +599,20 @@ mod tests {
     }
 
     #[test]
+    fn name_filter_rejects_absent_accepts_inserted() {
+        let f = NameFilter::new();
+        let h = |name: &str| crate::util::fnv1a(&name_to_wire(name, true).unwrap());
+        assert!(
+            !f.may_contain_hash(h("myhost.lan")),
+            "empty filter rejects everything"
+        );
+        f.insert(&name_to_wire("myhost.lan", true).unwrap());
+        assert!(f.may_contain_hash(h("myhost.lan")), "no false negatives");
+        // A distinct name stays (deterministically, for this input) negative.
+        assert!(!f.may_contain_hash(h("www.example.com")));
+    }
+
+    #[test]
     fn file_backed_forward_reverse_static_and_reload() {
         let dir = std::env::temp_dir();
         let uniq = format!("mppdns-{}-{:p}", std::process::id(), &dir as *const _);
@@ -581,7 +636,10 @@ mod tests {
         )
         .expect("resolver present");
 
-        let fwd = |name: &str| r.lookup_ip(&name_to_wire(name, true).unwrap());
+        let fwd = |name: &str| {
+            let wire = name_to_wire(name, true).unwrap();
+            r.lookup_ip(&wire, crate::util::fnv1a(&wire))
+        };
         let rev = |ipstr: &str| r.lookup(&name_to_wire(&ip_to_ptr_name_str(ipstr), true).unwrap());
 
         // lease reverse; hosts forward (all aliases) + reverse (first name); static.

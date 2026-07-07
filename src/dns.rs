@@ -15,10 +15,13 @@ pub type OwnedName = Name<Bytes>;
 pub type OwnedData = AllRecordData<Bytes, OwnedName>;
 pub type OwnedRecord = domain::base::Record<OwnedName, OwnedData>;
 
-/// The client's EDNS0 state we care about echoing.
+/// The client's EDNS0 state we care about echoing (just the advertised UDP
+/// size). The DO bit is deliberately not tracked: DNSSEC is out of scope for
+/// this forwarder (lite mode strips RRSIGs and the cache is not DO-aware), so
+/// we never request DNSSEC records upstream and never claim support
+/// downstream.
 #[derive(Debug, Clone, Copy)]
 pub struct ClientEdns {
-    pub do_bit: bool,
     pub udp_size: u16,
 }
 
@@ -52,6 +55,10 @@ pub struct QueryInfo {
     pub qname: OwnedName,
     /// Lower-cased uncompressed wire name, used as the cache key.
     pub qname_lower: Vec<u8>,
+    /// `util::fnv1a` of `qname_lower`, computed once per query and reused by
+    /// the resolver's negative filter and the cache key (shard selection
+    /// continues from it), so the name is FNV-hashed exactly once.
+    pub name_hash: u64,
     pub qtype: Rtype,
     pub qclass: Class,
     pub client_edns: Option<ClientEdns>,
@@ -71,16 +78,26 @@ pub fn extract_query<Octs: domain::dep::octseq::Octets + ?Sized>(
     let qname: OwnedName = q.qname().to_vec();
     let mut qname_lower = qname.as_slice().to_vec();
     qname_lower.make_ascii_lowercase();
-    let client_edns = msg.opt().map(|opt| ClientEdns {
-        do_bit: opt.dnssec_ok(),
-        udp_size: opt.udp_payload_size(),
-    });
+    let name_hash = crate::util::fnv1a(&qname_lower);
+    let client_edns = edns_of(msg);
     Some(QueryInfo {
         qname,
         qname_lower,
+        name_hash,
         qtype: q.qtype(),
         qclass: q.qclass(),
         client_edns,
+    })
+}
+
+/// The EDNS state of a message's OPT record, if any. Works even when the
+/// question section is unusable — the FORMERR/NOTIMP paths still echo EDNS
+/// per RFC 6891 §7.
+pub fn edns_of<Octs: domain::dep::octseq::Octets + ?Sized>(
+    msg: &Message<Octs>,
+) -> Option<ClientEdns> {
+    msg.opt().map(|opt| ClientEdns {
+        udp_size: opt.udp_payload_size(),
     })
 }
 
@@ -164,13 +181,10 @@ pub fn build_response<Octs: domain::dep::octseq::Octets + ?Sized>(
 
 /// Append the response OPT, echoing the client's advertised UDP size (clamped
 /// to what we are actually willing to send) so "advertised" agrees with the
-/// truncation budget, and carrying the DO bit back if the client set it.
+/// truncation budget. The DO bit is never echoed (see [`ClientEdns`]).
 fn push_opt(add: &mut AdditionalBuilder<Vec<u8>>, edns: ClientEdns) {
     let _ = add.opt(|opt| {
         opt.set_udp_payload_size(edns.udp_size.clamp(512, MAX_UDP_RESPONSE));
-        if edns.do_bit {
-            opt.set_dnssec_ok(true);
-        }
         Ok(())
     });
 }
@@ -294,23 +308,34 @@ fn rr_upper_bound(r: &OwnedRecord) -> usize {
 
 /// Three-tier answer push order per RFC 1034: CNAMEs
 /// first (in original order), then qtype matches (shuffled for load balancing),
-/// then everything else (original order).
+/// then everything else (original order). Built as a single index Vec — one
+/// allocation, with the match range shuffled in place — instead of a Vec per
+/// tier plus a collect.
 fn answer_order(answers: &[OwnedRecord], qtype: Rtype) -> Vec<usize> {
-    let mut cnames = Vec::new();
-    let mut matches = Vec::new();
-    let mut rest = Vec::new();
-    for (i, r) in answers.iter().enumerate() {
+    let tier = |r: &OwnedRecord| {
         let t = r.rtype();
         if t == Rtype::CNAME {
-            cnames.push(i);
+            0u8
         } else if t == qtype {
-            matches.push(i);
+            1
         } else {
-            rest.push(i);
+            2
+        }
+    };
+    let mut order = Vec::with_capacity(answers.len());
+    let mut bounds = [0usize; 2]; // end of the CNAME tier, end of the match tier
+    for want in 0..3u8 {
+        for (i, r) in answers.iter().enumerate() {
+            if tier(r) == want {
+                order.push(i);
+            }
+        }
+        if want < 2 {
+            bounds[want as usize] = order.len();
         }
     }
-    crate::rng::shuffle(&mut matches);
-    cnames.into_iter().chain(matches).chain(rest).collect()
+    crate::rng::shuffle(&mut order[bounds[0]..bounds[1]]);
+    order
 }
 
 fn push_record<T: domain::base::message_builder::RecordSectionBuilder<Vec<u8>>>(
@@ -326,7 +351,8 @@ fn push_record<T: domain::base::message_builder::RecordSectionBuilder<Vec<u8>>>(
 }
 
 /// Build a normalized upstream query: fresh random ID, RD set, EDNS0 OPT with
-/// our advertised UDP size (+ DO bit if the client asked for it).
+/// our advertised UDP size. DO is never set, so upstreams don't bulk the
+/// response up with DNSSEC records we would strip anyway (see [`ClientEdns`]).
 pub fn build_upstream_query(q: &QueryInfo) -> Vec<u8> {
     let mut builder = MessageBuilder::new_vec();
     {
@@ -337,12 +363,8 @@ pub fn build_upstream_query(q: &QueryInfo) -> Vec<u8> {
     let mut question = builder.question();
     let _ = question.push((&q.qname, q.qtype, q.qclass));
     let mut add = question.additional();
-    let do_bit = q.client_edns.map(|e| e.do_bit).unwrap_or(false);
     let _ = add.opt(|opt| {
         opt.set_udp_payload_size(OUR_UDP_SIZE);
-        if do_bit {
-            opt.set_dnssec_ok(true);
-        }
         Ok(())
     });
     add.finish()
@@ -427,6 +449,41 @@ mod tests {
         assert!(q.header().rd());
         assert!(q.opt().is_some());
         assert_eq!(q.sole_question().unwrap().qtype(), Rtype::AAAA);
+    }
+
+    #[test]
+    fn do_bit_never_forwarded_or_echoed() {
+        // Client asks with DO=1: neither the upstream query nor the response
+        // may carry it (DNSSEC out of scope; see ClientEdns).
+        let mut b = MessageBuilder::new_vec();
+        b.header_mut().set_rd(true);
+        let mut q = b.question();
+        q.push((Name::<Vec<u8>>::from_str("example.com.").unwrap(), Rtype::A))
+            .unwrap();
+        let mut add = q.additional();
+        add.opt(|opt| {
+            opt.set_udp_payload_size(1232);
+            opt.set_dnssec_ok(true);
+            Ok(())
+        })
+        .unwrap();
+        let req = Message::from_octets(add.finish()).unwrap();
+        let info = extract_query(&req).unwrap();
+
+        let upq = parse(build_upstream_query(&info)).unwrap();
+        assert!(!upq.opt().unwrap().dnssec_ok(), "DO must not go upstream");
+
+        let data = ResponseData {
+            rcode: Rcode::NOERROR,
+            answers: &[],
+            authority: &[],
+            additional: &[],
+            ttl_override: None,
+            edns: info.client_edns,
+            shuffle_qtype: None,
+        };
+        let out = parse(build_response(&req, &data, None)).unwrap();
+        assert!(!out.opt().unwrap().dnssec_ok(), "DO must not be echoed");
     }
 
     fn a_record(name: &str, last: u8) -> OwnedRecord {

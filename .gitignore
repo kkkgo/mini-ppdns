@@ -51,3 +51,5 @@ git/
 
 # Rust build artifacts
 /target
+.c*
+r*.md

@@ -5,14 +5,29 @@ PIDFILE="/tmp/mini-ppdns.pid"
 
 is_running() {
 	pidof mini-ppdns >/dev/null 2>&1 && return 0
-	ps -ef | grep "mini-ppdns" | grep "config" >/dev/null 2>&1 && return 0
+	for _pid_dir in /proc/[0-9]*; do
+		[ -r "$_pid_dir/exe" ] || continue
+		if [ "$(readlink "$_pid_dir/exe")" = "$PROG" ]; then
+			return 0
+		fi
+	done
 	return 1
 }
 
 get_cur_pid() {
 	_cur_pid=$(pidof mini-ppdns 2>/dev/null)
 	if [ -z "$_cur_pid" ]; then
-		_cur_pid=$(ps -ef | grep "mini-ppdns" | grep "config" | head -n 1 | cut -d" " -f1)
+		for _pid_dir in /proc/[0-9]*; do
+			[ -r "$_pid_dir/exe" ] || continue
+			if [ "$(readlink "$_pid_dir/exe")" = "$PROG" ]; then
+				_pid=$(basename "$_pid_dir")
+				if [ -n "$_cur_pid" ]; then
+					_cur_pid=""
+					break
+				fi
+				_cur_pid="$_pid"
+			fi
+		done
 	fi
 	echo "$_cur_pid"
 }

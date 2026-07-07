@@ -72,16 +72,23 @@ impl Upstream {
         })
     }
 
-    /// Send `query` and return the raw response bytes, honoring `deadline`.
+    /// Send `query` and return the raw response bytes, honoring `deadline`
+    /// across the whole exchange: a truncation-triggered TCP retry only gets
+    /// whatever time the UDP leg left over.
     async fn query(&self, query: &[u8], deadline: Duration) -> Result<Vec<u8>, String> {
         match self.kind {
             Kind::Udp => {
+                let start = Instant::now();
                 let resp = timeout(deadline, self.query_udp(query))
                     .await
                     .map_err(|_| "timeout".to_string())??;
                 // Truncated → retry over TCP (RFC 1035 fallback).
                 if resp.len() >= 3 && (resp[2] & 0x02) != 0 {
-                    return timeout(deadline, self.query_tcp(query))
+                    let remaining = deadline.saturating_sub(start.elapsed());
+                    if remaining.is_zero() {
+                        return Err("timeout".to_string());
+                    }
+                    return timeout(remaining, self.query_tcp(query))
                         .await
                         .map_err(|_| "timeout".to_string())?;
                 }
@@ -174,6 +181,13 @@ impl Upstream {
             .read_exact(&mut resp)
             .await
             .map_err(|e| e.to_string())?;
+        // The transport is connection-oriented, so spoofing isn't a concern;
+        // this guards against a protocol-violating server desyncing the
+        // stream. A wrong id means the reply belongs to some other exchange —
+        // fail (the caller redials) and don't pool the stream.
+        if resp.len() < 2 || resp[0..2] != query[0..2] {
+            return Err("tcp reply id mismatch".to_string());
+        }
         let mut idle = self.idle_tcp.lock().unwrap();
         if idle.len() < MAX_IDLE_CONNS {
             idle.push(stream);
@@ -248,10 +262,6 @@ impl Forwarder {
         Forwarder { upstreams, timeout }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.upstreams.is_empty()
-    }
-
     /// Fan `query` out to up to 3 shuffled upstreams; return the first NOERROR
     /// response (cancelling the rest), else the first non-success response,
     /// else an error result.
@@ -264,6 +274,31 @@ impl Forwarder {
                 upstream: "timeout/err".to_string(),
                 duration: Duration::ZERO,
                 had_error: true,
+            };
+        }
+        // Single upstream (the common config): query it inline. The JoinSet +
+        // per-attempt task spawn below costs forward-path CPU and buys nothing
+        // when there is no fan-out.
+        if n == 1 {
+            let up = &self.upstreams[0];
+            let parsed = match up.query(query, self.timeout).await {
+                Ok(bytes) => dns::parse(bytes).ok_or_else(|| "unpack failed".to_string()),
+                Err(e) => Err(e),
+            };
+            let duration = start.elapsed();
+            return match parsed {
+                Ok(msg) => ForwardResult {
+                    response: Some(msg),
+                    upstream: up.label.clone(),
+                    duration,
+                    had_error: false,
+                },
+                Err(_) => ForwardResult {
+                    response: None,
+                    upstream: up.label.clone(),
+                    duration,
+                    had_error: true,
+                },
             };
         }
         // Cap the working set so the index scratch lives on the stack.
@@ -484,6 +519,41 @@ mod tests {
             }
         });
         format!("udp://{addr}")
+    }
+
+    /// TCP mock that echoes the query back with QR set but a corrupted id.
+    async fn mock_tcp_wrong_id() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut len = [0u8; 2];
+                    if s.read_exact(&mut len).await.is_err() {
+                        return;
+                    }
+                    let n = u16::from_be_bytes(len) as usize;
+                    let mut q = vec![0u8; n];
+                    if s.read_exact(&mut q).await.is_err() {
+                        return;
+                    }
+                    q[0] ^= 0xFF; // wrong transaction id
+                    q[2] |= 0x80; // QR
+                    let _ = s.write_all(&(q.len() as u16).to_be_bytes()).await;
+                    let _ = s.write_all(&q).await;
+                });
+            }
+        });
+        format!("tcp://{addr}")
+    }
+
+    #[tokio::test]
+    async fn tcp_reply_with_wrong_id_is_rejected() {
+        let up = mock_tcp_wrong_id().await;
+        let f = fwd(&[up], 300);
+        let r = f.exec(&query()).await;
+        assert!(r.had_error, "id-mismatched TCP reply must not be accepted");
+        assert!(r.response.is_none());
     }
 
     #[tokio::test]

@@ -1,11 +1,5 @@
 // Copyright (c) 2026, https://blog.03k.org. All rights reserved.
 
-// During the phased rewrite (see plan.md §6) several foundation functions are
-// implemented and unit-tested before the data plane that will call them. Allow
-// dead_code crate-wide until those phases land, rather than scattering
-// per-item attributes we'd only have to remove again.
-#![allow(dead_code)]
-
 mod app;
 mod cache;
 mod cli;
@@ -161,16 +155,12 @@ fn is_daemon_flag_arg(arg: &str) -> bool {
     arg == "-d" || arg == "--d" || arg.starts_with("-d=") || arg.starts_with("--d=")
 }
 
-/// Merge CLI flags over an optional config file, applying deliberately
-/// inconsistent precedence rules field by field.
+/// Merge an optional config file with CLI flags. Precedence is uniform:
+/// CLI (when explicitly given) > config file > default. Collection flags
+/// (dns/fall/listen/…) append CLI entries after the file's.
 fn build_config(raw: &cli::RawArgs, warnings: &mut Vec<String>) -> Result<Config, Fatal> {
-    // Seed qtime/aaaa/lite/daemon/debug from the CLI (with defaults) BEFORE
-    // reading the config file, so a value present in the file then OVERRIDES
-    // the CLI for these particular keys.
+    // daemon/debug are CLI-only (the file has no such keys).
     let mut cfg = Config {
-        qtime: raw.get_int("qtime").unwrap_or(250),
-        aaaa: raw.get_str("aaaa").unwrap_or("no").to_string(),
-        lite: raw.get_str("lite").unwrap_or("yes").to_string(),
         daemon: raw.get_bool("d").unwrap_or(false),
         debug: raw.get_bool("debug").unwrap_or(false),
         ..Config::default()
@@ -179,6 +169,19 @@ fn build_config(raw: &cli::RawArgs, warnings: &mut Vec<String>) -> Result<Config
     if let Some(path) = nonempty(raw.get_str("config")) {
         config::parse_ini(path, &mut cfg, warnings)
             .map_err(|e| Fatal::Config(format!("Error reading config: {e}")))?;
+    }
+
+    // Scalars: an explicitly-given CLI flag overrides the file.
+    if raw.was_set("qtime") {
+        if let Some(n) = raw.get_int("qtime") {
+            cfg.qtime = n;
+        }
+    }
+    if let Some(v) = nonempty(raw.get_str("aaaa")) {
+        cfg.aaaa = v.to_string();
+    }
+    if let Some(v) = nonempty(raw.get_str("lite")) {
+        cfg.lite = v.to_string();
     }
 
     // Collection flags: config entries first, then CLI entries appended.
@@ -306,4 +309,30 @@ fn split_csv_trim(v: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_overrides_config_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("mini-ppdns-prec-{}.ini", std::process::id()));
+        std::fs::write(&path, "[adv]\nqtime=300\naaaa=noerror\nlite=no\n").unwrap();
+        let raw = cli::parse(
+            ["-config", path.to_str().unwrap(), "-qtime", "100", "-aaaa", "yes"]
+                .iter()
+                .map(|s| s.to_string()),
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let Ok(cfg) = build_config(&raw, &mut warnings) else {
+            panic!("build_config failed");
+        };
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(cfg.qtime, 100, "CLI qtime wins over file");
+        assert_eq!(cfg.aaaa, "yes", "CLI aaaa wins over file");
+        assert_eq!(cfg.lite, "no", "file value kept when CLI absent");
+    }
 }
