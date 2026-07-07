@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
 use std::time::SystemTime;
 
@@ -207,6 +207,13 @@ struct Maps {
 /// maybe" — degrading to the pre-filter cost, never below it.
 const FILTER_BITS: usize = 1 << 16;
 
+/// Word width of the filter bitmap. `AtomicUsize` (never `AtomicU64`): the
+/// 32-bit MIPS release targets have no 64-bit atomics — `AtomicU64` does not
+/// even exist there — while pointer-width atomics exist on every target we
+/// ship. The word size only changes the bitmap's internal layout, not the
+/// filter's semantics.
+const WORD_BITS: usize = usize::BITS as usize;
+
 /// Add-only Bloom filter (k=2) over lower-cased wire names, guarding the
 /// forward lookup that runs on *every* A/AAAA query: profiling showed the
 /// RwLock + HashMap probe costing ~6% of cache-hit-path CPU even when the
@@ -217,13 +224,15 @@ const FILTER_BITS: usize = 1 << 16;
 /// reload's *new* names for an instant — it just gets the pre-reload answer
 /// once.
 struct NameFilter {
-    words: Box<[AtomicU64]>,
+    words: Box<[AtomicUsize]>,
 }
 
 impl NameFilter {
     fn new() -> Self {
         NameFilter {
-            words: (0..FILTER_BITS / 64).map(|_| AtomicU64::new(0)).collect(),
+            words: (0..FILTER_BITS / WORD_BITS)
+                .map(|_| AtomicUsize::new(0))
+                .collect(),
         }
     }
 
@@ -238,14 +247,14 @@ impl NameFilter {
 
     fn insert(&self, name: &[u8]) {
         for i in Self::bits_of(crate::util::fnv1a(name)) {
-            self.words[i >> 6].fetch_or(1 << (i & 63), Ordering::Relaxed);
+            self.words[i / WORD_BITS].fetch_or(1 << (i % WORD_BITS), Ordering::Relaxed);
         }
     }
 
     fn may_contain_hash(&self, h: u64) -> bool {
         Self::bits_of(h)
             .into_iter()
-            .all(|i| self.words[i >> 6].load(Ordering::Relaxed) & (1 << (i & 63)) != 0)
+            .all(|i| self.words[i / WORD_BITS].load(Ordering::Relaxed) & (1 << (i % WORD_BITS)) != 0)
     }
 }
 
