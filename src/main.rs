@@ -321,9 +321,16 @@ mod tests {
         path.push(format!("mini-ppdns-prec-{}.ini", std::process::id()));
         std::fs::write(&path, "[adv]\nqtime=300\naaaa=noerror\nlite=no\n").unwrap();
         let raw = cli::parse(
-            ["-config", path.to_str().unwrap(), "-qtime", "100", "-aaaa", "yes"]
-                .iter()
-                .map(|s| s.to_string()),
+            [
+                "-config",
+                path.to_str().unwrap(),
+                "-qtime",
+                "100",
+                "-aaaa",
+                "yes",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
         )
         .unwrap();
         let mut warnings = Vec::new();

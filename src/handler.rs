@@ -816,7 +816,11 @@ impl Handler {
             // failover: those clients always use the fallback, so their answers
             // keep the upstream TTLs — forcing TTL=1 would only make them
             // re-resolve every second, uncached.
-            let ttl_override = if flabel == "force_fall" { None } else { Some(1) };
+            let ttl_override = if flabel == "force_fall" {
+                None
+            } else {
+                Some(1)
+            };
             let out = self.build(
                 msg,
                 fp.rcode,
