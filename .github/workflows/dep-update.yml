@@ -27,10 +27,6 @@ jobs:
           cargo build --release
 
       - name: Commit updated lockfile
-        uses: EndBug/add-and-commit@main
+        uses: kkkgo/Git-Commit-Action@main
         with:
-          author_name: Github Actions
-          author_email: actions@github.com
-          committer_email: actions@github.com
-          message: 'Update dependencies (cargo update)'
           add: Cargo.lock
