@@ -7,6 +7,7 @@
 //! to TCP when the answer is truncated (RFC 1035).
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,17 @@ const UDP_RECV_BUF: usize = 4096;
 const TCP_MAX_MSG: usize = 65535;
 /// Cap on idle connections retained per upstream (bounds fd usage under bursts).
 const MAX_IDLE_CONNS: usize = 128;
+/// Consecutive hard failures (timeout / socket error / unparseable reply) that
+/// trip the main upstream's breaker. Large enough that ordinary packet loss
+/// cannot trip it — five independent losses in a row — small enough to react
+/// within a handful of queries.
+const BREAKER_FAILS: u32 = 5;
+/// How long a tripped upstream is skipped before one probe is let through.
+/// One second, so recovery is noticed almost immediately — switching *back* to
+/// the main DNS has to stay fast.
+const BREAKER_COOLDOWN_SECS: u32 = 1;
+/// Upstream label reported when the breaker answered instead of the network.
+const CIRCUIT_OPEN: &str = "circuit-open";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -43,8 +55,12 @@ pub struct Upstream {
     addr: SocketAddr,
     kind: Kind,
     /// Human-readable label used in logs (the normalized `scheme://host:port`).
-    pub label: String,
-    idle_udp: Mutex<Vec<UdpSocket>>,
+    /// `Arc<str>` rather than `String`: every forwarded query hands this label
+    /// to the logger/telemetry, and a refcount bump beats a heap copy.
+    pub label: Arc<str>,
+    /// Idle connected sockets, each carrying its own receive buffer so the hot
+    /// path does not allocate (and zero) a fresh `UDP_RECV_BUF` per query.
+    idle_udp: Mutex<Vec<(UdpSocket, Vec<u8>)>>,
     idle_tcp: Mutex<Vec<TcpStream>>,
 }
 
@@ -66,7 +82,7 @@ impl Upstream {
         Ok(Upstream {
             addr,
             kind,
-            label: url.to_string(),
+            label: Arc::from(url),
             idle_udp: Mutex::new(Vec::new()),
             idle_tcp: Mutex::new(Vec::new()),
         })
@@ -104,8 +120,8 @@ impl Upstream {
         // Reuse a pooled connected socket, or dial a fresh one. The pop is its
         // own statement so the mutex guard never spans the dial `.await`.
         let pooled = self.idle_udp.lock().unwrap().pop();
-        let sock = match pooled {
-            Some(s) => s,
+        let (sock, mut buf) = match pooled {
+            Some(pair) => pair,
             None => {
                 let bind = if self.addr.is_ipv4() {
                     "0.0.0.0:0"
@@ -114,14 +130,13 @@ impl Upstream {
                 };
                 let s = UdpSocket::bind(bind).await.map_err(|e| e.to_string())?;
                 s.connect(self.addr).await.map_err(|e| e.to_string())?;
-                s
+                (s, vec![0u8; UDP_RECV_BUF])
             }
         };
         sock.send(query).await.map_err(|e| e.to_string())?;
         // Byte offset just past our query's question section; a matching reply
         // must echo those bytes verbatim (see `reply_matches`).
         let qend = question_end(query);
-        let mut buf = vec![0u8; UDP_RECV_BUF];
         loop {
             // A recv error (e.g. ECONNREFUSED from a dead peer) propagates so the
             // forwarder fails over fast rather than waiting out the timeout.
@@ -133,12 +148,16 @@ impl Upstream {
             // caller's deadline — no fixed round cap, which could otherwise drop
             // a valid late answer that trailed a few stale datagrams.
             if n >= 2 && buf[0..2] == query[0..2] && reply_matches(&buf[..n], query, qend) {
-                buf.truncate(n);
+                // Copy out the exact response bytes and return the (still
+                // full-size) scratch buffer to the pool with its socket. Only
+                // `buf[..n]` is ever read, so bytes left over from an earlier,
+                // longer reply are never observable.
+                let resp = buf[..n].to_vec();
                 let mut idle = self.idle_udp.lock().unwrap();
                 if idle.len() < MAX_IDLE_CONNS {
-                    idle.push(sock);
+                    idle.push((sock, buf));
                 }
-                return Ok(buf);
+                return Ok(resp);
             }
         }
     }
@@ -196,6 +215,21 @@ impl Upstream {
     }
 }
 
+/// Give this attempt its own DNS transaction ID, in place. Every hop draws
+/// independently: the three fan-out copies of one query, and the fallback stage
+/// after the main stage, must not share an ID (RFC 5452 §9 — ID entropy is
+/// per-query, not per-client-request). Uses `getrandom` rather than
+/// `rng::next_u64`, which is explicitly documented as non-cryptographic; on
+/// failure the ID built by `dns::build_upstream_query` (already CSPRNG) stands.
+fn randomize_id(query: &mut [u8]) {
+    if query.len() >= 2 {
+        let mut id = [0u8; 2];
+        if getrandom::fill(&mut id).is_ok() {
+            query[0..2].copy_from_slice(&id);
+        }
+    }
+}
+
 /// Byte offset just past the question section of a well-formed query
 /// (header 12 + QNAME + QTYPE(2) + QCLASS(2)). `None` if the QNAME is malformed
 /// or runs off the end — only possible for a caller-broken query, never for one
@@ -239,12 +273,115 @@ fn reply_matches(reply: &[u8], query: &[u8], qend: Option<usize>) -> bool {
 
 /// One concurrent query's result: the upstream label, its latency, and the
 /// parsed response (or an error string).
-type QueryOutcome = (String, Duration, Result<Message<Vec<u8>>, String>);
+type QueryOutcome = (Arc<str>, Duration, Result<Message<Vec<u8>>, String>);
+
+/// Fail-fast breaker for the *main* forwarder.
+///
+/// A main DNS that refuses packets fails immediately, but one that has gone
+/// silent (link down, firewall DROP, hung process) costs every query the full
+/// `qtime` before the fallback is tried at all. After `BREAKER_FAILS`
+/// consecutive hard failures this reports the upstream as down without touching
+/// the network, so queries reach the fallback with no added latency.
+///
+/// Switching *back* must stay fast, so the cooldown is one second and exactly
+/// one query per cooldown is let through to probe (a `probing` latch keeps a
+/// burst from piling onto the dead upstream). One successful probe closes it.
+///
+/// A parsed response counts as success even when it is SERVFAIL or NXDOMAIN:
+/// the upstream is alive and the rcode-based failover handles the rest. Only
+/// transport-level failures count against it.
+struct Breaker {
+    base: Instant,
+    /// Consecutive hard failures.
+    fails: AtomicU32,
+    /// Cooldown deadline, seconds since `base`; 0 means "closed" (not tripped).
+    /// `AtomicU32`, never `AtomicU64`: 32-bit MIPS release targets have no
+    /// 64-bit atomics. Seconds give 136 years of headroom.
+    open_until: AtomicU32,
+    /// Held by the one query currently probing a tripped upstream.
+    probing: AtomicBool,
+    label: Arc<str>,
+}
+
+/// What the breaker says about this attempt.
+enum Admit<'a> {
+    /// Not tripped — go to the network.
+    Closed,
+    /// Tripped and still cooling down — fail immediately.
+    Open,
+    /// Cooldown elapsed and this call won the latch: it is the probe.
+    Probe(ProbeGuard<'a>),
+}
+
+/// Releases the probe latch however the attempt ends — including when the task
+/// is cancelled mid-flight, which would otherwise wedge the breaker half-open.
+struct ProbeGuard<'a>(&'a AtomicBool);
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl Breaker {
+    fn new() -> Self {
+        Breaker {
+            base: Instant::now(),
+            fails: AtomicU32::new(0),
+            open_until: AtomicU32::new(0),
+            probing: AtomicBool::new(false),
+            label: Arc::from(CIRCUIT_OPEN),
+        }
+    }
+
+    fn now_secs(&self) -> u32 {
+        self.base.elapsed().as_secs() as u32
+    }
+
+    fn admit(&self) -> Admit<'_> {
+        let until = self.open_until.load(Ordering::Relaxed);
+        if until == 0 {
+            return Admit::Closed;
+        }
+        if self.now_secs() < until {
+            return Admit::Open;
+        }
+        // Cooldown elapsed: exactly one caller becomes the probe, the rest keep
+        // failing fast until it reports back.
+        match self
+            .probing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        {
+            Ok(_) => Admit::Probe(ProbeGuard(&self.probing)),
+            Err(_) => Admit::Open,
+        }
+    }
+
+    fn record(&self, ok: bool) {
+        if ok {
+            // One success is enough: close immediately so the main DNS is used
+            // again on the very next query.
+            self.fails.store(0, Ordering::Relaxed);
+            self.open_until.store(0, Ordering::Relaxed);
+            return;
+        }
+        let fails = self.fails.fetch_add(1, Ordering::Relaxed) + 1;
+        if fails >= BREAKER_FAILS {
+            // Also re-arms after a failed probe, which lands here with the
+            // streak already past the threshold.
+            self.open_until
+                .store(self.now_secs() + BREAKER_COOLDOWN_SECS, Ordering::Relaxed);
+        }
+    }
+}
 
 /// A pool of upstreams queried concurrently with failover.
 pub struct Forwarder {
     upstreams: Vec<Arc<Upstream>>,
     timeout: Duration,
+    /// Only the main forwarder gets one: skipping the *fallback* would leave
+    /// the query with nowhere to go.
+    breaker: Option<Breaker>,
 }
 
 /// Outcome of a forward attempt.
@@ -252,26 +389,69 @@ pub struct ForwardResult {
     /// The chosen response (first NOERROR, else first non-error), if any.
     pub response: Option<Message<Vec<u8>>>,
     /// Label of the upstream that answered, or "timeout/err".
-    pub upstream: String,
+    pub upstream: Arc<str>,
     pub duration: Duration,
     pub had_error: bool,
 }
 
 impl Forwarder {
     pub fn new(upstreams: Vec<Arc<Upstream>>, timeout: Duration) -> Self {
-        Forwarder { upstreams, timeout }
+        Forwarder {
+            upstreams,
+            timeout,
+            breaker: None,
+        }
+    }
+
+    /// The main forwarder: adds the fail-fast breaker (see [`Breaker`]).
+    pub fn with_breaker(upstreams: Vec<Arc<Upstream>>, timeout: Duration) -> Self {
+        Forwarder {
+            upstreams,
+            timeout,
+            breaker: Some(Breaker::new()),
+        }
     }
 
     /// Fan `query` out to up to 3 shuffled upstreams; return the first NOERROR
     /// response (cancelling the rest), else the first non-success response,
     /// else an error result.
-    pub async fn exec(&self, query: &[u8]) -> ForwardResult {
+    /// `query` is mutated in place: each attempt stamps its own transaction ID
+    /// (see `randomize_id`).
+    pub async fn exec(&self, query: &mut [u8]) -> ForwardResult {
+        let probe = match self.breaker.as_ref().map(Breaker::admit) {
+            Some(Admit::Open) => {
+                // Tripped: report the failure without touching the network so
+                // the caller moves straight on to the fallback.
+                let label = self
+                    .breaker
+                    .as_ref()
+                    .map(|b| b.label.clone())
+                    .unwrap_or_else(|| Arc::from(CIRCUIT_OPEN));
+                return ForwardResult {
+                    response: None,
+                    upstream: label,
+                    duration: Duration::ZERO,
+                    had_error: true,
+                };
+            }
+            Some(Admit::Probe(guard)) => Some(guard),
+            _ => None,
+        };
+        let out = self.exec_inner(query).await;
+        if let Some(b) = &self.breaker {
+            b.record(!out.had_error);
+        }
+        drop(probe);
+        out
+    }
+
+    async fn exec_inner(&self, query: &mut [u8]) -> ForwardResult {
         let start = Instant::now();
         let n = self.upstreams.len();
         if n == 0 {
             return ForwardResult {
                 response: None,
-                upstream: "timeout/err".to_string(),
+                upstream: Arc::from("timeout/err"),
                 duration: Duration::ZERO,
                 had_error: true,
             };
@@ -280,6 +460,7 @@ impl Forwarder {
         // per-attempt task spawn below costs forward-path CPU and buys nothing
         // when there is no fan-out.
         if n == 1 {
+            randomize_id(query);
             let up = &self.upstreams[0];
             let parsed = match up.query(query, self.timeout).await {
                 Ok(bytes) => dns::parse(bytes).ok_or_else(|| "unpack failed".to_string()),
@@ -310,11 +491,12 @@ impl Forwarder {
         }
         rng::partial_shuffle(&mut idx[..n], concurrent);
 
-        let q: Arc<[u8]> = Arc::from(query);
         let mut set: JoinSet<QueryOutcome> = JoinSet::new();
         for &i in idx[..concurrent].iter() {
             let up = self.upstreams[i].clone();
-            let q = q.clone();
+            // Each fan-out copy carries its own transaction ID.
+            let mut q = query.to_vec();
+            randomize_id(&mut q);
             let to = self.timeout;
             set.spawn(async move {
                 let started = Instant::now();
@@ -326,8 +508,8 @@ impl Forwarder {
             });
         }
 
-        let mut fallback: Option<(String, Duration, Message<Vec<u8>>)> = None;
-        let mut first_err: Option<(String, Duration)> = None;
+        let mut fallback: Option<(Arc<str>, Duration, Message<Vec<u8>>)> = None;
+        let mut first_err: Option<(Arc<str>, Duration)> = None;
         while let Some(joined) = set.join_next().await {
             let Ok((label, dur, parsed)) = joined else {
                 continue;
@@ -373,7 +555,7 @@ impl Forwarder {
         }
         ForwardResult {
             response: None,
-            upstream: "timeout/err".to_string(),
+            upstream: Arc::from("timeout/err"),
             duration: start.elapsed(),
             had_error: true,
         }
@@ -444,7 +626,7 @@ mod tests {
         let bad = mock(Rcode::SERVFAIL).await;
         let good = mock(Rcode::NOERROR).await;
         let f = fwd(&[bad, good], 500);
-        let r = f.exec(&query()).await;
+        let r = f.exec(&mut query()).await;
         assert!(!r.had_error);
         assert_eq!(r.response.unwrap().header().rcode(), Rcode::NOERROR);
     }
@@ -453,7 +635,7 @@ mod tests {
     async fn non_success_is_surfaced_not_dropped() {
         let bad = mock(Rcode::SERVFAIL).await;
         let f = fwd(&[bad], 500);
-        let r = f.exec(&query()).await;
+        let r = f.exec(&mut query()).await;
         assert!(!r.had_error); // a parsed non-NOERROR is still a response
         assert_eq!(r.response.unwrap().header().rcode(), Rcode::SERVFAIL);
     }
@@ -461,7 +643,7 @@ mod tests {
     #[tokio::test]
     async fn all_dead_reports_error() {
         let f = fwd(&["udp://127.0.0.1:1".to_string()], 200);
-        let r = f.exec(&query()).await;
+        let r = f.exec(&mut query()).await;
         assert!(r.had_error);
         assert!(r.response.is_none());
     }
@@ -551,7 +733,7 @@ mod tests {
     async fn tcp_reply_with_wrong_id_is_rejected() {
         let up = mock_tcp_wrong_id().await;
         let f = fwd(&[up], 300);
-        let r = f.exec(&query()).await;
+        let r = f.exec(&mut query()).await;
         assert!(r.had_error, "id-mismatched TCP reply must not be accepted");
         assert!(r.response.is_none());
     }
@@ -560,9 +742,161 @@ mod tests {
     async fn reply_with_wrong_question_is_rejected() {
         let up = mock_wrong_question().await;
         let f = fwd(&[up], 250);
-        let r = f.exec(&query()).await;
+        let r = f.exec(&mut query()).await;
         // Id matches but the echoed question doesn't → skipped → deadline hit.
         assert!(r.had_error);
         assert!(r.response.is_none());
+    }
+
+    /// UDP mock whose first reply is long and every later reply is short, so a
+    /// reused receive buffer would visibly carry a tail from the first one.
+    async fn mock_shrinking() -> String {
+        use domain::base::iana::Class;
+        use domain::base::name::ToName;
+        use domain::base::Ttl;
+        use domain::rdata::A;
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut first = true;
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                let Some(msg) = dns::parse(buf[..n].to_vec()) else {
+                    continue;
+                };
+                let count: u8 = if first { 20 } else { 1 };
+                first = false;
+                let mut b = MessageBuilder::new_vec()
+                    .start_answer(&msg, Rcode::NOERROR)
+                    .unwrap();
+                let name = msg.sole_question().unwrap().qname().to_vec();
+                for i in 0..count {
+                    b.push((
+                        &name,
+                        Class::IN,
+                        Ttl::from_secs(60),
+                        A::from_octets(10, 0, 0, i),
+                    ))
+                    .unwrap();
+                }
+                let _ = sock.send_to(&b.finish(), peer).await;
+            }
+        });
+        format!("udp://{addr}")
+    }
+
+    /// The connected socket and its receive buffer are pooled together across
+    /// queries. The second exchange must yield exactly the bytes the server
+    /// sent for it — never the longer previous reply's tail left in the buffer.
+    #[tokio::test]
+    async fn pooled_receive_buffer_yields_exact_reply_bytes() {
+        use domain::rdata::AllRecordData;
+        let f = fwd(&[mock_shrinking().await], 500);
+
+        let long = f.exec(&mut query()).await.response.expect("first reply");
+        let long_len = long.as_slice().len();
+
+        let short = f.exec(&mut query()).await.response.expect("second reply");
+        let short_len = short.as_slice().len();
+
+        // header(12) + question("example.com." 13 + qtype/qclass 4)
+        //            + one uncompressed A RR (13 + 10 + 4)
+        assert_eq!(short_len, 12 + 13 + 4 + 13 + 10 + 4);
+        assert!(
+            long_len > short_len,
+            "the first reply must be the longer one ({long_len} vs {short_len})"
+        );
+        assert_eq!(
+            short
+                .answer()
+                .unwrap()
+                .limit_to::<AllRecordData<_, _>>()
+                .count(),
+            1
+        );
+    }
+
+    /// UDP mock that can be switched between answering and going silent, so a
+    /// single upstream can be driven from "dead" to "recovered".
+    async fn mock_toggleable() -> (String, Arc<AtomicBool>) {
+        let alive = Arc::new(AtomicBool::new(false));
+        let a = alive.clone();
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                if !a.load(Ordering::Relaxed) {
+                    continue; // silent: the caller waits out its deadline
+                }
+                if let Some(msg) = dns::parse(buf[..n].to_vec()) {
+                    let resp = MessageBuilder::new_vec()
+                        .start_answer(&msg, Rcode::NOERROR)
+                        .unwrap()
+                        .finish();
+                    let _ = sock.send_to(&resp, peer).await;
+                }
+            }
+        });
+        (format!("udp://{addr}"), alive)
+    }
+
+    #[tokio::test]
+    async fn breaker_trips_on_a_silent_upstream_then_closes_on_recovery() {
+        let (up, alive) = mock_toggleable().await;
+        let f = Forwarder::with_breaker(
+            vec![Arc::new(Upstream::parse(&up).unwrap())],
+            Duration::from_millis(60),
+        );
+
+        // A silent upstream costs a full timeout per query — the cost the
+        // breaker exists to remove. It must not trip early.
+        for i in 0..BREAKER_FAILS {
+            let r = f.exec(&mut query()).await;
+            assert!(r.had_error, "attempt {i}");
+            assert_ne!(
+                &*r.upstream, CIRCUIT_OPEN,
+                "attempt {i} must still reach the network"
+            );
+        }
+
+        // Tripped: fails immediately, without touching the network.
+        let t = Instant::now();
+        let r = f.exec(&mut query()).await;
+        assert!(r.had_error);
+        assert_eq!(&*r.upstream, CIRCUIT_OPEN);
+        assert!(
+            t.elapsed() < Duration::from_millis(30),
+            "a tripped breaker must not wait out the timeout (took {:?})",
+            t.elapsed()
+        );
+
+        // Recovery: after the cooldown one probe is let through, and a single
+        // success closes the breaker again — switching back must not get slower.
+        alive.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let probe = f.exec(&mut query()).await;
+        assert!(!probe.had_error, "the probe reaches the recovered upstream");
+        let after = f.exec(&mut query()).await;
+        assert!(!after.had_error);
+        assert_ne!(
+            &*after.upstream, CIRCUIT_OPEN,
+            "one success must close the breaker"
+        );
+    }
+
+    /// The fallback forwarder never gets a breaker: short-circuiting the last
+    /// resort would leave the query with nowhere to go.
+    #[tokio::test]
+    async fn fallback_forwarder_keeps_trying() {
+        let f = fwd(&["udp://127.0.0.1:1".to_string()], 60);
+        for i in 0..(BREAKER_FAILS + 3) {
+            let r = f.exec(&mut query()).await;
+            assert!(r.had_error, "attempt {i}");
+            assert_ne!(
+                &*r.upstream, CIRCUIT_OPEN,
+                "attempt {i} must not short-circuit"
+            );
+        }
     }
 }

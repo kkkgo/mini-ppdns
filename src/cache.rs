@@ -5,6 +5,7 @@
 //! rcode). Sharding by a cheap FNV hash keeps lock contention low under load.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 use domain::base::iana::Rcode;
 
 use crate::dns::OwnedRecord;
-use crate::util::{fnv1a, fnv1a_continue};
+use crate::util::{hash, hash_extend};
 
 /// How many entries to sample when choosing a cap-eviction victim.
 const EVICT_SAMPLE: usize = 8;
@@ -23,9 +24,33 @@ const EVICT_SAMPLE: usize = 8;
 /// day, BIND at a week).
 const MAX_TTL_SECS: u32 = 86_400;
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// Hasher for a key that already carries its hash: the shard maps index on the
+/// value `CacheKey::hash` writes and never touch the key bytes.
+///
+/// Sound only because `util::hash` is seeded per process (see its docs) — which
+/// bucket a key lands in must not be attacker-predictable.
+#[derive(Default)]
+pub struct PreHashed(u64);
+
+impl Hasher for PreHashed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        // Only reached if something hashes a key we did not pre-hash; falling
+        // back to a real hash keeps such a use correct rather than degenerate.
+        self.0 = hash_extend(self.0, hash(bytes));
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = v;
+    }
+}
+
+type Shard = HashMap<CacheKey, Entry, BuildHasherDefault<PreHashed>>;
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct CacheKey {
-    /// `util::fnv1a` of `name`. First field so the derived `PartialEq`
+    /// `util::hash` of `name`. First field so the derived `PartialEq`
     /// rejects mismatched keys on one u64 compare before touching the name
     /// bytes. Always derived from `name` (constructor-enforced), so equality
     /// and hashing stay consistent.
@@ -39,7 +64,7 @@ impl CacheKey {
     /// Build a key, hashing `name` here (tests only).
     #[cfg(test)]
     pub fn new(name: Vec<u8>, qtype: u16, qclass: u16) -> Self {
-        let name_hash = fnv1a(&name);
+        let name_hash = hash(&name);
         CacheKey {
             name_hash,
             name,
@@ -51,7 +76,7 @@ impl CacheKey {
     /// Build a key from the per-query hash computed in `dns::extract_query`,
     /// so the hot path never re-hashes the name.
     pub fn with_hash(name: Vec<u8>, qtype: u16, qclass: u16, name_hash: u64) -> Self {
-        debug_assert_eq!(name_hash, fnv1a(&name), "name_hash must be fnv1a(name)");
+        debug_assert_eq!(name_hash, hash(&name), "name_hash must be util::hash(name)");
         CacheKey {
             name_hash,
             name,
@@ -60,11 +85,23 @@ impl CacheKey {
         }
     }
 
-    /// Shard selector: continue the name's FNV over qtype/qclass — the same
-    /// value as hashing the whole key in one run, without re-reading the name.
-    fn shard_hash(&self) -> u64 {
-        let h = fnv1a_continue(self.name_hash, &self.qtype.to_be_bytes());
-        fnv1a_continue(h, &self.qclass.to_be_bytes())
+    /// The key's full hash: the name's hash folded over qtype/qclass, without
+    /// re-reading the name. Selects the shard *and* is what the shard map
+    /// indexes on (see [`PreHashed`]).
+    fn key_hash(&self) -> u64 {
+        hash_extend(
+            self.name_hash,
+            (u64::from(self.qtype) << 16) | u64::from(self.qclass),
+        )
+    }
+}
+
+impl std::hash::Hash for CacheKey {
+    /// Writes the precomputed hash and nothing else — [`PreHashed`] takes it
+    /// verbatim. Equality still compares the full key, so distinct names that
+    /// happen to collide stay distinct entries.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.key_hash());
     }
 }
 
@@ -82,7 +119,7 @@ struct Entry {
 }
 
 pub struct Cache {
-    shards: Box<[Mutex<HashMap<CacheKey, Entry>>]>,
+    shards: Box<[Mutex<Shard>]>,
     shard_mask: usize,
     per_shard_cap: usize,
 }
@@ -93,7 +130,7 @@ impl Cache {
         const SHARDS: usize = 64; // power of two
         let per_shard_cap = (total_cap / SHARDS).max(1);
         let shards = (0..SHARDS)
-            .map(|_| Mutex::new(HashMap::new()))
+            .map(|_| Mutex::new(Shard::default()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Cache {
@@ -103,8 +140,8 @@ impl Cache {
         }
     }
 
-    fn shard(&self, key: &CacheKey) -> &Mutex<HashMap<CacheKey, Entry>> {
-        let idx = (key.shard_hash() as usize) & self.shard_mask;
+    fn shard(&self, key: &CacheKey) -> &Mutex<Shard> {
+        let idx = (key.key_hash() as usize) & self.shard_mask;
         &self.shards[idx]
     }
 

@@ -4,6 +4,7 @@
 //!
 //! Order: static rewrites → route decision → cache → main DNS → fallback.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -44,7 +45,15 @@ impl AaaaMode {
 pub struct Handler {
     pub main: Forwarder,
     pub fallback: Forwarder,
+    /// Answers that came from the main DNS. Read by main-preferring clients.
     pub cache: Arc<Cache>,
+    /// Answers that came from the fallback DNS. Read by force_fall clients and,
+    /// while the hook says the main DNS is down, by everyone. The two caches
+    /// are partitioned by *which upstream produced the answer*, never by which
+    /// client asked — that is what makes sharing this one safe: every entry in
+    /// it is a faithful fallback-upstream answer, which is exactly what both
+    /// kinds of reader are supposed to get.
+    pub fall_cache: Arc<Cache>,
     pub force_fall: ForceFallMatcher,
     pub aaaa_mode: AaaaMode,
     pub lite: bool,
@@ -64,7 +73,23 @@ struct Parts {
     additional: Vec<OwnedRecord>,
 }
 
+/// Label reported for a fallback stage that was answered out of the fallback
+/// cache instead of the network.
+const FALL_CACHE_LABEL: &str = "cache-fall";
+
 impl Parts {
+    /// Re-own a cached message so it can go through the same NODATA-preference
+    /// and lite handling as a freshly fetched one. Costs a clone of the record
+    /// set, which is small next to the upstream round trip it saves.
+    fn from_cached(c: &CachedMsg) -> Self {
+        Parts {
+            rcode: c.rcode,
+            answers: c.answers.clone(),
+            authority: c.authority.clone(),
+            additional: c.additional.clone(),
+        }
+    }
+
     fn from_msg(msg: &Message<Vec<u8>>) -> Self {
         Parts {
             rcode: msg.header().rcode(),
@@ -110,23 +135,36 @@ impl LocalResult {
     }
 }
 
-/// The routing decision: whether to bypass the main DNS, and the log label to
-/// use when the fallback answers.
+/// The routing decision: whether to bypass the main DNS, the log label to use
+/// when the fallback answers, and how a fallback-sourced answer is aged.
 struct RouteDecision {
+    /// Skip the main DNS entirely (force_fall policy, or hook-detected outage).
+    /// Also selects which cache this query reads: forced routes read the
+    /// fallback cache, everyone else the main one.
     force: bool,
     fall_label: &'static str,
+    /// Whether a fallback-sourced answer is handed to the *client* with TTL=1.
+    /// True for failover (so recovery switches back fast), false for force_fall
+    /// — permanent policy routing, where those clients keep the upstream TTLs.
+    /// This governs only what the client sees; the cache always stores the
+    /// upstream's own TTL.
+    fallback_ttl1: bool,
 }
 
-/// Human-readable rcode label for logs.
-fn rcode_label(rcode: Rcode, empty_answer: bool) -> String {
+/// Human-readable rcode label for logs. Borrowed for every label known
+/// statically: labels are built on the cache-hit and upstream-response paths
+/// *before* `dlog` gets to check whether debug logging is on (arguments are
+/// evaluated first), so an owned `String` here would allocate on every query
+/// whether or not the line is ever emitted.
+fn rcode_label(rcode: Rcode, empty_answer: bool) -> Cow<'static, str> {
     match rcode {
-        Rcode::NOERROR if empty_answer => "NODATA".to_string(),
-        Rcode::NOERROR => "NOERROR".to_string(),
-        Rcode::NXDOMAIN => "NXDOMAIN".to_string(),
-        Rcode::SERVFAIL => "SERVFAIL".to_string(),
-        Rcode::REFUSED => "REFUSED".to_string(),
-        Rcode::FORMERR => "FORMERR".to_string(),
-        other => format!("RCODE_{}", u8::from(other)),
+        Rcode::NOERROR if empty_answer => Cow::Borrowed("NODATA"),
+        Rcode::NOERROR => Cow::Borrowed("NOERROR"),
+        Rcode::NXDOMAIN => Cow::Borrowed("NXDOMAIN"),
+        Rcode::SERVFAIL => Cow::Borrowed("SERVFAIL"),
+        Rcode::REFUSED => Cow::Borrowed("REFUSED"),
+        Rcode::FORMERR => Cow::Borrowed("FORMERR"),
+        other => Cow::Owned(format!("RCODE_{}", u8::from(other))),
     }
 }
 
@@ -154,7 +192,7 @@ pub enum FastOutcome {
 impl Handler {
     /// Process one query, returning the wire response to send (None = drop).
     pub async fn process(&self, req: Vec<u8>, client: IpAddr, is_udp: bool) -> Option<Vec<u8>> {
-        match self.process_fast(req, client, is_udp) {
+        match self.process_fast(&req, client, is_udp) {
             FastOutcome::Done(resp) => resp,
             FastOutcome::Pending(p) => self.process_slow(p, client).await,
         }
@@ -164,7 +202,7 @@ impl Handler {
     /// cache hit. Synchronous and bounded (~µs), so the UDP receive loop can
     /// run it inline without spawning a task; only a `Pending` result pays the
     /// per-task scheduling cost.
-    pub fn process_fast(&self, req: Vec<u8>, client: IpAddr, is_udp: bool) -> FastOutcome {
+    pub fn process_fast(&self, req: &[u8], client: IpAddr, is_udp: bool) -> FastOutcome {
         let Ok(msg) = Message::from_octets(req) else {
             return FastOutcome::Done(None);
         };
@@ -178,7 +216,7 @@ impl Handler {
         if msg.header().opcode() != Opcode::QUERY {
             return FastOutcome::Done(Some(self.reject(&msg, Rcode::NOTIMP, is_udp)));
         }
-        let Some(info) = dns::extract_query(&msg) else {
+        let Some((info, qname_lower)) = dns::extract_query(&msg) else {
             // No sole question → FORMERR.
             return FastOutcome::Done(Some(self.reject(&msg, Rcode::FORMERR, is_udp)));
         };
@@ -189,23 +227,40 @@ impl Handler {
             None
         };
 
-        if let Some(resp) = self.try_static_rewrite(&msg, &info, client, udp_limit) {
+        if let Some(resp) = self.try_static_rewrite(&msg, &info, &qname_lower, client, udp_limit) {
             return FastOutcome::Done(Some(resp));
         }
 
-        let route = self.resolve_route(&info, client);
+        let route = self.resolve_route(&qname_lower, client);
+        // `qname_lower` is moved in, not cloned: the key owns the only copy
+        // from here on, and every later reader goes through `key.name`.
         let key = CacheKey::with_hash(
-            info.qname_lower.clone(),
+            qname_lower,
             info.qtype.to_int(),
             info.qclass.to_int(),
             info.name_hash,
         );
 
-        if !route.force {
-            if let Some((cached, ttl_left)) = self.cache.get(&key) {
+        // Forced routes read the fallback cache, everyone else the main one.
+        let (cache, cache_label) = if route.force {
+            (&self.fall_cache, "cache-fall")
+        } else {
+            (&self.cache, "cache")
+        };
+        {
+            if let Some((cached, ttl_left)) = cache.get(&key) {
+                // The stored TTL is always the upstream's own. Only what the
+                // client sees is capped, and only for failover — so a hook-down
+                // hit still serves TTL=1 and the client re-asks (and lands back
+                // on the main DNS) as soon as the hook clears.
+                let ttl_left = if route.force && route.fallback_ttl1 {
+                    1
+                } else {
+                    ttl_left
+                };
                 let empty = cached.rcode == Rcode::NOERROR && cached.answers.is_empty();
                 self.dlog(
-                    "cache",
+                    cache_label,
                     &info,
                     client,
                     None,
@@ -234,6 +289,12 @@ impl Handler {
             }
         }
 
+        // Only here do we need an owned message: this query is going to an
+        // upstream, which means a task spawn and a network round trip — one
+        // copy is noise. The answered-inline paths above never pay for it.
+        let Ok(msg) = Message::from_octets(req.to_vec()) else {
+            return FastOutcome::Done(None);
+        };
         FastOutcome::Pending(Box::new(PendingQuery {
             msg,
             info,
@@ -253,26 +314,34 @@ impl Handler {
             key,
             udp_limit,
         } = *p;
-        let query = dns::build_upstream_query(&info);
+        // Mutable: each upstream stage stamps its own transaction ID into it.
+        let mut query = dns::build_upstream_query(&info);
         let local = if route.force {
             LocalResult::none()
         } else {
-            self.exec_local(&msg, &info, &key, &query, client, udp_limit)
+            self.exec_local(&msg, &info, &key, &mut query, client, udp_limit)
                 .await
         };
         if let Some(resp) = local.handled {
             return Some(resp);
         }
         Some(
-            self.exec_fallback(&msg, &info, &key, &query, &route, client, local, udp_limit)
-                .await,
+            self.exec_fallback(
+                &msg, &info, &key, &mut query, &route, client, local, udp_limit,
+            )
+            .await,
         )
     }
 
     /// Build a question-echoing error response (FORMERR/NOTIMP). The client's
     /// EDNS is still echoed even though the query wasn't processed
     /// (RFC 6891 §7), and the UDP size budget still applies.
-    fn reject(&self, msg: &Message<Vec<u8>>, rcode: Rcode, is_udp: bool) -> Vec<u8> {
+    fn reject<Octs: domain::dep::octseq::Octets + ?Sized>(
+        &self,
+        msg: &Message<Octs>,
+        rcode: Rcode,
+        is_udp: bool,
+    ) -> Vec<u8> {
         let edns = dns::edns_of(msg);
         let udp_limit = is_udp.then(|| dns::udp_response_limit(edns));
         self.build(msg, rcode, &Parts::empty(), edns, udp_limit, None, None)
@@ -280,10 +349,11 @@ impl Handler {
 
     /// Answers needing no upstream: AAAA/SVCB/HTTPS blocking, hosts forward
     /// lookups, local PTR, and bogus-priv.
-    fn try_static_rewrite(
+    fn try_static_rewrite<Octs: domain::dep::octseq::Octets + ?Sized>(
         &self,
-        msg: &Message<Vec<u8>>,
+        msg: &Message<Octs>,
         info: &QueryInfo,
+        qname_lower: &[u8],
         client: IpAddr,
         udp_limit: Option<u16>,
     ) -> Option<Vec<u8>> {
@@ -319,15 +389,47 @@ impl Handler {
             ));
         }
 
-        // Forward lookup from hosts files / [hosts] config.
+        // Forward lookup from hosts files / [hosts] config. A locally defined
+        // name is authoritative for *every* type, as it is in dnsmasq: when the
+        // entry holds no address of the queried family the answer is an empty
+        // NOERROR, not a fall-through. Falling through would resolve the name
+        // upstream for real, so an IPv4-only entry — the shape every ad-blocking
+        // hosts list uses — would be bypassed over IPv6, and an internal name
+        // would leak.
         if qt == Rtype::A || qt == Rtype::AAAA {
             if let Some(res) = &self.resolver {
-                let ips = res.lookup_ip(&info.qname_lower, info.name_hash);
+                let ips = res.lookup_ip(qname_lower, info.name_hash);
                 if !ips.is_empty() {
-                    if let Some(out) = self.hosts_response(msg, info, client, &ips, udp_limit) {
-                        self.dlog("hosts", info, client, None, "NOERROR", None, None);
-                        return Some(out);
-                    }
+                    return Some(
+                        match self.hosts_response(msg, info, client, &ips, udp_limit) {
+                            Some(out) => {
+                                self.dlog("hosts", info, client, None, "NOERROR", None, None);
+                                out
+                            }
+                            None => {
+                                self.dlog("hosts", info, client, None, "NODATA", None, None);
+                                self.preport(
+                                    ROUTE_HOSTS,
+                                    RCODE_NODATA,
+                                    0,
+                                    "hosts",
+                                    &[],
+                                    &[],
+                                    info,
+                                    client,
+                                );
+                                self.build(
+                                    msg,
+                                    Rcode::NOERROR,
+                                    &Parts::empty(),
+                                    info.client_edns,
+                                    udp_limit,
+                                    None,
+                                    Some(info.qtype),
+                                )
+                            }
+                        },
+                    );
                 }
             }
         }
@@ -335,7 +437,7 @@ impl Handler {
         // Local PTR, then bogus-priv.
         if qt == Rtype::PTR {
             if let Some(res) = &self.resolver {
-                if let Some(host) = res.lookup(&info.qname_lower) {
+                if let Some(host) = res.lookup(qname_lower) {
                     if let Some(out) = self.ptr_response(msg, info, client, &host, udp_limit) {
                         self.dlog(
                             "local-ptr",
@@ -378,9 +480,9 @@ impl Handler {
 
     /// Build a NOERROR response with A/AAAA records (TTL 300) for a hosts hit,
     /// filtering by qtype. Returns None if no record matches the qtype.
-    fn hosts_response(
+    fn hosts_response<Octs: domain::dep::octseq::Octets + ?Sized>(
         &self,
-        msg: &Message<Vec<u8>>,
+        msg: &Message<Octs>,
         info: &QueryInfo,
         client: IpAddr,
         ips: &[std::net::IpAddr],
@@ -441,9 +543,9 @@ impl Handler {
     }
 
     /// Build a NOERROR PTR response (TTL 300) for a local reverse hit.
-    fn ptr_response(
+    fn ptr_response<Octs: domain::dep::octseq::Octets + ?Sized>(
         &self,
-        msg: &Message<Vec<u8>>,
+        msg: &Message<Octs>,
         info: &QueryInfo,
         client: IpAddr,
         hostname: &str,
@@ -487,7 +589,7 @@ impl Handler {
     /// force_fall matcher + hook-down forcing + the `paopao.dns` always-main
     /// special case. `fall_label` is the route label used when the query is
     /// answered from the fallback ("fall" / "force_fall" / "hook_fall").
-    fn resolve_route(&self, info: &QueryInfo, client: IpAddr) -> RouteDecision {
+    fn resolve_route(&self, qname_lower: &[u8], client: IpAddr) -> RouteDecision {
         let ff = self.force_fall.matches(client);
         let hook_down = self
             .hook_failed
@@ -496,21 +598,26 @@ impl Handler {
             .unwrap_or(false);
         let mut force = ff || hook_down;
         // paopao.dns always uses the primary DNS, overriding force_fall/hook.
-        if force && info.qname_lower.eq_ignore_ascii_case(PAOPAO_DNS_WIRE) {
+        if force && qname_lower.eq_ignore_ascii_case(PAOPAO_DNS_WIRE) {
             force = false;
             return RouteDecision {
                 force,
                 fall_label: "fall",
+                fallback_ttl1: true,
             };
         }
-        let fall_label = if !force {
-            "fall"
+        let (fall_label, fallback_ttl1) = if !force {
+            ("fall", true)
         } else if hook_down {
-            "hook_fall"
+            ("hook_fall", true)
         } else {
-            "force_fall"
+            ("force_fall", false)
         };
-        RouteDecision { force, fall_label }
+        RouteDecision {
+            force,
+            fall_label,
+            fallback_ttl1,
+        }
     }
 
     /// Emit a pplog telemetry entry (no-op unless pplog is enabled).
@@ -578,22 +685,28 @@ impl Handler {
         msg: &Message<Vec<u8>>,
         info: &QueryInfo,
         key: &CacheKey,
-        query: &[u8],
+        query: &mut [u8],
         client: IpAddr,
         udp_limit: Option<u16>,
     ) -> LocalResult {
-        let fr = self.main.exec(query).await;
-        let up = fr.upstream.clone();
-        let dur = Some(fr.duration);
-        let dms = dur_to_ms(fr.duration);
-        let Some(resp) = fr.response else {
+        // Destructured so the label moves out alongside `response`, which is
+        // consumed below.
+        let crate::upstream::ForwardResult {
+            response,
+            upstream: up,
+            duration,
+            ..
+        } = self.main.exec(query).await;
+        let dur = Some(duration);
+        let dms = dur_to_ms(duration);
+        let Some(resp) = response else {
             self.dlog("local", info, client, Some(&up), "timeout/error", dur, None);
             self.preport(ROUTE_LOCAL, RCODE_TIMEOUT, dms, &up, &[], &[], info, client);
             return LocalResult::none();
         };
         let mut parts = Parts::from_msg(&resp);
         if self.lite {
-            self.apply_lite(&mut parts, info);
+            self.apply_lite(&mut parts, info, &key.name);
         }
         let log_local = |label: &str| self.dlog("local", info, client, Some(&up), label, dur, None);
 
@@ -608,12 +721,16 @@ impl Handler {
                 None,
                 Some(info.qtype),
             );
-            let label = if parts.answers.is_empty() {
-                format!("{}(trusted)", rcode_label(parts.rcode, false))
-            } else {
-                rcode_label(parts.rcode, false)
-            };
-            log_local(&label);
+            // `dlog` guards on debug_enabled() itself, but the "(trusted)"
+            // suffix has to be formatted before the call, so hoist the check.
+            if log::debug_enabled() {
+                let base = rcode_label(parts.rcode, false);
+                if parts.answers.is_empty() {
+                    log_local(&format!("{base}(trusted)"));
+                } else {
+                    log_local(&base);
+                }
+            }
             // Report the true rcode; only a NOERROR with no answers is NODATA.
             // Using `answers.is_empty()` alone would mislabel a trusted empty
             // NXDOMAIN/REFUSED as NODATA (0xFF) to the pplog collector.
@@ -632,7 +749,7 @@ impl Handler {
                 info,
                 client,
             );
-            self.store(key, parts, None);
+            self.store(&self.cache, key, parts, None);
             return LocalResult {
                 handled: Some(out),
                 carry: None,
@@ -661,7 +778,7 @@ impl Handler {
                 info,
                 client,
             );
-            self.store(key, parts, None);
+            self.store(&self.cache, key, parts, None);
             return LocalResult {
                 handled: Some(out),
                 carry: None,
@@ -692,7 +809,7 @@ impl Handler {
                     info,
                     client,
                 );
-                self.store(key, parts, None);
+                self.store(&self.cache, key, parts, None);
                 return LocalResult {
                     handled: Some(out),
                     carry: None,
@@ -742,18 +859,44 @@ impl Handler {
         msg: &Message<Vec<u8>>,
         info: &QueryInfo,
         key: &CacheKey,
-        query: &[u8],
+        query: &mut [u8],
         route: &RouteDecision,
         client: IpAddr,
         local: LocalResult,
         udp_limit: Option<u16>,
     ) -> Vec<u8> {
-        let fr = self.fallback.exec(query).await;
-        let up = fr.upstream.clone();
-        let dur = Some(fr.duration);
-        let fall = fr.response.as_ref().map(Parts::from_msg);
+        // Try the fallback cache before the network. Its entries are faithful
+        // fallback-upstream answers, so this is what stops a main-DNS outage
+        // from turning every client retry into an upstream query — and it works
+        // whether or not a hook is configured (the hook is optional and off by
+        // default, so the hookless outage is the common case). The client still
+        // gets TTL=1 below and re-checks the main DNS a second later.
+        let cached_fall = self.fall_cache.get(key);
+        let from_cache = cached_fall.is_some();
+        let (fall, up, duration, had_error) = match cached_fall {
+            Some((c, _)) => (
+                Some(Parts::from_cached(&c)),
+                Arc::<str>::from(FALL_CACHE_LABEL),
+                Duration::ZERO,
+                false,
+            ),
+            None => {
+                let crate::upstream::ForwardResult {
+                    response,
+                    upstream,
+                    duration,
+                    had_error,
+                } = self.fallback.exec(query).await;
+                (
+                    response.as_ref().map(Parts::from_msg),
+                    upstream,
+                    duration,
+                    had_error,
+                )
+            }
+        };
+        let dur = Some(duration);
         let fall_is_nodata = fall.as_ref().map(Parts::is_nodata).unwrap_or(false);
-        let cache_writes = !route.force;
         let flabel = route.fall_label;
 
         // pplog reports the fallback query outcome (route byte from the label),
@@ -763,7 +906,7 @@ impl Handler {
             "force_fall" => ROUTE_FORCE_FALL,
             _ => ROUTE_FALL,
         };
-        let dms = dur_to_ms(fr.duration);
+        let dms = dur_to_ms(duration);
         match &fall {
             Some(fp) => {
                 let rc = if fp.is_nodata() {
@@ -800,27 +943,23 @@ impl Handler {
                 Some(info.qtype),
             );
             self.dlog(flabel, info, client, Some(&up), "NODATA", dur, None);
-            if cache_writes {
-                self.store(key, np, None);
-            }
+            // This answer came from the *main* DNS, so it belongs in the main
+            // cache — a forced route never reaches here (it carries nothing).
+            self.store(&self.cache, key, np, None);
             return out;
         }
 
         if let Some(mut fp) = fall {
-            if self.lite {
-                self.apply_lite(&mut fp, info);
+            // Cached entries were already lite-filtered on the way in.
+            if self.lite && !from_cache {
+                self.apply_lite(&mut fp, info, &key.name);
             }
             let label = rcode_label(fp.rcode, fp.answers.is_empty());
-            // Failover answers (main failed / hook-down) are short-lived (TTL=1)
-            // so recovery switches back fast. force_fall is policy routing, not
-            // failover: those clients always use the fallback, so their answers
-            // keep the upstream TTLs — forcing TTL=1 would only make them
-            // re-resolve every second, uncached.
-            let ttl_override = if flabel == "force_fall" {
-                None
-            } else {
-                Some(1)
-            };
+            // Failover answers (main failed / hook-down) reach the *client*
+            // with TTL=1 so recovery switches back fast. force_fall is policy
+            // routing, not failover: those clients always use the fallback, so
+            // they keep the upstream TTLs.
+            let ttl_override = if route.fallback_ttl1 { Some(1) } else { None };
             let out = self.build(
                 msg,
                 fp.rcode,
@@ -831,14 +970,23 @@ impl Handler {
                 Some(info.qtype),
             );
             self.dlog(flabel, info, client, Some(&up), &label, dur, None);
-            if cache_writes {
-                self.store(key, fp, ttl_override);
+            // The client got TTL=1, but the cache keeps the upstream's own TTL:
+            // that split is what lets the fallback cache actually absorb load
+            // during an outage while every client still re-checks the main DNS
+            // one second later. Always the fallback cache — the answer is a
+            // fallback-upstream answer whoever asked for it.
+            //
+            // Never write back something we just read: the stored records carry
+            // their *original* TTLs, so re-storing would reset the entry's
+            // expiry and a name queried every second would never expire.
+            if !from_cache {
+                self.store(&self.fall_cache, key, fp, None);
             }
             return out;
         }
 
         // Fallback failed entirely: surface the main-DNS response if we have one.
-        if fr.had_error {
+        if had_error {
             if let Some(lp) = carry.take() {
                 let out = self.build(
                     msg,
@@ -851,9 +999,8 @@ impl Handler {
                 );
                 let label = rcode_label(lp.rcode, lp.answers.is_empty());
                 self.dlog(flabel, info, client, Some(&up), &label, dur, None);
-                if cache_writes {
-                    self.store(key, lp, None);
-                }
+                // Main-DNS answer again (the fallback produced nothing).
+                self.store(&self.cache, key, lp, None);
                 return out;
             }
         }
@@ -873,7 +1020,7 @@ impl Handler {
     /// lite mode: keep only qtype records (following any CNAME chain and
     /// rewriting the final owner back to the query name), keep only SOA in the
     /// authority section, and drop the additional section.
-    fn apply_lite(&self, parts: &mut Parts, info: &QueryInfo) {
+    fn apply_lite(&self, parts: &mut Parts, info: &QueryInfo, qname_lower: &[u8]) {
         let qtype = info.qtype;
         if qtype == Rtype::CNAME {
             parts.answers.retain(|r| r.rtype() == Rtype::CNAME);
@@ -882,8 +1029,8 @@ impl Handler {
             return;
         }
 
-        let final_name = resolve_cname_chain(&parts.answers, &info.qname_lower);
-        let has_chain = final_name != info.qname_lower;
+        let final_name = resolve_cname_chain(&parts.answers, qname_lower);
+        let has_chain = final_name != qname_lower;
         if has_chain {
             let ok = parts
                 .answers
@@ -919,7 +1066,9 @@ impl Handler {
         parts.additional.clear();
     }
 
-    fn store(&self, key: &CacheKey, parts: Parts, ttl_override: Option<u32>) {
+    /// Store `parts` in the cache that matches the upstream it came from —
+    /// `self.cache` for main-DNS answers, `self.fall_cache` for fallback ones.
+    fn store(&self, cache: &Cache, key: &CacheKey, parts: Parts, ttl_override: Option<u32>) {
         let ttl = ttl_override.unwrap_or_else(|| parts.min_ttl());
         let cached = Arc::new(CachedMsg {
             rcode: parts.rcode,
@@ -927,12 +1076,12 @@ impl Handler {
             authority: parts.authority,
             additional: parts.additional,
         });
-        self.cache.store(key.clone(), cached, ttl);
+        cache.store(key.clone(), cached, ttl);
     }
 
-    fn build_cached(
+    fn build_cached<Octs: domain::dep::octseq::Octets + ?Sized>(
         &self,
-        msg: &Message<Vec<u8>>,
+        msg: &Message<Octs>,
         info: &QueryInfo,
         cached: &CachedMsg,
         ttl_left: u32,
@@ -951,9 +1100,9 @@ impl Handler {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build(
+    fn build<Octs: domain::dep::octseq::Octets + ?Sized>(
         &self,
-        msg: &Message<Vec<u8>>,
+        msg: &Message<Octs>,
         rcode: Rcode,
         parts: &Parts,
         edns: Option<ClientEdns>,
@@ -1058,6 +1207,7 @@ mod tests {
             main: fwd(main, 300),
             fallback: fwd(fall, 800),
             cache: Arc::new(Cache::new(1024)),
+            fall_cache: Arc::new(Cache::new(1024)),
             force_fall: ForceFallMatcher::default(),
             aaaa_mode: AaaaMode::No,
             lite: true,
@@ -1296,7 +1446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn force_fall_uses_fallback_and_skips_cache() {
+    async fn force_fall_uses_the_fallback_cache_not_the_main_one() {
         let main = spawn_mock(|q| answer(q, Rcode::NOERROR, &[([1, 1, 1, 1], 60)])).await;
         let fall = spawn_mock(|q| answer(q, Rcode::NOERROR, &[([2, 2, 2, 2], 60)])).await;
         let mut h = mk(vec![main], vec![fall]);
@@ -1306,8 +1456,13 @@ mod tests {
         let out = ask(&h, "example.com.", Rtype::A, "127.0.0.1").await;
         // Policy-routed clients keep the upstream TTL (only failover gets 1).
         assert_eq!(first_ttl(&out), Some(60));
-        // force_fall clients never touch the shared cache.
+        // The main cache stays clean: a fallback answer must never be visible
+        // to main-preferring clients.
         assert!(h.cache.is_empty());
+        // …but the answer is cached, in the fallback cache, with the upstream's
+        // own TTL, so repeat queries from policy-routed clients are served
+        // locally instead of hitting the fallback upstream every time.
+        assert_eq!(h.fall_cache.len(), 1);
     }
 
     #[tokio::test]
@@ -1396,7 +1551,7 @@ mod tests {
         assert_eq!(end, b"\x01a\x07example\x00".to_vec());
     }
 
-    fn info_for(name: &str, qtype: Rtype) -> QueryInfo {
+    fn info_for(name: &str, qtype: Rtype) -> (QueryInfo, Vec<u8>) {
         let req = Message::from_octets(client_query(name, qtype)).unwrap();
         dns::extract_query(&req).unwrap()
     }
@@ -1413,7 +1568,8 @@ mod tests {
             authority: vec![],
             additional: vec![],
         };
-        h.apply_lite(&mut parts, &info_for("www.example.com.", Rtype::A));
+        let (info, lower) = info_for("www.example.com.", Rtype::A);
+        h.apply_lite(&mut parts, &info, &lower);
         assert_eq!(parts.answers.len(), 1);
         let r = &parts.answers[0];
         assert_eq!(r.rtype(), Rtype::A);
@@ -1431,7 +1587,8 @@ mod tests {
             authority: vec![],
             additional: vec![],
         };
-        h.apply_lite(&mut parts, &info_for("www.example.com.", Rtype::A));
+        let (info, lower) = info_for("www.example.com.", Rtype::A);
+        h.apply_lite(&mut parts, &info, &lower);
         assert_eq!(parts.answers.len(), 1);
         assert_eq!(parts.answers[0].rtype(), Rtype::CNAME);
     }
@@ -1441,11 +1598,318 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(true));
         let mut h = mk(dead(), dead());
         h.hook_failed = Some(flag);
-        let route = h.resolve_route(
-            &info_for("example.com.", Rtype::A),
-            "127.0.0.1".parse().unwrap(),
-        );
+        let (_info, lower) = info_for("example.com.", Rtype::A);
+        let route = h.resolve_route(&lower, "127.0.0.1".parse().unwrap());
         assert!(route.force);
         assert_eq!(route.fall_label, "hook_fall");
+    }
+
+    // ---- local authority for hosts-defined names ----
+
+    /// A name defined in `[hosts]`/hosts_file is authoritative for both A and
+    /// AAAA. An IPv4-only entry — what every ad-blocking list looks like — must
+    /// answer AAAA locally, or the block leaks over IPv6.
+    #[tokio::test]
+    async fn hosts_entry_is_authoritative_for_aaaa() {
+        let mut statics: HashMap<String, Vec<IpAddr>> = HashMap::new();
+        statics.insert(
+            "ads.example.com.".to_string(),
+            vec!["0.0.0.0".parse().unwrap()],
+        );
+        let hit = Arc::new(AtomicBool::new(false));
+        let flag = hit.clone();
+        // The mock would happily answer; reaching it at all is the failure.
+        let main = spawn_mock(move |q| {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            answer(q, Rcode::NOERROR, &[([1, 2, 3, 4], 60)])
+        })
+        .await;
+        let mut h = mk(vec![main], dead());
+        h.aaaa_mode = AaaaMode::Yes;
+        h.resolver = PtrResolver::new(vec![], vec![], false, &statics).map(Arc::new);
+
+        let a = ask(&h, "ads.example.com.", Rtype::A, "127.0.0.1").await;
+        assert_eq!(answer_count(&a), 1, "A comes from hosts");
+        assert_eq!(first_ttl(&a), Some(300));
+
+        let aaaa = ask(&h, "ads.example.com.", Rtype::AAAA, "127.0.0.1").await;
+        assert_eq!(parse_resp(&aaaa).header().rcode(), Rcode::NOERROR);
+        assert_eq!(answer_count(&aaaa), 0, "AAAA is a local NODATA");
+        assert!(
+            !hit.load(std::sync::atomic::Ordering::Relaxed),
+            "a hosts-defined name must never reach the upstream"
+        );
+
+        // Matching is case-insensitive (the key owns the lower-cased name).
+        let mixed = ask(&h, "ADS.Example.COM.", Rtype::AAAA, "127.0.0.1").await;
+        assert_eq!(answer_count(&mixed), 0);
+        assert!(
+            !hit.load(std::sync::atomic::Ordering::Relaxed),
+            "case must not change local-authority matching"
+        );
+
+        // The local NODATA is not cached: hosts answers are always live.
+        assert!(h.cache.is_empty());
+    }
+
+    /// The authority is scoped to names the resolver actually knows: anything
+    /// else must still be forwarded.
+    #[tokio::test]
+    async fn name_absent_from_hosts_still_forwards() {
+        let mut statics: HashMap<String, Vec<IpAddr>> = HashMap::new();
+        statics.insert(
+            "ads.example.com.".to_string(),
+            vec!["0.0.0.0".parse().unwrap()],
+        );
+        let main = spawn_mock(|q| answer(q, Rcode::NOERROR, &[([1, 2, 3, 4], 60)])).await;
+        let mut h = mk(vec![main], dead());
+        h.aaaa_mode = AaaaMode::Yes;
+        h.resolver = PtrResolver::new(vec![], vec![], false, &statics).map(Arc::new);
+
+        let out = ask(&h, "other.example.com.", Rtype::A, "127.0.0.1").await;
+        assert_eq!(answer_count(&out), 1);
+        assert_eq!(first_ttl(&out), Some(60), "answer came from the upstream");
+    }
+
+    /// The CNAME-chain walk in `apply_lite` matches lower-cased wire names, so
+    /// it must be handed the lower-cased query name (which now lives in the
+    /// cache key). A mixed-case query is the case that catches getting this
+    /// wrong: the chain would silently fail to resolve and the final record
+    /// would keep the chain-end owner instead of the queried name.
+    #[tokio::test]
+    async fn lite_collapses_cname_chain_for_mixed_case_query() {
+        let main = spawn_mock(|q| {
+            let name = q.sole_question().unwrap().qname().to_vec();
+            let target = Name::<Vec<u8>>::from_str("edge.example.org.").unwrap();
+            let mut b = MessageBuilder::new_vec()
+                .start_answer(q, Rcode::NOERROR)
+                .unwrap();
+            b.push((
+                &name,
+                Class::IN,
+                Ttl::from_secs(60),
+                Cname::new(target.clone()),
+            ))
+            .unwrap();
+            b.push((
+                &target,
+                Class::IN,
+                Ttl::from_secs(60),
+                A::from_octets(5, 6, 7, 8),
+            ))
+            .unwrap();
+            b.finish()
+        })
+        .await;
+        let h = mk(vec![main], dead()); // mk() enables lite
+        let out = ask(&h, "WWW.Example.COM.", Rtype::A, "127.0.0.1").await;
+        assert_eq!(answer_count(&out), 1, "lite keeps only the qtype record");
+        let msg = parse_resp(&out);
+        let rec = msg
+            .answer()
+            .unwrap()
+            .limit_to::<AllRecordData<_, _>>()
+            .next()
+            .unwrap()
+            .unwrap();
+        let owner = rec.owner().to_string().to_ascii_lowercase();
+        assert_eq!(
+            owner.trim_end_matches('.'),
+            "www.example.com",
+            "chain end must be rewritten back to the queried name"
+        );
+    }
+
+    // ---- fallback cache / failover behaviour ----
+
+    fn answer_ip(bytes: &[u8]) -> [u8; 4] {
+        let msg = parse_resp(bytes);
+        let rec = msg
+            .answer()
+            .unwrap()
+            .limit_to::<AllRecordData<_, _>>()
+            .next()
+            .expect("an answer")
+            .expect("a parsable answer");
+        match rec.data() {
+            AllRecordData::A(a) => a.addr().octets(),
+            _ => panic!("expected an A record"),
+        }
+    }
+
+    /// While the hook says the main DNS is down, repeat queries are served from
+    /// the fallback cache instead of hammering the fallback upstream — but the
+    /// client still sees TTL=1 so it re-asks and lands back on the main DNS as
+    /// soon as the hook clears.
+    #[tokio::test]
+    async fn hook_down_serves_repeat_queries_from_the_fallback_cache() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = hits.clone();
+        let fall = spawn_mock(move |q| {
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            answer(q, Rcode::NOERROR, &[([2, 2, 2, 2], 60)])
+        })
+        .await;
+        let mut h = mk(dead(), vec![fall]);
+        h.hook_failed = Some(Arc::new(AtomicBool::new(true)));
+
+        let a = ask(&h, "example.com.", Rtype::A, "127.0.0.1").await;
+        let b = ask(&h, "example.com.", Rtype::A, "127.0.0.1").await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the second query must come from the fallback cache"
+        );
+        assert_eq!(first_ttl(&a), Some(1), "failover answers stay TTL=1");
+        assert_eq!(first_ttl(&b), Some(1), "including the cached one");
+        assert!(h.cache.is_empty(), "main cache untouched during an outage");
+
+        // The entry itself keeps the upstream's TTL — that split is the point.
+        let key = CacheKey::new(
+            b"\x07example\x03com\x00".to_vec(),
+            Rtype::A.to_int(),
+            Class::IN.to_int(),
+        );
+        let (_, ttl_left) = h
+            .fall_cache
+            .get(&key)
+            .expect("stored in the fallback cache");
+        assert!(
+            ttl_left > 1,
+            "cache holds the upstream TTL ({ttl_left}), not the client's 1"
+        );
+    }
+
+    /// The two caches are partitioned by which upstream produced the answer, so
+    /// a policy-routed client and a main-preferring client asking the same name
+    /// must keep getting their own upstream's answer.
+    #[tokio::test]
+    async fn main_and_fallback_caches_do_not_cross_contaminate() {
+        let main = spawn_mock(|q| answer(q, Rcode::NOERROR, &[([1, 1, 1, 1], 60)])).await;
+        let fall = spawn_mock(|q| answer(q, Rcode::NOERROR, &[([2, 2, 2, 2], 60)])).await;
+        let mut h = mk(vec![main], vec![fall]);
+        h.force_fall
+            .include
+            .push(parse_prefix("127.0.0.2/32").unwrap());
+
+        // Policy-routed client primes the fallback cache…
+        assert_eq!(
+            answer_ip(&ask(&h, "example.com.", Rtype::A, "127.0.0.2").await),
+            [2, 2, 2, 2]
+        );
+        // …a main-preferring client still gets the main DNS's answer…
+        assert_eq!(
+            answer_ip(&ask(&h, "example.com.", Rtype::A, "127.0.0.1").await),
+            [1, 1, 1, 1]
+        );
+        // …and the main answer never leaks back to the policy-routed client.
+        assert_eq!(
+            answer_ip(&ask(&h, "example.com.", Rtype::A, "127.0.0.2").await),
+            [2, 2, 2, 2]
+        );
+        assert_eq!(h.cache.len(), 1);
+        assert_eq!(h.fall_cache.len(), 1);
+    }
+
+    /// Every upstream hop draws its own transaction ID (RFC 5452 §9). Sampled
+    /// over several queries so a chance 1-in-65536 collision cannot fail the
+    /// run, while a shared ID — which makes *every* pair identical — does.
+    #[tokio::test]
+    async fn each_upstream_hop_draws_its_own_transaction_id() {
+        let ids: Arc<std::sync::Mutex<Vec<(bool, u16)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let i1 = ids.clone();
+        let main = spawn_mock(move |q| {
+            i1.lock().unwrap().push((true, q.header().id()));
+            answer(q, Rcode::SERVFAIL, &[])
+        })
+        .await;
+        let i2 = ids.clone();
+        let fall = spawn_mock(move |q| {
+            i2.lock().unwrap().push((false, q.header().id()));
+            answer(q, Rcode::NOERROR, &[([2, 2, 2, 2], 60)])
+        })
+        .await;
+        let h = mk(vec![main], vec![fall]);
+
+        const ROUNDS: usize = 5;
+        for i in 0..ROUNDS {
+            let name = format!("q{i}.example.com.");
+            let _ = ask(&h, &name, Rtype::A, "127.0.0.1").await;
+        }
+        let seen = ids.lock().unwrap().clone();
+        assert_eq!(seen.len(), ROUNDS * 2, "both hops ran every round");
+        let main_ids: Vec<u16> = seen.iter().filter(|(m, _)| *m).map(|(_, id)| *id).collect();
+        let fall_ids: Vec<u16> = seen
+            .iter()
+            .filter(|(m, _)| !*m)
+            .map(|(_, id)| *id)
+            .collect();
+        let shared = main_ids
+            .iter()
+            .zip(&fall_ids)
+            .filter(|(a, b)| a == b)
+            .count();
+        assert!(
+            shared <= 1,
+            "hops reused the same id in {shared}/{ROUNDS} rounds: {main_ids:?} vs {fall_ids:?}"
+        );
+    }
+
+    /// With no hook configured — the default — a dead main DNS must not turn
+    /// every client retry into a fallback-upstream query. The fallback stage
+    /// reads the fallback cache first.
+    #[tokio::test]
+    async fn fallback_stage_reads_the_fallback_cache() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = hits.clone();
+        let fall = spawn_mock(move |q| {
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            answer(q, Rcode::NOERROR, &[([2, 2, 2, 2], 60)])
+        })
+        .await;
+        let h = mk(dead(), vec![fall]); // main unreachable, no hook
+        for i in 0..3 {
+            let out = ask(&h, "example.com.", Rtype::A, "127.0.0.1").await;
+            assert_eq!(answer_count(&out), 1, "round {i}");
+            assert_eq!(first_ttl(&out), Some(1), "failover answers stay TTL=1");
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the fallback upstream must be asked once, not once per retry"
+        );
+    }
+
+    /// An answer served *from* the fallback cache must not be written back:
+    /// the stored records carry their original TTLs, so re-storing would reset
+    /// the entry's expiry and a name queried every second would never age out.
+    #[tokio::test]
+    async fn serving_from_the_fallback_cache_does_not_extend_the_entry() {
+        let h = mk(dead(), dead()); // both dead: only a cache hit can answer
+        let key = CacheKey::new(
+            b"\x07example\x03com\x00".to_vec(),
+            Rtype::A.to_int(),
+            Class::IN.to_int(),
+        );
+        // Records carry a long TTL, but this entry only has 2s of life left.
+        h.fall_cache.store(
+            key.clone(),
+            Arc::new(CachedMsg {
+                rcode: Rcode::NOERROR,
+                answers: vec![a_rec("example.com.", [2, 2, 2, 2], 300)],
+                authority: vec![],
+                additional: vec![],
+            }),
+            2,
+        );
+        let out = ask(&h, "example.com.", Rtype::A, "127.0.0.1").await;
+        assert_eq!(answer_count(&out), 1, "served from the fallback cache");
+        assert_eq!(first_ttl(&out), Some(1), "failover answers stay TTL=1");
+        let (_, ttl_left) = h.fall_cache.get(&key).expect("entry survives");
+        assert!(
+            ttl_left <= 2,
+            "expiry must not be pushed out by a cache-served answer (ttl_left={ttl_left})"
+        );
     }
 }

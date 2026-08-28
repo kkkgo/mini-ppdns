@@ -52,13 +52,12 @@ pub async fn serve_udp(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let req = buf[..n].to_vec();
                 let client = unmap_ip(peer.ip());
                 // Synchronous, bounded (~µs) fast path: parse + static rewrite +
                 // cache lookup. Running it inline avoids the per-task spawn and
                 // wakeup cost, and keeps cache hits served even while the permit
                 // pool is drained by a stalled upstream.
-                match handler.process_fast(req, client, true) {
+                match handler.process_fast(&buf[..n], client, true) {
                     FastOutcome::Done(Some(resp)) => {
                         // try_send_to never blocks intake; a full socket send
                         // buffer (rare for UDP) drops the reply — client retries.

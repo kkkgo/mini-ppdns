@@ -58,6 +58,14 @@ impl HookMonitor {
                 if fail_count >= self.cfg.count && !was_down {
                     self.failed.store(true, Ordering::Relaxed);
                     was_down = true;
+                    // Only the main cache: its entries came from the DNS we
+                    // just declared dead, and everyone is about to read the
+                    // fallback cache instead. The fallback cache is deliberately
+                    // kept — its entries are faithful fallback-upstream answers,
+                    // which is exactly what the outage needs, and dropping them
+                    // would also punish force_fall clients that are unaffected.
+                    // Nothing needs clearing on recovery either: clients go back
+                    // to reading this (now empty) cache and re-query the main DNS.
                     self.cache.flush();
                     eprintln!(
                         "[hook] main DNS marked DOWN ({fail_count} failures), switching to fallback; cache flushed"

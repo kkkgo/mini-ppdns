@@ -18,7 +18,7 @@ use crate::hook::HookMonitor;
 use crate::local_resolver::PtrResolver;
 use crate::log;
 use crate::server::{serve_tcp, serve_udp};
-use crate::sysinfo::{calculate_cache_size, get_available_memory};
+use crate::sysinfo::{calculate_cache_size, calculate_fallback_cache_size, get_available_memory};
 use crate::upstream::{Forwarder, Upstream};
 
 // Concurrency caps are per-protocol so a TCP connection flood cannot starve
@@ -155,12 +155,18 @@ async fn serve(
     }
 
     let qtime = Duration::from_millis(cfg.qtime as u64);
-    let main_fwd = Forwarder::new(main, qtime);
+    // Only the main forwarder gets the fail-fast breaker (see `Breaker`).
+    let main_fwd = Forwarder::with_breaker(main, qtime);
     let fall_fwd = Forwarder::new(fall, qtime * 10);
 
     let avail = get_available_memory();
     let cache_cap = calculate_cache_size(avail);
     let cache = Arc::new(Cache::new(cache_cap));
+    // Answers from the fallback upstream live in their own cache (see the
+    // `Handler` fields): partitioning by source upstream is what lets
+    // force_fall clients and a hook-down outage share entries safely.
+    let fall_cache_cap = calculate_fallback_cache_size(cache_cap);
+    let fall_cache = Arc::new(Cache::new(fall_cache_cap));
 
     // Startup banner (timestamped, highlighted).
     log::info(&format!("mini-ppdns {}", crate::VERSION));
@@ -173,8 +179,9 @@ async fn serve(
         "upstreams dns={dns_upstreams:?} fall={fall_upstreams:?}"
     ));
     log::info(&format!(
-        "cache capacity {} entries",
-        log::hl_value(cache_cap)
+        "cache capacity {} entries (fallback {} entries)",
+        log::hl_value(cache_cap),
+        log::hl_value(fall_cache_cap)
     ));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -270,6 +277,7 @@ async fn serve(
         main: main_fwd,
         fallback: fall_fwd,
         cache: cache.clone(),
+        fall_cache,
         force_fall: matcher,
         aaaa_mode: AaaaMode::parse(&cfg.aaaa),
         lite: cfg.lite == "yes",

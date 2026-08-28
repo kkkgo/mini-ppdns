@@ -236,7 +236,7 @@ impl NameFilter {
         }
     }
 
-    /// The two bit positions for a name hash (`util::fnv1a` of the wire
+    /// The two bit positions for a name hash (`util::hash` of the wire
     /// name): low and high halves of the one hash.
     fn bits_of(h: u64) -> [usize; 2] {
         [
@@ -246,7 +246,7 @@ impl NameFilter {
     }
 
     fn insert(&self, name: &[u8]) {
-        for i in Self::bits_of(crate::util::fnv1a(name)) {
+        for i in Self::bits_of(crate::util::hash(name)) {
             self.words[i / WORD_BITS].fetch_or(1 << (i % WORD_BITS), Ordering::Relaxed);
         }
     }
@@ -265,8 +265,9 @@ impl NameFilter {
 /// stall intake.
 pub struct PtrResolver {
     lease_files: Vec<String>,
-    hosts_files: Vec<String>,      // explicit, watched for hot-reload
-    auto_hosts_files: Vec<String>, // auto-detected, loaded once (not watched)
+    hosts_files: Vec<String>,      // explicit
+    auto_hosts_files: Vec<String>, // auto-detected (e.g. /etc/hosts)
+
     static_ptr: HashMap<Vec<u8>, String>,
     static_fwd: HashMap<Vec<u8>, Vec<IpAddr>>,
     maps: RwLock<Maps>,
@@ -357,7 +358,7 @@ impl PtrResolver {
     /// Forward lookup: A/AAAA query wire name (lower-cased) → IPs. Runs on
     /// every A/AAAA query, so the (overwhelmingly common) absent name is
     /// rejected by the lock-free filter before paying for the RwLock +
-    /// HashMap probe. `name_hash` is the caller's per-query `util::fnv1a` of
+    /// HashMap probe. `name_hash` is the caller's per-query `util::hash` of
     /// `qname_lower` (`QueryInfo::name_hash`), so the name isn't re-hashed.
     pub fn lookup_ip(&self, qname_lower: &[u8], name_hash: u64) -> Vec<IpAddr> {
         if !self.fwd_filter.may_contain_hash(name_hash) {
@@ -380,12 +381,18 @@ impl PtrResolver {
         }
     }
 
-    fn files_changed(&self) -> bool {
-        let watched: Vec<&String> = self
-            .lease_files
+    /// Every file the resolver reads is watched, auto-detected ones included —
+    /// `/etc/hosts` is documented as hot-reloading, and a file that is read but
+    /// not watched only refreshes when some *other* watched file changes.
+    fn watched_files(&self) -> impl Iterator<Item = &String> {
+        self.lease_files
             .iter()
             .chain(self.hosts_files.iter())
-            .collect();
+            .chain(self.auto_hosts_files.iter())
+    }
+
+    fn files_changed(&self) -> bool {
+        let watched: Vec<&String> = self.watched_files().collect();
         // Stat outside the lock so disk I/O never blocks readers.
         let cur: Vec<(&String, Option<SystemTime>)> = watched
             .iter()
@@ -415,7 +422,7 @@ impl PtrResolver {
             load_hosts(f, &mut ptr, &mut fwd, Some(&mut mod_times));
         }
         for f in &self.auto_hosts_files {
-            load_hosts(f, &mut ptr, &mut fwd, None);
+            load_hosts(f, &mut ptr, &mut fwd, Some(&mut mod_times));
         }
         // Static [hosts] entries always overlay file entries.
         for (k, v) in &self.static_ptr {
@@ -429,10 +436,22 @@ impl PtrResolver {
         for k in fwd.keys() {
             self.fwd_filter.insert(k);
         }
-        let mut m = self.maps.write().unwrap();
-        m.ptr = ptr;
-        m.fwd = fwd;
-        m.mod_times = mod_times;
+        // Swap under the lock, drop the replaced maps *outside* it: dropping
+        // them frees every key and value, and lookups take this same lock from
+        // inside the UDP receive loops, where a large table's deallocation
+        // would stall intake.
+        let old = {
+            let mut m = self.maps.write().unwrap();
+            std::mem::replace(
+                &mut *m,
+                Maps {
+                    ptr,
+                    fwd,
+                    mod_times,
+                },
+            )
+        };
+        drop(old);
     }
 }
 
@@ -444,6 +463,14 @@ fn load_lease(
     let Ok(meta) = std::fs::metadata(path) else {
         return;
     };
+    // The mtime is recorded the moment the path is statable, *before* the read
+    // is attempted. Every statable path must get an entry in `mod_times`, or
+    // `files_changed` scores it as newly appeared on every poll and reloads
+    // every watched file on every tick — which is what a path that stats but
+    // cannot be read (a directory, a permission or I/O error) would do. The
+    // trade is that a transient read failure is retried when the file's mtime
+    // next changes, not on the next tick.
+    record_mtime(&meta, path, Some(mod_times));
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
@@ -466,9 +493,6 @@ fn load_lease(
             ptr.insert(k, hostname.to_string());
         }
     }
-    if let Ok(mt) = meta.modified() {
-        mod_times.insert(path.to_string(), mt);
-    }
 }
 
 fn load_hosts(
@@ -480,6 +504,8 @@ fn load_hosts(
     let Ok(meta) = std::fs::metadata(path) else {
         return;
     };
+    // See `load_lease`: the mtime is recorded on stat, not on a successful read.
+    record_mtime(&meta, path, mod_times);
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
@@ -509,10 +535,17 @@ fn load_hosts(
             }
         }
     }
-    if let Some(mt) = mod_times {
-        if let Ok(t) = meta.modified() {
-            mt.insert(path.to_string(), t);
-        }
+}
+
+/// Note `path`'s modification time in the watch table, if it has one and the
+/// caller is tracking this file (auto-detected files are not watched).
+fn record_mtime(
+    meta: &std::fs::Metadata,
+    path: &str,
+    mod_times: Option<&mut HashMap<String, SystemTime>>,
+) {
+    if let (Some(table), Ok(mt)) = (mod_times, meta.modified()) {
+        table.insert(path.to_string(), mt);
     }
 }
 
@@ -610,7 +643,7 @@ mod tests {
     #[test]
     fn name_filter_rejects_absent_accepts_inserted() {
         let f = NameFilter::new();
-        let h = |name: &str| crate::util::fnv1a(&name_to_wire(name, true).unwrap());
+        let h = |name: &str| crate::util::hash(&name_to_wire(name, true).unwrap());
         assert!(
             !f.may_contain_hash(h("myhost.lan")),
             "empty filter rejects everything"
@@ -647,7 +680,7 @@ mod tests {
 
         let fwd = |name: &str| {
             let wire = name_to_wire(name, true).unwrap();
-            r.lookup_ip(&wire, crate::util::fnv1a(&wire))
+            r.lookup_ip(&wire, crate::util::hash(&wire))
         };
         let rev = |ipstr: &str| r.lookup(&name_to_wire(&ip_to_ptr_name_str(ipstr), true).unwrap());
 
@@ -668,5 +701,93 @@ mod tests {
 
         let _ = std::fs::remove_file(&lease);
         let _ = std::fs::remove_file(&hosts);
+    }
+
+    /// A watched path that can be stat'ed but never read (a directory here, in
+    /// practice also a permission or I/O error) must not be scored as "changed"
+    /// on every poll — that would re-parse every watched file on every tick,
+    /// forever. Change detection for the readable files must still work.
+    #[test]
+    fn unreadable_watched_file_does_not_force_endless_reloads() {
+        let dir = std::env::temp_dir();
+        let uniq = format!(
+            "mppdns-unread-{}-{:p}",
+            std::process::id(),
+            &dir as *const _
+        );
+        let good = dir.join(format!("{uniq}.hosts"));
+        let bad = dir.join(format!("{uniq}.baddir")); // statable, never readable
+        std::fs::write(&good, "10.0.0.5 myhost.lan\n").unwrap();
+        std::fs::create_dir_all(&bad).unwrap();
+
+        let r = PtrResolver::new(
+            vec![],
+            vec![
+                good.to_string_lossy().into_owned(),
+                bad.to_string_lossy().into_owned(),
+            ],
+            false,
+            &HashMap::new(),
+        )
+        .expect("resolver present");
+        let fwd = |name: &str| {
+            let wire = name_to_wire(name, true).unwrap();
+            r.lookup_ip(&wire, crate::util::hash(&wire))
+        };
+        assert_eq!(
+            fwd("myhost.lan"),
+            vec![ip("10.0.0.5")],
+            "the readable sibling is still loaded"
+        );
+
+        for i in 0..5 {
+            assert!(
+                !r.files_changed(),
+                "quiet poll {i} reported a spurious change"
+            );
+        }
+
+        // A genuine change to the readable file is still detected. The mtime is
+        // set explicitly so the test does not depend on filesystem timestamp
+        // granularity.
+        std::fs::write(&good, "10.0.0.6 newhost.lan\n").unwrap();
+        let f = std::fs::File::options().write(true).open(&good).unwrap();
+        f.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(SystemTime::now() + std::time::Duration::from_secs(120)),
+        )
+        .unwrap();
+        drop(f);
+
+        assert!(r.files_changed(), "a real mtime change must still be seen");
+        r.check_reload();
+        assert_eq!(fwd("newhost.lan"), vec![ip("10.0.0.6")]);
+        assert!(fwd("myhost.lan").is_empty(), "old entry dropped");
+        assert!(!r.files_changed(), "settles again after the reload");
+
+        let _ = std::fs::remove_file(&good);
+        let _ = std::fs::remove_dir(&bad);
+    }
+
+    /// The auto-detected hosts file must be watched like an explicit one. A
+    /// file that is read on every reload but never *triggers* one only refreshes
+    /// when some other watched file changes — and never at all when it is the
+    /// only file, which is the default setup.
+    #[test]
+    fn auto_detected_hosts_file_is_watched() {
+        if !std::path::Path::new("/etc/hosts").exists() {
+            return; // nothing auto-detectable here
+        }
+        let r = PtrResolver::new(vec![], vec![], true, &HashMap::new())
+            .expect("auto-detection finds /etc/hosts");
+        assert!(
+            r.watched_files().any(|f| f == "/etc/hosts"),
+            "auto-detected hosts file must be in the watch set"
+        );
+        assert!(
+            r.maps.read().unwrap().mod_times.contains_key("/etc/hosts"),
+            "and must have an mtime recorded, or every poll reports a change"
+        );
+        assert!(!r.files_changed(), "so a quiet poll settles");
     }
 }

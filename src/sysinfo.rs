@@ -9,6 +9,7 @@ use crate::util::{join_host_port, v6_is_link_local, v6_is_private_special};
 const ESTIMATED_ENTRY_SIZE: u64 = 2048; // bytes per cache entry (rough)
 const MAX_CACHE_SIZE: usize = 102400; // absolute upper limit
 const MIN_CACHE_SIZE: usize = 1024; // minimum entries
+const MIN_FALLBACK_CACHE_SIZE: usize = 256; // minimum entries, fallback cache
 
 /// Read `/proc/meminfo` and return available memory in bytes. Returns 0 when
 /// the file cannot be read (non-Linux) — callers treat 0 as "unknown".
@@ -48,6 +49,16 @@ pub fn calculate_cache_size(available_bytes: u64) -> usize {
     }
     let mem_based = (available_bytes / 5 / ESTIMATED_ENTRY_SIZE) as usize;
     mem_based.clamp(MIN_CACHE_SIZE, MAX_CACHE_SIZE)
+}
+
+/// Capacity for the fallback-answer cache, derived from the main one.
+///
+/// It only holds answers produced by the fallback upstream: hot for force_fall
+/// clients and while the main DNS is down, near-empty in a healthy default
+/// deployment. A quarter of the main budget caps the worst-case cache footprint
+/// at a quarter more, which matters on the 64/128 MB routers this targets.
+pub fn calculate_fallback_cache_size(main_cap: usize) -> usize {
+    (main_cap / 4).max(MIN_FALLBACK_CACHE_SIZE)
 }
 
 /// Auto-detected private/loopback/link-local listen addresses on :53.
@@ -161,6 +172,16 @@ mod tests {
         assert_eq!(
             calculate_cache_size(hundred_mib),
             want.clamp(MIN_CACHE_SIZE, MAX_CACHE_SIZE)
+        );
+    }
+
+    #[test]
+    fn fallback_cache_size_is_a_quarter_with_a_floor() {
+        assert_eq!(calculate_fallback_cache_size(102400), 25600);
+        // Never below the floor, even off the smallest main cache.
+        assert_eq!(
+            calculate_fallback_cache_size(MIN_CACHE_SIZE),
+            MIN_FALLBACK_CACHE_SIZE
         );
     }
 
