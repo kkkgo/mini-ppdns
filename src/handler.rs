@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use domain::base::iana::{Class, Opcode, Rcode, Rtype};
+use domain::base::CharStr;
 use domain::base::{Message, Ttl};
-use domain::rdata::{Aaaa, AllRecordData, Ptr, A};
+use domain::rdata::{Aaaa, AllRecordData, Hinfo, Ptr, A};
 
 use crate::cache::{Cache, CacheKey, CachedMsg};
 use crate::dns::{self, ClientEdns, OwnedName, OwnedRecord, QueryInfo, ResponseData};
@@ -169,6 +170,10 @@ fn rcode_label(rcode: Rcode, empty_answer: bool) -> Cow<'static, str> {
 }
 
 const PAOPAO_DNS_WIRE: &[u8] = b"\x06paopao\x03dns\x00";
+
+/// TTL on the synthesised ANY answer. Long enough that a client which insists
+/// on asking gets the same cheap answer from its own cache.
+const ANY_HINFO_TTL: u32 = 3600;
 
 /// Parsed state carried from the synchronous fast path to the upstream (slow)
 /// path, so nothing is parsed twice. Opaque outside this module.
@@ -358,6 +363,38 @@ impl Handler {
         udp_limit: Option<u16>,
     ) -> Option<Vec<u8>> {
         let qt = info.qtype;
+
+        // RFC 8482: a conventional ANY response — every RRset a name has — is
+        // deprecated, and a forwarder is the wrong place to assemble one. Answer
+        // with the synthesised HINFO the RFC defines instead of asking upstream.
+        if qt == Rtype::ANY {
+            self.dlog("any", info, client, None, "RFC8482", None, None);
+            self.preport(ROUTE_HOSTS, 0, 0, "rfc8482", &[], &[], info, client);
+            let parts = Parts {
+                rcode: Rcode::NOERROR,
+                answers: vec![OwnedRecord::new(
+                    info.qname.clone(),
+                    info.qclass,
+                    Ttl::from_secs(ANY_HINFO_TTL),
+                    AllRecordData::Hinfo(Hinfo::new(
+                        CharStr::from_octets(b"RFC8482".to_vec()).expect("7 bytes"),
+                        CharStr::from_octets(Vec::new()).expect("empty"),
+                    )),
+                )],
+                authority: Vec::new(),
+                additional: Vec::new(),
+            };
+            return Some(self.build(
+                msg,
+                Rcode::NOERROR,
+                &parts,
+                info.client_edns,
+                udp_limit,
+                None,
+                Some(info.qtype),
+            ));
+        }
+
         // Blocking is checked first (an AAAA block shadows a hosts AAAA entry).
         let block = (self.block_svcb && (qt == Rtype::SVCB || qt == Rtype::HTTPS))
             || (self.aaaa_mode == AaaaMode::No && qt == Rtype::AAAA);
@@ -1911,5 +1948,62 @@ mod tests {
             ttl_left <= 2,
             "expiry must not be pushed out by a cache-served answer (ttl_left={ttl_left})"
         );
+    }
+
+    /// RFC 8482: an ANY query is answered with a synthesised HINFO and never
+    /// forwarded.
+    ///
+    /// Checked under both `lite` settings: the answer is produced in the static
+    /// rewrite stage, before any route decision or upstream query, so the two
+    /// must be indistinguishable.
+    #[tokio::test]
+    async fn any_queries_get_the_rfc8482_hinfo_whatever_lite_says() {
+        for lite in [true, false] {
+            let hit = Arc::new(AtomicBool::new(false));
+            let flag = hit.clone();
+            let main = spawn_mock(move |q| {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                answer(q, Rcode::NOERROR, &[([1, 2, 3, 4], 60)])
+            })
+            .await;
+            let mut h = mk(vec![main], dead());
+            h.lite = lite;
+            let out = ask(&h, "example.com.", Rtype::ANY, "127.0.0.1").await;
+
+            let msg = parse_resp(&out);
+            assert_eq!(msg.header().rcode(), Rcode::NOERROR, "lite={lite}");
+            assert!(
+                !hit.load(std::sync::atomic::Ordering::Relaxed),
+                "ANY must not reach the upstream (lite={lite})"
+            );
+            let rec = msg
+                .answer()
+                .unwrap()
+                .limit_to::<AllRecordData<_, _>>()
+                .next()
+                .expect("one answer")
+                .expect("parses");
+            assert_eq!(rec.rtype(), Rtype::HINFO, "lite={lite}");
+            assert_eq!(rec.ttl().as_secs(), ANY_HINFO_TTL);
+            match rec.data() {
+                AllRecordData::Hinfo(hi) => {
+                    assert_eq!(hi.cpu().as_slice(), b"RFC8482");
+                    assert!(hi.os().as_slice().is_empty());
+                }
+                other => panic!("expected HINFO, got {other:?}"),
+            }
+            // Synthesised, so nothing goes into either cache.
+            assert!(h.cache.is_empty() && h.fall_cache.is_empty(), "lite={lite}");
+        }
+    }
+
+    /// The ANY handling must not touch any other qtype.
+    #[tokio::test]
+    async fn non_any_queries_still_forward() {
+        let main = spawn_mock(|q| answer(q, Rcode::NOERROR, &[([1, 2, 3, 4], 60)])).await;
+        let h = mk(vec![main], dead());
+        let out = ask(&h, "example.com.", Rtype::A, "127.0.0.1").await;
+        assert_eq!(answer_count(&out), 1);
+        assert_eq!(first_ttl(&out), Some(60));
     }
 }

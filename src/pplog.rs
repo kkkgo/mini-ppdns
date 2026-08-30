@@ -30,7 +30,9 @@ const INNER_HEADER_SIZE: usize = 7;
 const MAX_PACKET_SIZE: usize = 1400;
 const MAX_INNER_PAYLOAD: usize = MAX_PACKET_SIZE - HEADER_SIZE - AEAD_OVERHEAD - INNER_HEADER_SIZE;
 const FLAG_IPV6: u8 = 1;
-const CHANNEL_SIZE: usize = 4096;
+/// Queued packets before telemetry starts dropping. Each is up to
+/// `MAX_PACKET_SIZE`, so this also bounds what a stalled collector can pin.
+const CHANNEL_SIZE: usize = 512;
 const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 pub const SEVERITY_INFO: u8 = 1;
 pub const SEVERITY_WARN: u8 = 2;
@@ -172,7 +174,12 @@ impl Reporter {
     /// Report a query entry (non-blocking; dropped if the channel is full).
     pub fn report(&self, entry: &QueryEntry) {
         let ts = now_secs();
-        self.last_report.store(ts, Ordering::Relaxed);
+        // Only written when the second actually turns over: every query on every
+        // core touches this, and a store takes the cache line exclusively where
+        // a load can share it.
+        if self.last_report.load(Ordering::Relaxed) != ts {
+            self.last_report.store(ts, Ordering::Relaxed);
+        }
         // Query entries max out at level 4 even when configured level is 5.
         let level = self.level.min(4);
         let payload = if level >= 3 {

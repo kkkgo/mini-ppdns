@@ -30,10 +30,28 @@ pub struct ClientEdns {
 /// (DNS Flag Day 2020 recommendation).
 pub const OUR_UDP_SIZE: u16 = 1200;
 
-/// Anti-fragmentation cap on the UDP response size we will emit, even if the
-/// client advertises a larger EDNS buffer. Bounds fragmentation-related packet
-/// loss while still letting well-behaved EDNS clients receive large answers.
-pub const MAX_UDP_RESPONSE: u16 = 4096;
+/// Ceiling on the UDP response size we will emit, whatever the client
+/// advertises.
+///
+/// 1232 is the DNS Flag Day 2020 figure: 1280 (the smallest MTU IPv6 requires
+/// a link to carry) minus a 40-byte IPv6 header and an 8-byte UDP header. A
+/// response that stays under it is never split into IP fragments, and losing
+/// one fragment loses the whole answer. Anything larger is truncated and the
+/// client re-asks over TCP.
+///
+/// Rarely binding in practice: [`OUR_UDP_SIZE`] caps what an upstream may hand
+/// us over UDP, so only an answer fetched over TCP — an upstream truncation
+/// retry, with `lite=no` keeping the records a lite response would drop — can
+/// reach this ceiling.
+pub const MAX_UDP_RESPONSE: u16 = 1232;
+
+/// The ceiling only does its job if a full-size response still fits the
+/// smallest MTU IPv6 requires a link to carry: 1280 − 40 (IPv6 header) − 8
+/// (UDP header). Checked at compile time so it cannot drift.
+const _: () = assert!(MAX_UDP_RESPONSE as usize + 40 + 8 <= 1280);
+/// …and it has to leave room above the RFC 1035 floor, or an EDNS client would
+/// be no better off than one that sends no OPT.
+const _: () = assert!(MAX_UDP_RESPONSE > 512);
 
 /// Build target for outgoing responses: a plain `Vec<u8>` wrapped in the
 /// crate's name compressor.
@@ -822,7 +840,12 @@ mod tests {
 
     #[test]
     fn response_opt_echoes_clamped_client_size() {
-        for (advertised, want) in [(1400u16, 1400u16), (8192, MAX_UDP_RESPONSE), (200, 512)] {
+        for (advertised, want) in [
+            (1000u16, 1000u16),                   // under the ceiling: echoed as-is
+            (MAX_UDP_RESPONSE, MAX_UDP_RESPONSE), // exactly at it
+            (8192, MAX_UDP_RESPONSE),             // over it: held down
+            (200, 512),                           // under the RFC 1035 floor
+        ] {
             let req = Message::from_octets(query_with_edns(advertised)).unwrap();
             let (info, _) = extract_query(&req).unwrap();
             let data = ResponseData {
@@ -1356,5 +1379,33 @@ mod tests {
             fast_used > 10_000,
             "direct read used {fast_used} times overall"
         );
+    }
+
+    /// A client that advertises more than we are willing to send gets held to
+    /// the ceiling: the datagram is capped and TC tells it to retry over TCP.
+    #[test]
+    fn a_client_asking_for_more_than_the_ceiling_is_held_to_it() {
+        let req = Message::from_octets(query_with_edns(8192)).unwrap();
+        let (info, _) = extract_query(&req).unwrap();
+        let answers: Vec<OwnedRecord> = (0..200).map(|i| a_record(LONG_NAME, i as u8)).collect();
+        let data = ResponseData {
+            rcode: Rcode::NOERROR,
+            answers: &answers,
+            authority: &[],
+            additional: &[],
+            ttl_override: None,
+            edns: info.client_edns,
+            shuffle_qtype: Some(Rtype::A),
+        };
+        let out = build_response(&req, &data, Some(udp_response_limit(info.client_edns)));
+        assert!(
+            out.len() <= MAX_UDP_RESPONSE as usize,
+            "emitted {} bytes for a client that asked for 8192",
+            out.len()
+        );
+        let msg = parse(out).unwrap();
+        assert!(msg.header().tc(), "the client must be told to use TCP");
+        // What we advertise back agrees with what we were willing to send.
+        assert_eq!(msg.opt().unwrap().udp_payload_size(), MAX_UDP_RESPONSE);
     }
 }

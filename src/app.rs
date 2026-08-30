@@ -32,7 +32,63 @@ const MAX_CONCURRENT_TCP: usize = 1024;
 // permit pool above. Bounds task/memory growth under a connection flood;
 // excess connections are dropped at accept (see `serve_tcp`).
 const MAX_TCP_CONNS: usize = 2048;
+// Floors, so a tiny file-descriptor limit still leaves the forwarder usable.
+const MIN_CONCURRENT_UDP: usize = 64;
+const MIN_CONCURRENT_TCP: usize = 16;
+const MIN_TCP_CONNS: usize = 32;
+// Descriptors set aside for the listen sockets, the upstream idle pools
+// (`MAX_IDLE_CONNS` per upstream) and whatever else the process holds open.
+const FD_RESERVE: usize = 320;
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+
+/// The three concurrency ceilings, after the file-descriptor limit is taken
+/// into account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Caps {
+    udp: usize,
+    tcp: usize,
+    tcp_conns: usize,
+}
+
+/// Derive the ceilings from `fd_limit` (`None` when it cannot be read, which
+/// means "assume plenty").
+///
+/// Every in-flight forwarded query holds at least one upstream socket, and every
+/// accepted TCP connection is a descriptor of its own. Ceilings above what the
+/// process may open turn overload into `EMFILE` — a SERVFAIL for the client —
+/// rather than the intended shed, which drops a datagram the client will retry.
+fn caps_for(fd_limit: Option<usize>) -> Caps {
+    let Some(limit) = fd_limit else {
+        return Caps {
+            udp: MAX_CONCURRENT_UDP,
+            tcp: MAX_CONCURRENT_TCP,
+            tcp_conns: MAX_TCP_CONNS,
+        };
+    };
+    let budget = limit.saturating_sub(FD_RESERVE);
+    Caps {
+        udp: (budget / 2).clamp(MIN_CONCURRENT_UDP, MAX_CONCURRENT_UDP),
+        tcp_conns: (budget * 3 / 10).clamp(MIN_TCP_CONNS, MAX_TCP_CONNS),
+        tcp: (budget / 5).clamp(MIN_CONCURRENT_TCP, MAX_CONCURRENT_TCP),
+    }
+}
+
+/// The process's soft descriptor limit, or `None` if it is unlimited or
+/// unreadable.
+fn fd_limit() -> Option<usize> {
+    // SAFETY: `getrlimit` only writes into the `rlimit` we hand it.
+    let rl = unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
+            return None;
+        }
+        rl
+    };
+    if rl.rlim_cur == libc::RLIM_INFINITY {
+        return None;
+    }
+    usize::try_from(rl.rlim_cur).ok()
+}
 
 /// UDP receive-loop shards per listen address. The fast path (cache hit /
 /// static rewrite) runs inline in the receive loop, so one loop caps
@@ -293,9 +349,20 @@ async fn serve(
         pplog,
     });
 
-    let udp_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_UDP));
-    let tcp_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_TCP));
-    let tcp_conn_sem = Arc::new(Semaphore::new(MAX_TCP_CONNS));
+    let caps = caps_for(fd_limit());
+    log::info(&format!(
+        "concurrency udp {} tcp {} tcp-conns {} (fd limit {})",
+        log::hl_value(caps.udp),
+        log::hl_value(caps.tcp),
+        log::hl_value(caps.tcp_conns),
+        log::hl_value(match fd_limit() {
+            Some(n) => n.to_string(),
+            None => "unlimited".to_string(),
+        })
+    ));
+    let udp_sem = Arc::new(Semaphore::new(caps.udp));
+    let tcp_sem = Arc::new(Semaphore::new(caps.tcp));
+    let tcp_conn_sem = Arc::new(Semaphore::new(caps.tcp_conns));
 
     let mut servers = Vec::new();
     for addr in &listen {
@@ -372,8 +439,8 @@ async fn serve(
     // Both pools drain concurrently in the background; the sequential awaits
     // just observe them, all bounded by the one outer timeout.
     let drain = async {
-        let _ = udp_sem.acquire_many(MAX_CONCURRENT_UDP as u32).await;
-        let _ = tcp_sem.acquire_many(MAX_CONCURRENT_TCP as u32).await;
+        let _ = udp_sem.acquire_many(caps.udp as u32).await;
+        let _ = tcp_sem.acquire_many(caps.tcp as u32).await;
     };
     let _ = tokio::time::timeout(SHUTDOWN_DRAIN, drain).await;
 
@@ -413,6 +480,63 @@ async fn wait_for_signal() {
         _ => {
             // Fallback: Ctrl-C only.
             let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caps_stay_at_the_ceilings_when_descriptors_are_plentiful() {
+        let plenty = caps_for(Some(1_048_576));
+        assert_eq!(
+            plenty,
+            Caps {
+                udp: MAX_CONCURRENT_UDP,
+                tcp: MAX_CONCURRENT_TCP,
+                tcp_conns: MAX_TCP_CONNS,
+            }
+        );
+        // An unreadable or unlimited rlimit means "assume plenty", not "assume
+        // nothing" — the floors would otherwise cripple a healthy machine.
+        assert_eq!(caps_for(None), plenty);
+    }
+
+    #[test]
+    fn caps_fit_inside_a_small_descriptor_limit() {
+        // The default on the routers this targets.
+        let limit = 1024;
+        let c = caps_for(Some(limit));
+        // Each in-flight query holds an upstream socket and each accepted
+        // connection is a descriptor, so the three together plus the reserve
+        // must stay inside the limit.
+        assert!(
+            c.udp + c.tcp + c.tcp_conns + FD_RESERVE <= limit,
+            "{c:?} + reserve overruns {limit}"
+        );
+        assert!(c.udp < MAX_CONCURRENT_UDP, "must actually scale down");
+        assert!(c.udp >= MIN_CONCURRENT_UDP);
+    }
+
+    #[test]
+    fn caps_never_fall_below_the_floors() {
+        for limit in [0usize, 1, 64, FD_RESERVE, FD_RESERVE + 1] {
+            let c = caps_for(Some(limit));
+            assert_eq!(c.udp, MIN_CONCURRENT_UDP, "limit={limit}");
+            assert_eq!(c.tcp, MIN_CONCURRENT_TCP, "limit={limit}");
+            assert_eq!(c.tcp_conns, MIN_TCP_CONNS, "limit={limit}");
+        }
+    }
+
+    #[test]
+    fn caps_grow_monotonically_with_the_limit() {
+        let mut prev = caps_for(Some(0));
+        for limit in (0..20_000).step_by(97) {
+            let c = caps_for(Some(limit));
+            assert!(c.udp >= prev.udp && c.tcp >= prev.tcp && c.tcp_conns >= prev.tcp_conns);
+            prev = c;
         }
     }
 }

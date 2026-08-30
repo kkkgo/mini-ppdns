@@ -196,9 +196,54 @@ pub fn hostname_to_name(s: &str) -> Option<OwnedName> {
 
 #[derive(Default)]
 struct Maps {
-    ptr: HashMap<Vec<u8>, String>,          // wire-lower(arpa) -> hostname
-    fwd: HashMap<Vec<u8>, Vec<IpAddr>>,     // wire-lower(name) -> ips
-    mod_times: HashMap<String, SystemTime>, // watched path -> mtime
+    /// What `lookup` probes: lease entries, then hosts entries, then statics.
+    ptr: HashMap<Vec<u8>, String>, // wire-lower(arpa) -> hostname
+    /// What `lookup_ip` probes. Only hosts files and `[hosts]` feed it, and it
+    /// is the table that can get large, so it is never rebuilt for a lease
+    /// change.
+    fwd: HashMap<Vec<u8>, Vec<IpAddr>>, // wire-lower(name) -> ips
+    /// Each source's own contribution to `ptr`, so either can be rebuilt
+    /// without re-reading the other. Both are keyed by address rather than by
+    /// name, so they stay small even when a hosts file holds a million names.
+    lease_ptr: HashMap<Vec<u8>, String>,
+    hosts_ptr: HashMap<Vec<u8>, String>,
+    lease_times: HashMap<String, SystemTime>, // watched path -> mtime
+    hosts_times: HashMap<String, SystemTime>,
+}
+
+/// Which group of files a poll found changed.
+#[derive(Clone, Copy)]
+struct Changed {
+    lease: bool,
+    hosts: bool,
+}
+
+impl Changed {
+    fn all() -> Self {
+        Changed {
+            lease: true,
+            hosts: true,
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.lease || self.hosts
+    }
+}
+
+/// Whether any watched path's modification time differs from what was recorded
+/// when it was last read.
+fn group_changed(files: &[&String], recorded: &HashMap<String, SystemTime>) -> bool {
+    files.iter().any(|f| {
+        // Stat outside the lock so disk I/O never blocks readers.
+        let cur = std::fs::metadata(f).and_then(|m| m.modified()).ok();
+        match (cur, recorded.get(*f).copied()) {
+            (None, Some(_)) => true,      // disappeared
+            (Some(_), None) => true,      // appeared
+            (Some(c), Some(p)) => c != p, // changed
+            (None, None) => false,
+        }
+    })
 }
 
 /// Bits in [`NameFilter`] (8 KiB). Sized so typical lease/hosts tables
@@ -326,7 +371,7 @@ impl PtrResolver {
             maps: RwLock::new(Maps::default()),
             fwd_filter: NameFilter::new(),
         };
-        r.reload();
+        r.reload(Changed::all());
         Some(r)
     }
 
@@ -376,80 +421,102 @@ impl PtrResolver {
     /// Reload if any watched file changed. Runs blocking file IO — call it
     /// from the background watcher task, never from the query path.
     pub fn check_reload(&self) {
-        if self.files_changed() {
-            self.reload();
+        let what = self.changed();
+        if what.any() {
+            self.reload(what);
         }
     }
 
-    /// Every file the resolver reads is watched, auto-detected ones included —
+    /// The hosts files this resolver reads: the configured ones plus anything
+    /// auto-detection turned up. Auto-detected files are watched like the rest —
     /// `/etc/hosts` is documented as hot-reloading, and a file that is read but
     /// not watched only refreshes when some *other* watched file changes.
-    fn watched_files(&self) -> impl Iterator<Item = &String> {
-        self.lease_files
+    fn hosts_group(&self) -> Vec<&String> {
+        self.hosts_files
             .iter()
-            .chain(self.hosts_files.iter())
             .chain(self.auto_hosts_files.iter())
+            .collect()
     }
 
+    /// Which group of watched files changed since it was last read.
+    fn changed(&self) -> Changed {
+        let lease: Vec<&String> = self.lease_files.iter().collect();
+        let hosts = self.hosts_group();
+        let m = self.maps.read().unwrap();
+        Changed {
+            lease: group_changed(&lease, &m.lease_times),
+            hosts: group_changed(&hosts, &m.hosts_times),
+        }
+    }
+
+    #[cfg(test)]
     fn files_changed(&self) -> bool {
-        let watched: Vec<&String> = self.watched_files().collect();
-        // Stat outside the lock so disk I/O never blocks readers.
-        let cur: Vec<(&String, Option<SystemTime>)> = watched
-            .iter()
-            .map(|f| (*f, std::fs::metadata(f).and_then(|m| m.modified()).ok()))
-            .collect();
-        let maps = self.maps.read().unwrap();
-        for (f, cur_mt) in cur {
-            let prev = maps.mod_times.get(f).copied();
-            match (cur_mt, prev) {
-                (None, Some(_)) => return true,              // disappeared
-                (Some(_), None) => return true,              // appeared
-                (Some(c), Some(p)) if c != p => return true, // changed
-                _ => {}
-            }
-        }
-        false
+        self.changed().any()
     }
 
-    fn reload(&self) {
-        let mut ptr = HashMap::new();
-        let mut fwd = HashMap::new();
-        let mut mod_times = HashMap::new();
-        for f in &self.lease_files {
-            load_lease(f, &mut ptr, &mut mod_times);
+    /// Rebuild the tables fed by the groups named in `what`, leaving the other
+    /// group's as they are. A DHCP server rewrites its lease file constantly,
+    /// and re-parsing a large hosts table on every one of those is the cost this
+    /// split avoids.
+    fn reload(&self, what: Changed) {
+        let mut lease_times = None;
+        let lease_ptr = if what.lease {
+            let (mut p, mut t) = (HashMap::new(), HashMap::new());
+            for f in &self.lease_files {
+                load_lease(f, &mut p, &mut t);
+            }
+            lease_times = Some(t);
+            p
+        } else {
+            self.maps.read().unwrap().lease_ptr.clone()
+        };
+
+        let mut hosts_times = None;
+        let mut new_fwd = None;
+        let hosts_ptr = if what.hosts {
+            let (mut p, mut fwd, mut t) = (HashMap::new(), HashMap::new(), HashMap::new());
+            for f in self.hosts_files.iter().chain(self.auto_hosts_files.iter()) {
+                load_hosts(f, &mut p, &mut fwd, Some(&mut t));
+            }
+            // Static [hosts] entries always overlay file entries.
+            for (k, v) in &self.static_fwd {
+                fwd.insert(k.clone(), v.clone());
+            }
+            // Publish filter bits for every (possibly new) name BEFORE swapping
+            // the table in, so a lookup that sees the table also sees the bits.
+            for k in fwd.keys() {
+                self.fwd_filter.insert(k);
+            }
+            hosts_times = Some(t);
+            new_fwd = Some(fwd);
+            p
+        } else {
+            self.maps.read().unwrap().hosts_ptr.clone()
+        };
+
+        // Merge the reverse view in priority order, off the lock.
+        let mut ptr =
+            HashMap::with_capacity(lease_ptr.len() + hosts_ptr.len() + self.static_ptr.len());
+        for src in [&lease_ptr, &hosts_ptr, &self.static_ptr] {
+            ptr.extend(src.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
-        for f in &self.hosts_files {
-            load_hosts(f, &mut ptr, &mut fwd, Some(&mut mod_times));
-        }
-        for f in &self.auto_hosts_files {
-            load_hosts(f, &mut ptr, &mut fwd, Some(&mut mod_times));
-        }
-        // Static [hosts] entries always overlay file entries.
-        for (k, v) in &self.static_ptr {
-            ptr.insert(k.clone(), v.clone());
-        }
-        for (k, v) in &self.static_fwd {
-            fwd.insert(k.clone(), v.clone());
-        }
-        // Publish filter bits for every (possibly new) name BEFORE swapping
-        // the maps in, so a lookup that sees the new maps also sees the bits.
-        for k in fwd.keys() {
-            self.fwd_filter.insert(k);
-        }
-        // Swap under the lock, drop the replaced maps *outside* it: dropping
+
+        // Swap under the lock, drop the replaced tables *outside* it: dropping
         // them frees every key and value, and lookups take this same lock from
         // inside the UDP receive loops, where a large table's deallocation
         // would stall intake.
         let old = {
             let mut m = self.maps.write().unwrap();
-            std::mem::replace(
-                &mut *m,
-                Maps {
-                    ptr,
-                    fwd,
-                    mod_times,
-                },
-            )
+            m.lease_ptr = lease_ptr;
+            m.hosts_ptr = hosts_ptr;
+            if let Some(t) = lease_times {
+                m.lease_times = t;
+            }
+            if let Some(t) = hosts_times {
+                m.hosts_times = t;
+            }
+            let old_fwd = new_fwd.map(|f| std::mem::replace(&mut m.fwd, f));
+            (std::mem::replace(&mut m.ptr, ptr), old_fwd)
         };
         drop(old);
     }
@@ -694,7 +761,7 @@ mod tests {
         // Hot reload: rewrite hosts, force a reload, old entry gone / new present,
         // and the [hosts] static overlay survives.
         std::fs::write(&hosts, "10.0.0.6 newhost.lan\n").unwrap();
-        r.reload();
+        r.reload(Changed::all());
         assert_eq!(fwd("newhost.lan"), vec![ip("10.0.0.6")]);
         assert!(fwd("myhost.lan").is_empty());
         assert_eq!(fwd("static.lan"), vec![ip("172.16.0.9")]);
@@ -781,13 +848,155 @@ mod tests {
         let r = PtrResolver::new(vec![], vec![], true, &HashMap::new())
             .expect("auto-detection finds /etc/hosts");
         assert!(
-            r.watched_files().any(|f| f == "/etc/hosts"),
+            r.hosts_group().iter().any(|f| *f == "/etc/hosts"),
             "auto-detected hosts file must be in the watch set"
         );
         assert!(
-            r.maps.read().unwrap().mod_times.contains_key("/etc/hosts"),
+            r.maps
+                .read()
+                .unwrap()
+                .hosts_times
+                .contains_key("/etc/hosts"),
             "and must have an mtime recorded, or every poll reports a change"
         );
         assert!(!r.files_changed(), "so a quiet poll settles");
+    }
+
+    /// Set `path`'s modification time explicitly, so a test never depends on
+    /// filesystem timestamp granularity.
+    fn set_mtime(path: &std::path::Path, t: SystemTime) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(t))
+            .unwrap();
+    }
+
+    /// A DHCP server rewrites its lease file constantly. Those reloads must not
+    /// re-read the hosts files, which is where a large table would be.
+    ///
+    /// Proven by editing the hosts file's *content* while restoring its mtime,
+    /// so it still looks untouched: if a lease-only reload re-read it, the new
+    /// content would show up.
+    #[test]
+    fn a_lease_change_does_not_re_read_the_hosts_files() {
+        let dir = std::env::temp_dir();
+        let uniq = format!("mppdns-split-{}-{:p}", std::process::id(), &dir as *const _);
+        let lease = dir.join(format!("{uniq}.leases"));
+        let hosts = dir.join(format!("{uniq}.hosts"));
+        std::fs::write(
+            &lease,
+            "1700000000 aa:bb:cc:dd:ee:ff 192.168.1.50 leasehost *\n",
+        )
+        .unwrap();
+        std::fs::write(&hosts, "10.0.0.5 myhost.lan\n").unwrap();
+
+        let r = PtrResolver::new(
+            vec![lease.to_string_lossy().into_owned()],
+            vec![hosts.to_string_lossy().into_owned()],
+            false,
+            &HashMap::new(),
+        )
+        .expect("resolver present");
+        let fwd = |name: &str| {
+            let wire = name_to_wire(name, true).unwrap();
+            r.lookup_ip(&wire, crate::util::hash(&wire))
+        };
+        let rev = |ipstr: &str| r.lookup(&name_to_wire(&ip_to_ptr_name_str(ipstr), true).unwrap());
+        assert_eq!(fwd("myhost.lan"), vec![ip("10.0.0.5")]);
+        assert_eq!(rev("192.168.1.50").as_deref(), Some("leasehost"));
+
+        // Rewrite the hosts file but put its mtime back: to the watcher it is
+        // unchanged.
+        let hosts_mtime = std::fs::metadata(&hosts).unwrap().modified().unwrap();
+        std::fs::write(&hosts, "10.0.0.9 newhost.lan\n").unwrap();
+        set_mtime(&hosts, hosts_mtime);
+
+        // Now make the lease file genuinely change.
+        std::fs::write(
+            &lease,
+            "1700000000 aa:bb:cc:dd:ee:ff 192.168.1.51 movedhost *\n",
+        )
+        .unwrap();
+        set_mtime(
+            &lease,
+            SystemTime::now() + std::time::Duration::from_secs(120),
+        );
+        r.check_reload();
+
+        // The lease side is up to date...
+        assert_eq!(rev("192.168.1.51").as_deref(), Some("movedhost"));
+        assert!(rev("192.168.1.50").is_none(), "old lease entry dropped");
+        // ...and the hosts side was not re-read.
+        assert_eq!(
+            fwd("myhost.lan"),
+            vec![ip("10.0.0.5")],
+            "a lease-only reload must not re-parse the hosts files"
+        );
+        assert!(fwd("newhost.lan").is_empty());
+
+        // A real hosts change is still picked up, and the lease side survives it.
+        set_mtime(
+            &hosts,
+            SystemTime::now() + std::time::Duration::from_secs(240),
+        );
+        r.check_reload();
+        assert_eq!(fwd("newhost.lan"), vec![ip("10.0.0.9")]);
+        assert!(fwd("myhost.lan").is_empty());
+        assert_eq!(rev("192.168.1.51").as_deref(), Some("movedhost"));
+
+        // And the watch settles afterwards.
+        assert!(!r.files_changed());
+
+        let _ = std::fs::remove_file(&lease);
+        let _ = std::fs::remove_file(&hosts);
+    }
+
+    /// Reverse lookups resolve one address to one name, so the three sources
+    /// have to have a defined precedence: `[hosts]` config beats a hosts file,
+    /// which beats a DHCP lease.
+    #[test]
+    fn reverse_lookup_precedence_is_config_then_hosts_then_lease() {
+        let dir = std::env::temp_dir();
+        let uniq = format!("mppdns-prio-{}-{:p}", std::process::id(), &dir as *const _);
+        let lease = dir.join(format!("{uniq}.leases"));
+        let hosts = dir.join(format!("{uniq}.hosts"));
+        // All three name 10.0.0.7; only one can answer its PTR.
+        std::fs::write(
+            &lease,
+            "1700000000 aa:bb:cc:dd:ee:ff 10.0.0.7 leasename *\n",
+        )
+        .unwrap();
+        std::fs::write(&hosts, "10.0.0.7 hostsname.lan\n10.0.0.8 leaseless.lan\n").unwrap();
+        let mut statics: HashMap<String, Vec<IpAddr>> = HashMap::new();
+        statics.insert("configname.lan.".to_string(), vec![ip("10.0.0.7")]);
+
+        let r = PtrResolver::new(
+            vec![lease.to_string_lossy().into_owned()],
+            vec![hosts.to_string_lossy().into_owned()],
+            false,
+            &statics,
+        )
+        .expect("resolver present");
+        let rev = |ipstr: &str| r.lookup(&name_to_wire(&ip_to_ptr_name_str(ipstr), true).unwrap());
+
+        assert_eq!(
+            rev("10.0.0.7").as_deref(),
+            Some("configname.lan"),
+            "a [hosts] entry outranks both files"
+        );
+        // With the config entry out of the way, the hosts file outranks the lease.
+        let r2 = PtrResolver::new(
+            vec![lease.to_string_lossy().into_owned()],
+            vec![hosts.to_string_lossy().into_owned()],
+            false,
+            &HashMap::new(),
+        )
+        .expect("resolver present");
+        let rev2 =
+            |ipstr: &str| r2.lookup(&name_to_wire(&ip_to_ptr_name_str(ipstr), true).unwrap());
+        assert_eq!(rev2("10.0.0.7").as_deref(), Some("hostsname.lan"));
+        assert_eq!(rev2("10.0.0.8").as_deref(), Some("leaseless.lan"));
+
+        let _ = std::fs::remove_file(&lease);
+        let _ = std::fs::remove_file(&hosts);
     }
 }
