@@ -111,17 +111,110 @@ pub fn question_end(msg: &[u8]) -> Option<usize> {
     }
 }
 
-/// Extracted, owned view of an incoming query's question + EDNS state.
-#[derive(Debug, Clone)]
-pub struct QueryInfo {
-    pub qname: OwnedName,
-    /// `util::hash` of the lower-cased wire name, computed once per query and reused by
-    /// the resolver's negative filter and the cache key (shard selection
-    /// continues from it), so the name is FNV-hashed exactly once.
+/// Longest domain name in wire form, root label included (RFC 1035 §2.3.4).
+pub const MAX_NAME_LEN: usize = 255;
+
+/// Storage `extract_query` parses a question into. The lower-cased copy of the
+/// name always lands in the inline buffer, so it costs no allocation; a name
+/// that has to be flattened out of compression pointers — which no real client
+/// sends — is copied into `flat`, the one case that allocates.
+pub struct QueryScratch {
+    lower: [u8; MAX_NAME_LEN],
+    flat: Vec<u8>,
+}
+
+impl QueryScratch {
+    pub fn new() -> Self {
+        QueryScratch {
+            lower: [0; MAX_NAME_LEN],
+            flat: Vec::new(),
+        }
+    }
+}
+
+impl Default for QueryScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// An incoming query's sole question and EDNS state, borrowed from the message
+/// and from the `QueryScratch` it was parsed into.
+#[derive(Debug, Clone, Copy)]
+pub struct QueryInfo<'a> {
+    /// The question name as the client sent it: uncompressed wire form,
+    /// original case. Always a well-formed absolute name.
+    name: &'a [u8],
+    /// `name` lower-cased, which is what the cache key and the local resolver
+    /// match on.
+    lower: &'a [u8],
+    /// `util::hash` of the lower-cased name, computed once per query and reused
+    /// by the resolver's negative filter and the cache key (shard selection
+    /// continues from it).
     pub name_hash: u64,
     pub qtype: Rtype,
     pub qclass: Class,
     pub client_edns: Option<ClientEdns>,
+}
+
+impl<'a> QueryInfo<'a> {
+    /// The question name in wire form, lower-cased.
+    pub fn lower(&self) -> &'a [u8] {
+        self.lower
+    }
+
+    /// The question name in wire form, original case — the bytes a response
+    /// echoes and a record owned by this name repeats.
+    pub fn name_bytes(&self) -> &'a [u8] {
+        self.name
+    }
+
+    /// The question name as a `domain` name, for display and composing.
+    pub fn qname(&self) -> Name<&'a [u8]> {
+        Name::from_octets(self.name).expect("extract_query only yields well-formed names")
+    }
+
+    /// An owned copy of the question name, for a record that has to hold one.
+    pub fn qname_owned(&self) -> OwnedName {
+        Name::from_octets(self.name.to_vec()).expect("extract_query only yields well-formed names")
+    }
+
+    /// Copy the names out of the message and scratch buffer, for a query that
+    /// outlives them while it waits on an upstream.
+    pub fn detach(&self) -> OwnedQueryInfo {
+        OwnedQueryInfo {
+            name: self.name.to_vec(),
+            lower: self.lower.to_vec(),
+            name_hash: self.name_hash,
+            qtype: self.qtype,
+            qclass: self.qclass,
+            client_edns: self.client_edns,
+        }
+    }
+}
+
+/// A `QueryInfo` that owns its names.
+#[derive(Debug, Clone)]
+pub struct OwnedQueryInfo {
+    name: Vec<u8>,
+    lower: Vec<u8>,
+    name_hash: u64,
+    qtype: Rtype,
+    qclass: Class,
+    client_edns: Option<ClientEdns>,
+}
+
+impl OwnedQueryInfo {
+    pub fn info(&self) -> QueryInfo<'_> {
+        QueryInfo {
+            name: &self.name,
+            lower: &self.lower,
+            name_hash: self.name_hash,
+            qtype: self.qtype,
+            qclass: self.qclass,
+            client_edns: self.client_edns,
+        }
+    }
 }
 
 /// Parse a datagram/stream message body. Returns None on malformed input.
@@ -129,39 +222,114 @@ pub fn parse(bytes: Vec<u8>) -> Option<Message<Vec<u8>>> {
     Message::from_octets(bytes).ok()
 }
 
-/// Extract the sole question and EDNS state, plus the lower-cased uncompressed
-/// wire name. Returns None if there is no question (caller then answers
-/// FORMERR).
-///
-/// The lower-cased name comes back beside the `QueryInfo` so the caller can
-/// move it into the `CacheKey`, which has to own it.
-pub fn extract_query<Octs: domain::dep::octseq::Octets + ?Sized>(
-    msg: &Message<Octs>,
-) -> Option<(QueryInfo, Vec<u8>)> {
-    let q = msg.sole_question().ok()?;
-    let qname: OwnedName = q.qname().to_vec();
-    let mut qname_lower = qname.as_slice().to_vec();
-    qname_lower.make_ascii_lowercase();
-    let name_hash = crate::util::hash(&qname_lower);
-    let client_edns = edns_of(msg);
-    Some((
-        QueryInfo {
-            qname,
-            name_hash,
-            qtype: q.qtype(),
-            qclass: q.qclass(),
-            client_edns,
+/// What one pass over a question section found.
+enum QuestionScan {
+    /// One uncompressed name spanning `12..name_end`, followed by QTYPE and
+    /// QCLASS.
+    Plain {
+        name_end: usize,
+        qtype: u16,
+        qclass: u16,
+    },
+    /// Not exactly one well-formed question.
+    Invalid,
+    /// A label byte this pass does not interpret (a compression pointer or a
+    /// reserved label type): only the general parser can rule on it.
+    General,
+}
+
+/// Walk the question section once, accepting exactly what
+/// `Message::sole_question` accepts for an uncompressed name: a question count
+/// of one, labels that stay inside the message, fewer than `MAX_NAME_LEN`
+/// octets before the root label, and a complete QTYPE and QCLASS after it.
+fn scan_question(src: &[u8]) -> QuestionScan {
+    if src.len() < 12 || u16::from_be_bytes([src[4], src[5]]) != 1 {
+        return QuestionScan::Invalid;
+    }
+    let mut i = 12usize;
+    loop {
+        let Some(&len) = src.get(i) else {
+            return QuestionScan::Invalid;
+        };
+        let len = usize::from(len);
+        if len & 0xC0 != 0 {
+            return QuestionScan::General;
+        }
+        if len == 0 {
+            break;
+        }
+        if i - 12 + 1 + len >= MAX_NAME_LEN {
+            return QuestionScan::Invalid;
+        }
+        i += 1 + len;
+    }
+    let name_end = i + 1;
+    match src.get(name_end..name_end + 4) {
+        Some(t) => QuestionScan::Plain {
+            name_end,
+            qtype: u16::from_be_bytes([t[0], t[1]]),
+            qclass: u16::from_be_bytes([t[2], t[3]]),
         },
-        qname_lower,
-    ))
+        None => QuestionScan::Invalid,
+    }
+}
+
+/// Extract the sole question and EDNS state. Returns None if the message does
+/// not carry exactly one parseable question (caller then answers FORMERR).
+///
+/// Parses straight off the wire in one pass. A question name that uses
+/// compression pointers — no real client sends one — goes through the general
+/// parser instead and is flattened into `scratch`, the only case that
+/// allocates.
+pub fn extract_query<'a, Octs: domain::dep::octseq::Octets + ?Sized>(
+    msg: &'a Message<Octs>,
+    scratch: &'a mut QueryScratch,
+) -> Option<QueryInfo<'a>> {
+    let src = msg.as_slice();
+    let QueryScratch { lower, flat } = scratch;
+    let (name, qend, qtype, qclass) = match scan_question(src) {
+        QuestionScan::Plain {
+            name_end,
+            qtype,
+            qclass,
+        } => (
+            &src[12..name_end],
+            Some(name_end + 4),
+            Rtype::from_int(qtype),
+            Class::from_int(qclass),
+        ),
+        QuestionScan::Invalid => return None,
+        QuestionScan::General => {
+            let q = msg.sole_question().ok()?;
+            flat.clear();
+            flat.extend_from_slice(q.qname().to_vec().as_slice());
+            let flat: &'a Vec<u8> = flat;
+            (flat.as_slice(), None, q.qtype(), q.qclass())
+        }
+    };
+    for (l, &b) in lower.iter_mut().zip(name) {
+        *l = b.to_ascii_lowercase();
+    }
+    let lower: &'a [u8; MAX_NAME_LEN] = lower;
+    let lower = &lower[..name.len()];
+    Some(QueryInfo {
+        name,
+        lower,
+        name_hash: crate::util::hash(lower),
+        qtype,
+        qclass,
+        client_edns: edns_with(msg, qend),
+    })
 }
 
 /// Read the OPT a query carries right after its question, for the message
-/// shapes where that position is guaranteed.
+/// shapes where that position is guaranteed. `qend` is the end of the
+/// question section when the caller has already walked it (it must equal
+/// `question_end(src)`); otherwise it is found here.
 ///
 /// `Some(x)` is a definitive answer; `None` means the shape is not one this can
 /// read directly and the caller must fall back to walking the sections.
-fn opt_after_question(src: &[u8]) -> Option<Option<ClientEdns>> {
+fn opt_after_question(src: &[u8], qend: Option<usize>) -> Option<Option<ClientEdns>> {
     if src.len() < 12 {
         return None;
     }
@@ -176,7 +344,10 @@ fn opt_after_question(src: &[u8]) -> Option<Option<ClientEdns>> {
     {
         return None;
     }
-    let i = question_end(src)?;
+    let i = match qend {
+        Some(end) => end,
+        None => question_end(src)?,
+    };
     // An OPT's owner is always the root name.
     if *src.get(i)? != 0 {
         return None;
@@ -205,7 +376,16 @@ fn opt_after_question(src: &[u8]) -> Option<Option<ClientEdns>> {
 pub fn edns_of<Octs: domain::dep::octseq::Octets + ?Sized>(
     msg: &Message<Octs>,
 ) -> Option<ClientEdns> {
-    if let Some(fast) = opt_after_question(msg.as_slice()) {
+    edns_with(msg, None)
+}
+
+/// `edns_of`, reusing the end of the question section when the caller already
+/// knows it.
+fn edns_with<Octs: domain::dep::octseq::Octets + ?Sized>(
+    msg: &Message<Octs>,
+    qend: Option<usize>,
+) -> Option<ClientEdns> {
+    if let Some(fast) = opt_after_question(msg.as_slice(), qend) {
         return fast;
     }
     edns_of_slow(msg)
@@ -263,6 +443,17 @@ pub fn min_ttl(records: &[OwnedRecord]) -> Option<u32> {
         .min()
 }
 
+/// How long RFC 2308 §5 allows a negative answer to be cached: the smaller of
+/// the SOA record's own TTL and the MINIMUM field of its rdata. `None` when
+/// the authority section carries no SOA, which is an answer that cannot be
+/// cached as a negative at all.
+pub fn negative_ttl_cap(authority: &[OwnedRecord]) -> Option<u32> {
+    authority.iter().find_map(|r| match r.data() {
+        AllRecordData::Soa(soa) => Some(r.ttl().as_secs().min(soa.minimum().as_secs())),
+        _ => None,
+    })
+}
+
 /// A response ready to build: header flags, rcode, and sectioned records.
 pub struct ResponseData<'a> {
     pub rcode: Rcode,
@@ -279,14 +470,29 @@ pub struct ResponseData<'a> {
     pub shuffle_qtype: Option<Rtype>,
 }
 
-/// Build a wire response echoing `req`'s question. `udp_limit` (Some for UDP)
-/// caps the datagram size; on overflow the response is refilled up to the limit
-/// with as many records as fit and the TC bit is set (RFC 1035 §4.2.1).
+/// [`build_response_into`], into a fresh buffer.
+#[cfg(test)]
 pub fn build_response<Octs: domain::dep::octseq::Octets + ?Sized>(
     req: &Message<Octs>,
     data: &ResponseData<'_>,
     udp_limit: Option<u16>,
 ) -> Vec<u8> {
+    let mut out = Vec::new();
+    build_response_into(req, data, udp_limit, &mut out);
+    out
+}
+
+/// Build a wire response echoing `req`'s question into `out`, replacing
+/// whatever it held, so a loop answering one query after another can keep a
+/// single buffer. `udp_limit` (Some for UDP) caps the datagram size; on
+/// overflow the response is refilled up to the limit with as many records as
+/// fit and the TC bit is set (RFC 1035 §4.2.1).
+pub fn build_response_into<Octs: domain::dep::octseq::Octets + ?Sized>(
+    req: &Message<Octs>,
+    data: &ResponseData<'_>,
+    udp_limit: Option<u16>,
+    out: &mut Vec<u8>,
+) {
     // TCP carries no datagram budget, but a DNS message is still capped by the
     // 2-byte length prefix the transport frames it with, so that is the budget
     // there — an over-long message gets truncated with TC like any other.
@@ -294,22 +500,131 @@ pub fn build_response<Octs: domain::dep::octseq::Octets + ?Sized>(
 
     // Uncompressed build first: compression costs noticeably more CPU, and the
     // overwhelming majority of responses fit without it.
-    let msg = assemble(req, data);
-    if msg.len() <= limit {
-        return msg;
+    assemble_into(req, data, out);
+    if out.len() <= limit {
+        return;
     }
 
     // Over budget. Name compression alone usually brings a multi-record answer
     // back under the limit, saving the client a TCP round trip; the extra build
     // only ever happens here.
     let packed = assemble_packed(req, data);
+    out.clear();
     if packed.len() <= limit {
-        return packed;
+        out.extend_from_slice(&packed);
+        return;
     }
 
     // Genuinely too big: drop records and set TC. Compressed, so the budget
     // holds as many of them as possible.
-    assemble_fitted(req, data, limit)
+    out.extend_from_slice(&assemble_fitted(req, data, limit));
+}
+
+/// A locally synthesised address answer: one A or AAAA record per address,
+/// every one owned by the question's own name.
+pub struct AddrAnswers<'a> {
+    /// The question name in uncompressed wire form, original case — what the
+    /// response echoes and what each record's owner field repeats.
+    pub owner: &'a [u8],
+    /// Addresses of the queried family only; anything else is skipped, which
+    /// would silently shrink the answer.
+    pub ips: &'a [std::net::IpAddr],
+    /// A or AAAA. Any other type belongs on the record path.
+    pub qtype: Rtype,
+    pub ttl: u32,
+    pub edns: Option<ClientEdns>,
+}
+
+/// Write an address answer straight to the wire: the records exist only as the
+/// bytes this appends, so answering a hosts hit touches no heap.
+///
+/// Returns false, leaving `out` empty, when the answer cannot be written this
+/// way — a question that cannot be echoed verbatim, an address that does not
+/// match `qtype`, more addresses than fit the inline ordering, or a result
+/// past `udp_limit`. The caller then builds records and goes through
+/// [`build_response_into`], which compresses and truncates.
+///
+/// Must stay byte-identical to that path for the same answer set and order,
+/// which `an_address_answer_matches_the_record_built_one` checks.
+pub fn build_addr_response_into<Octs: domain::dep::octseq::Octets + ?Sized>(
+    req: &Message<Octs>,
+    data: &AddrAnswers<'_>,
+    udp_limit: Option<u16>,
+    out: &mut Vec<u8>,
+) -> bool {
+    out.clear();
+    let n = data.ips.len();
+    if n == 0 || n > INLINE_ANSWER_ORDER {
+        return false;
+    }
+    let rdlen: usize = match data.qtype {
+        Rtype::A => 4,
+        Rtype::AAAA => 16,
+        _ => return false,
+    };
+    if data
+        .ips
+        .iter()
+        .any(|ip| ip.is_ipv4() != (data.qtype == Rtype::A))
+    {
+        return false;
+    }
+    let src = req.as_slice();
+    // `Message` guarantees at least a full header.
+    let Some(qend) = (match u16::from_be_bytes([src[4], src[5]]) {
+        1 => question_end(src),
+        _ => None,
+    }) else {
+        return false;
+    };
+    // Every record is owner + the fixed 10 bytes + rdata; bail before writing
+    // if that cannot fit, so an over-budget answer costs no copying.
+    let size = qend
+        + n * (data.owner.len() + 10 + rdlen)
+        + if data.edns.is_some() { OPT_WIRE_LEN } else { 0 };
+    if size > udp_limit.unwrap_or(u16::MAX) as usize {
+        return false;
+    }
+
+    out.reserve(size.max(512));
+    out.extend_from_slice(&src[..qend]); // header + question, verbatim
+                                         // QR=1, opcode and RD copied from the request, AA/TC cleared.
+    out[2] = 0x80 | (src[2] & 0x79);
+    // RA=1 (we offer recursion), Z/AD/CD cleared, NOERROR.
+    out[3] = 0x80;
+    out[6..12].fill(0);
+
+    // The record path orders answers in three tiers and shuffles the qtype
+    // matches; here every record matches, so that is one shuffle of the whole
+    // set — and none at all for a single record, which draws no randomness.
+    let mut order = [0usize; INLINE_ANSWER_ORDER];
+    for (i, slot) in order.iter_mut().enumerate().take(n) {
+        *slot = i;
+    }
+    if n > 1 {
+        crate::rng::shuffle(&mut order[..n]);
+    }
+    for &i in &order[..n] {
+        out.extend_from_slice(data.owner);
+        out.extend_from_slice(&data.qtype.to_int().to_be_bytes());
+        out.extend_from_slice(&Class::IN.to_int().to_be_bytes());
+        out.extend_from_slice(&data.ttl.to_be_bytes());
+        out.extend_from_slice(&(rdlen as u16).to_be_bytes());
+        match data.ips[i] {
+            std::net::IpAddr::V4(v4) => out.extend_from_slice(&v4.octets()),
+            std::net::IpAddr::V6(v6) => out.extend_from_slice(&v6.octets()),
+        }
+    }
+    let mut counts = [n as u16, 0, 0];
+    if let Some(edns) = data.edns {
+        write_opt(out, edns);
+        counts[2] = 1;
+    }
+    for (i, c) in counts.iter().enumerate() {
+        out[6 + i * 2..8 + i * 2].copy_from_slice(&c.to_be_bytes());
+    }
+    debug_assert_eq!(out.len(), size);
+    true
 }
 
 /// Append the response OPT, echoing the client's advertised UDP size (clamped
@@ -327,7 +642,7 @@ fn push_opt<T: Composer>(add: &mut AdditionalBuilder<T>, edns: ClientEdns) {
 fn fill<T: Composer>(mut ans: AnswerBuilder<T>, data: &ResponseData<'_>) -> T {
     match data.shuffle_qtype {
         Some(qtype) if data.answers.len() > 1 => {
-            for i in answer_order(data.answers, qtype) {
+            for &i in AnswerOrder::new(data.answers, qtype).as_slice() {
                 if push_record(&mut ans, &data.answers[i], data.ttl_override).is_err() {
                     break;
                 }
@@ -404,11 +719,13 @@ fn write_record(out: &mut Vec<u8>, r: &OwnedRecord, ttl_override: Option<u32>) -
 /// no flags — DO is never echoed, see [`ClientEdns`]). Exactly [`OPT_WIRE_LEN`]
 /// bytes.
 fn write_opt(out: &mut Vec<u8>, edns: ClientEdns) {
-    out.push(0);
-    out.extend_from_slice(&Rtype::OPT.to_int().to_be_bytes());
-    out.extend_from_slice(&edns.udp_size.clamp(512, MAX_UDP_RESPONSE).to_be_bytes());
-    out.extend_from_slice(&0u32.to_be_bytes());
-    out.extend_from_slice(&0u16.to_be_bytes());
+    // Root owner(1) + type(2) + advertised size(2) + ttl(4, all zero: rcode
+    // extension, version and flags) + rdlen(2, no options), staged in one
+    // stack buffer like a record's fixed fields.
+    let mut opt = [0u8; 11];
+    opt[1..3].copy_from_slice(&Rtype::OPT.to_int().to_be_bytes());
+    opt[3..5].copy_from_slice(&edns.udp_size.clamp(512, MAX_UDP_RESPONSE).to_be_bytes());
+    out.extend_from_slice(&opt);
 }
 
 /// Full build, no name compression — the fast, common path.
@@ -421,10 +738,14 @@ fn write_opt(out: &mut Vec<u8>, edns: ClientEdns) {
 /// Must stay byte-identical to the `MessageBuilder` path below, which
 /// `assemble_matches_the_builder` checks. Shapes this cannot echo verbatim
 /// (more than one question, or a question it cannot walk) go to that path.
-fn assemble<Octs: domain::dep::octseq::Octets + ?Sized>(
+///
+/// Replaces the contents of `out`.
+fn assemble_into<Octs: domain::dep::octseq::Octets + ?Sized>(
     req: &Message<Octs>,
     data: &ResponseData<'_>,
-) -> Vec<u8> {
+    out: &mut Vec<u8>,
+) {
+    out.clear();
     let src = req.as_slice();
     // `Message` guarantees at least a full header.
     let qend = match u16::from_be_bytes([src[4], src[5]]) {
@@ -433,10 +754,16 @@ fn assemble<Octs: domain::dep::octseq::Octets + ?Sized>(
         _ => None,
     };
     let Some(qend) = qend else {
-        return fill(start(MessageBuilder::new_vec(), req, data.rcode), data);
+        out.extend_from_slice(&fill(
+            start(MessageBuilder::new_vec(), req, data.rcode),
+            data,
+        ));
+        return;
     };
 
-    let mut out = Vec::with_capacity(512);
+    // A new buffer starts out big enough for a typical response; a reused one
+    // already is.
+    out.reserve(512);
     out.extend_from_slice(&src[..qend]); // header + question, verbatim
                                          // QR=1, opcode and RD copied from the request, AA/TC cleared.
     out[2] = 0x80 | (src[2] & 0x79);
@@ -447,30 +774,29 @@ fn assemble<Octs: domain::dep::octseq::Octets + ?Sized>(
     let mut counts = [0u16; 3]; // AN, NS, AR
     match data.shuffle_qtype {
         Some(qtype) if data.answers.len() > 1 => {
-            for i in answer_order(data.answers, qtype) {
-                counts[0] += u16::from(write_record(&mut out, &data.answers[i], data.ttl_override));
+            for &i in AnswerOrder::new(data.answers, qtype).as_slice() {
+                counts[0] += u16::from(write_record(out, &data.answers[i], data.ttl_override));
             }
         }
         _ => {
             for r in data.answers {
-                counts[0] += u16::from(write_record(&mut out, r, data.ttl_override));
+                counts[0] += u16::from(write_record(out, r, data.ttl_override));
             }
         }
     }
     for r in data.authority {
-        counts[1] += u16::from(write_record(&mut out, r, data.ttl_override));
+        counts[1] += u16::from(write_record(out, r, data.ttl_override));
     }
     for r in data.additional {
-        counts[2] += u16::from(write_record(&mut out, r, data.ttl_override));
+        counts[2] += u16::from(write_record(out, r, data.ttl_override));
     }
     if let Some(edns) = data.edns {
-        write_opt(&mut out, edns);
+        write_opt(out, edns);
         counts[2] += 1;
     }
     for (i, c) in counts.iter().enumerate() {
         out[6 + i * 2..8 + i * 2].copy_from_slice(&c.to_be_bytes());
     }
-    out
 }
 
 /// Full build with name compression, for a response that overflowed its budget.
@@ -497,7 +823,9 @@ fn assemble_fitted<Octs: domain::dep::octseq::Octets + ?Sized>(
     ans.header_mut().set_tc(true);
 
     let order: Vec<usize> = match data.shuffle_qtype {
-        Some(qtype) if data.answers.len() > 1 => answer_order(data.answers, qtype),
+        Some(qtype) if data.answers.len() > 1 => {
+            AnswerOrder::new(data.answers, qtype).as_slice().to_vec()
+        }
         _ => (0..data.answers.len()).collect(),
     };
     for i in order {
@@ -552,36 +880,68 @@ fn rr_upper_bound(r: &OwnedRecord) -> usize {
     owner_len + 10 + rdata_len
 }
 
-/// Three-tier answer push order per RFC 1034: CNAMEs
-/// first (in original order), then qtype matches (shuffled for load balancing),
-/// then everything else (original order). Built as a single index Vec — one
-/// allocation, with the match range shuffled in place — instead of a Vec per
-/// tier plus a collect.
-fn answer_order(answers: &[OwnedRecord], qtype: Rtype) -> Vec<usize> {
-    let tier = |r: &OwnedRecord| {
-        let t = r.rtype();
-        if t == Rtype::CNAME {
-            0u8
-        } else if t == qtype {
-            1
+/// Answer sets up to this size are ordered without touching the heap.
+const INLINE_ANSWER_ORDER: usize = 32;
+
+/// Three-tier answer push order per RFC 1034: CNAMEs first (in original
+/// order), then qtype matches (shuffled for load balancing), then everything
+/// else (original order). One index list with the match range shuffled in
+/// place, held inline for a typical answer set so ordering one does not
+/// allocate.
+struct AnswerOrder {
+    inline: [usize; INLINE_ANSWER_ORDER],
+    spill: Vec<usize>,
+    len: usize,
+}
+
+impl AnswerOrder {
+    fn new(answers: &[OwnedRecord], qtype: Rtype) -> Self {
+        let len = answers.len();
+        let mut order = AnswerOrder {
+            inline: [0; INLINE_ANSWER_ORDER],
+            spill: Vec::new(),
+            len,
+        };
+        let slots: &mut [usize] = if len <= INLINE_ANSWER_ORDER {
+            &mut order.inline[..len]
         } else {
-            2
-        }
-    };
-    let mut order = Vec::with_capacity(answers.len());
-    let mut bounds = [0usize; 2]; // end of the CNAME tier, end of the match tier
-    for want in 0..3u8 {
-        for (i, r) in answers.iter().enumerate() {
-            if tier(r) == want {
-                order.push(i);
+            order.spill.resize(len, 0);
+            &mut order.spill
+        };
+        let tier = |r: &OwnedRecord| {
+            let t = r.rtype();
+            if t == Rtype::CNAME {
+                0u8
+            } else if t == qtype {
+                1
+            } else {
+                2
+            }
+        };
+        let mut filled = 0;
+        let mut bounds = [0usize; 2]; // end of the CNAME tier, end of the match tier
+        for want in 0..3u8 {
+            for (i, r) in answers.iter().enumerate() {
+                if tier(r) == want {
+                    slots[filled] = i;
+                    filled += 1;
+                }
+            }
+            if want < 2 {
+                bounds[want as usize] = filled;
             }
         }
-        if want < 2 {
-            bounds[want as usize] = order.len();
+        crate::rng::shuffle(&mut slots[bounds[0]..bounds[1]]);
+        order
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        if self.len <= INLINE_ANSWER_ORDER {
+            &self.inline[..self.len]
+        } else {
+            &self.spill
         }
     }
-    crate::rng::shuffle(&mut order[bounds[0]..bounds[1]]);
-    order
 }
 
 fn push_record<T: Composer, B: domain::base::message_builder::RecordSectionBuilder<T>>(
@@ -607,7 +967,7 @@ pub fn build_upstream_query(q: &QueryInfo) -> Vec<u8> {
         h.set_random_id();
     }
     let mut question = builder.question();
-    let _ = question.push((&q.qname, q.qtype, q.qclass));
+    let _ = question.push((q.qname(), q.qtype, q.qclass));
     let mut add = question.additional();
     let _ = add.opt(|opt| {
         opt.set_udp_payload_size(OUR_UDP_SIZE);
@@ -653,11 +1013,14 @@ mod tests {
     fn parse_extract_build_roundtrip() {
         let req_bytes = make_query("Example.COM.", Rtype::A);
         let req = Message::from_octets(req_bytes.clone()).unwrap();
-        let (info, qname_lower) = extract_query(&req).expect("has question");
+        let mut scratch = QueryScratch::new();
+        let info = extract_query(&req, &mut scratch).expect("has question");
         assert_eq!(info.qtype, Rtype::A);
         assert_eq!(info.qclass, Class::IN);
-        // Cache key is lower-cased.
-        assert_eq!(qname_lower, b"\x07example\x03com\x00");
+        // The name is kept as sent, next to the lower-cased copy the cache
+        // key uses.
+        assert_eq!(info.qname().as_slice(), b"\x07Example\x03COM\x00");
+        assert_eq!(info.lower(), b"\x07example\x03com\x00");
 
         // Parse a fake upstream response, own its records, rebuild with TTL=1.
         let resp = parse(fake_a_response("example.com.", 3600)).unwrap();
@@ -690,7 +1053,8 @@ mod tests {
     #[test]
     fn upstream_query_has_opt_and_rd() {
         let req = Message::from_octets(make_query("example.com.", Rtype::AAAA)).unwrap();
-        let (info, _) = extract_query(&req).unwrap();
+        let mut scratch = QueryScratch::new();
+        let info = extract_query(&req, &mut scratch).unwrap();
         let q = parse(build_upstream_query(&info)).unwrap();
         assert!(q.header().rd());
         assert!(q.opt().is_some());
@@ -714,7 +1078,8 @@ mod tests {
         })
         .unwrap();
         let req = Message::from_octets(add.finish()).unwrap();
-        let (info, _) = extract_query(&req).unwrap();
+        let mut scratch = QueryScratch::new();
+        let info = extract_query(&req, &mut scratch).unwrap();
 
         let upq = parse(build_upstream_query(&info)).unwrap();
         assert!(!upq.opt().unwrap().dnssec_ok(), "DO must not go upstream");
@@ -760,7 +1125,8 @@ mod tests {
             ), // rest
             a_record("a.", 2), // A (qtype match)
         ];
-        let order = answer_order(&recs, Rtype::A);
+        let order = AnswerOrder::new(&recs, Rtype::A);
+        let order = order.as_slice();
         assert_eq!(order.len(), 4);
         assert_eq!(order[0], 0, "CNAME goes first");
         assert_eq!(order[3], 2, "non-matching rest goes last");
@@ -847,7 +1213,8 @@ mod tests {
             (200, 512),                           // under the RFC 1035 floor
         ] {
             let req = Message::from_octets(query_with_edns(advertised)).unwrap();
-            let (info, _) = extract_query(&req).unwrap();
+            let mut scratch = QueryScratch::new();
+            let info = extract_query(&req, &mut scratch).unwrap();
             let data = ResponseData {
                 rcode: Rcode::NOERROR,
                 answers: &[],
@@ -889,8 +1256,9 @@ mod tests {
             let len = (rnd() % 96) as usize;
             let bytes: Vec<u8> = (0..len).map(|_| (rnd() & 0xff) as u8).collect();
             if let Some(msg) = parse(bytes) {
-                if let Some((info, _)) = extract_query(&msg) {
-                    let _ = info.qname.to_string();
+                let mut scratch = QueryScratch::new();
+                if let Some(info) = extract_query(&msg, &mut scratch) {
+                    let _ = info.qname().to_string();
                 }
                 let _ = answers_owned(&msg);
                 let _ = authority_owned(&msg);
@@ -908,7 +1276,7 @@ mod tests {
                 bytes[idx] = (rnd() & 0xff) as u8;
             }
             if let Some(msg) = parse(bytes) {
-                let _ = extract_query(&msg);
+                let _ = extract_query(&msg, &mut QueryScratch::new());
                 let _ = answers_owned(&msg);
                 let _ = authority_owned(&msg);
                 let _ = additional_owned(&msg);
@@ -1188,6 +1556,7 @@ mod tests {
         ];
 
         let mut checked = 0;
+        let mut reused = Vec::new();
         for raw in &requests {
             let req = Message::from_octets(raw.clone()).unwrap();
             for rcode in [
@@ -1220,7 +1589,11 @@ mod tests {
                                 // disagree on record order by design.
                                 shuffle_qtype: None,
                             };
-                            let fast = assemble(&req, &data);
+                            // One buffer across every combination: a reused
+                            // buffer must never leak bytes from a longer
+                            // earlier response.
+                            assemble_into(&req, &data, &mut reused);
+                            let fast = reused.clone();
                             let slow =
                                 fill(start(MessageBuilder::new_vec(), &req, data.rcode), &data);
                             assert_eq!(
@@ -1269,7 +1642,9 @@ mod tests {
             rrs.sort();
             (msg.as_slice()[..12].to_vec(), rrs)
         };
-        let fast = sorted(assemble(&req, &data));
+        let mut fast = Vec::new();
+        assemble_into(&req, &data, &mut fast);
+        let fast = sorted(fast);
         let slow = sorted(fill(
             start(MessageBuilder::new_vec(), &req, data.rcode),
             &data,
@@ -1294,7 +1669,7 @@ mod tests {
 
         let mut check = |bytes: Vec<u8>| {
             if let Some(msg) = parse(bytes.clone()) {
-                if opt_after_question(&bytes).is_some() {
+                if opt_after_question(&bytes, None).is_some() {
                     fast_used += 1;
                 }
                 let fast = edns_of(&msg).map(|e| e.udp_size);
@@ -1355,7 +1730,7 @@ mod tests {
             for _ in 0..1 + rnd() % 3 {
                 bytes[12 + (rnd() as usize % (n - 12))] = (rnd() & 0xff) as u8;
             }
-            if opt_after_question(&bytes).is_some() {
+            if opt_after_question(&bytes, None).is_some() {
                 fast_seen += 1;
             }
             check(bytes);
@@ -1386,7 +1761,8 @@ mod tests {
     #[test]
     fn a_client_asking_for_more_than_the_ceiling_is_held_to_it() {
         let req = Message::from_octets(query_with_edns(8192)).unwrap();
-        let (info, _) = extract_query(&req).unwrap();
+        let mut scratch = QueryScratch::new();
+        let info = extract_query(&req, &mut scratch).unwrap();
         let answers: Vec<OwnedRecord> = (0..200).map(|i| a_record(LONG_NAME, i as u8)).collect();
         let data = ResponseData {
             rcode: Rcode::NOERROR,
@@ -1407,5 +1783,518 @@ mod tests {
         assert!(msg.header().tc(), "the client must be told to use TCP");
         // What we advertise back agrees with what we were willing to send.
         assert_eq!(msg.opt().unwrap().udp_payload_size(), MAX_UDP_RESPONSE);
+    }
+
+    /// A query with the given QNAME bytes taken as they are (not validated),
+    /// and an OPT advertising `udp` when given.
+    fn raw_query(qname: &[u8], qtype: u16, udp: Option<u16>) -> Vec<u8> {
+        let mut m = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0];
+        m.push(u8::from(udp.is_some()));
+        m.extend_from_slice(qname);
+        m.extend_from_slice(&qtype.to_be_bytes());
+        m.extend_from_slice(&1u16.to_be_bytes());
+        if let Some(size) = udp {
+            m.extend_from_slice(&[0, 0, 41]);
+            m.extend_from_slice(&size.to_be_bytes());
+            m.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        }
+        m
+    }
+
+    /// Everything `extract_query` reports, as owned values.
+    type Extracted = (Vec<u8>, Vec<u8>, u64, Rtype, Class, Option<u16>);
+
+    /// The general parser's reading of a query: the `domain` question
+    /// parser, its name flattened and lower-cased, and `edns_of`.
+    fn reference_extract(msg: &Message<&[u8]>) -> Option<Extracted> {
+        let q = msg.sole_question().ok()?;
+        let name = q.qname().to_vec().as_slice().to_vec();
+        let mut lower = name.clone();
+        lower.make_ascii_lowercase();
+        let hash = crate::util::hash(&lower);
+        Some((
+            name,
+            lower,
+            hash,
+            q.qtype(),
+            q.qclass(),
+            edns_of(msg).map(|e| e.udp_size),
+        ))
+    }
+
+    #[derive(Default)]
+    struct Tally {
+        plain: usize,
+        flattened: usize,
+        rejected: usize,
+    }
+
+    fn compare_extract(bytes: &[u8], tally: &mut Tally) {
+        let Ok(msg) = Message::from_octets(bytes) else {
+            return;
+        };
+        let want = reference_extract(&msg);
+        let mut scratch = QueryScratch::new();
+        let got = extract_query(&msg, &mut scratch);
+        let got_fields = got.map(|i| {
+            (
+                i.qname().as_slice().to_vec(),
+                i.lower().to_vec(),
+                i.name_hash,
+                i.qtype,
+                i.qclass,
+                i.client_edns.map(|e| e.udp_size),
+            )
+        });
+        assert_eq!(got_fields, want, "extract_query disagrees on {bytes:?}");
+        match got {
+            None => tally.rejected += 1,
+            Some(info) => {
+                assert_eq!(info.qname_owned().as_slice(), info.qname().as_slice());
+                if matches!(scan_question(bytes), QuestionScan::General) {
+                    tally.flattened += 1;
+                } else {
+                    tally.plain += 1;
+                }
+            }
+        }
+    }
+
+    /// `extract_query` reads the question in one pass straight off the wire,
+    /// so it has to see exactly what the general parser sees: the same
+    /// verdict, name, hash, type, class and EDNS state, on well-formed queries,
+    /// on names at the length limits, on every truncation, on compression
+    /// pointers, and on corrupted bytes.
+    #[test]
+    fn extract_query_agrees_with_the_domain_parser() {
+        let mut state: u64 = 0x0dd_ba11_c0ff_ee42;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut tally = Tally::default();
+
+        let mut names: Vec<Vec<u8>> = vec![
+            b"\x00".to_vec(),
+            b"\x01a\x00".to_vec(),
+            b"\x07Example\x03COM\x00".to_vec(),
+            b"\x03w-w\x05ex_mp\x02l\xe9\x00".to_vec(),
+        ];
+        // 255 octets is the longest name; 256 is not a name.
+        for last in [61usize, 62] {
+            let mut n = Vec::new();
+            for _ in 0..3 {
+                n.push(63);
+                n.extend_from_slice(&[b'x'; 63]);
+            }
+            n.push(last as u8);
+            n.extend(std::iter::repeat_n(b'Y', last));
+            n.push(0);
+            names.push(n);
+        }
+        // 63 octets is the longest label; a length byte of 64 is a reserved
+        // label type.
+        names.push([&[63u8][..], &[b'm'; 63][..], &[0u8][..]].concat());
+        names.push([&[64u8][..], &[b'm'; 64][..], &[0u8][..]].concat());
+        // Compression pointers: into the header (where the bytes may spell a
+        // name), back onto the name itself, and forward.
+        names.push(b"\x03www\xc0\x0b".to_vec());
+        names.push(b"\xc0\x0b".to_vec());
+        names.push(b"\x03www\xc0\x0c".to_vec());
+        names.push(b"\x03www\xc0\x40".to_vec());
+        names.push(b"\x03www\x80\x00".to_vec());
+        // Ordinary names with random labels in random case.
+        for _ in 0..64 {
+            let mut n = Vec::new();
+            for _ in 0..1 + rnd() % 5 {
+                let len = 1 + (rnd() % 20) as usize;
+                n.push(len as u8);
+                for _ in 0..len {
+                    n.push(b"abcXYZ019-_"[(rnd() % 11) as usize]);
+                }
+            }
+            n.push(0);
+            names.push(n);
+        }
+
+        for name in &names {
+            for udp in [None, Some(1232)] {
+                let q = raw_query(name, 1, udp);
+                compare_extract(&q, &mut tally);
+                for cut in 12..q.len() {
+                    compare_extract(&q[..cut], &mut tally);
+                }
+            }
+        }
+
+        for round in 0..120_000usize {
+            let name = &names[round % names.len()];
+            let udp = (round % 2 == 0).then_some(1232);
+            let mut q = raw_query(name, (rnd() & 0xffff) as u16, udp);
+            for _ in 0..1 + rnd() % 3 {
+                let at = if round % 5 == 0 {
+                    4 + (rnd() % 8) as usize
+                } else {
+                    12 + (rnd() as usize % (q.len() - 12))
+                };
+                q[at] = (rnd() & 0xff) as u8;
+            }
+            if round % 7 == 0 {
+                let at = 12 + rnd() as usize % (q.len() - 12);
+                q[at] = 0xC0 | (rnd() & 0x3f) as u8;
+            }
+            compare_extract(&q, &mut tally);
+        }
+
+        assert!(tally.plain > 30_000, "only {} plain names", tally.plain);
+        assert!(
+            tally.flattened >= 2,
+            "only {} flattened names",
+            tally.flattened
+        );
+        assert!(
+            tally.rejected > 20_000,
+            "only {} rejections",
+            tally.rejected
+        );
+    }
+
+    /// Past the inline capacity the order spills to the heap; either way it is
+    /// a permutation in three tiers: CNAMEs in their original order, the
+    /// qtype matches, then the rest in their original order.
+    #[test]
+    fn answer_order_holds_its_tiers_past_the_inline_capacity() {
+        use domain::rdata::{Aaaa, Cname};
+        let n = |s: &str| Name::<Vec<u8>>::from_str(s).unwrap();
+        let recs: Vec<OwnedRecord> = (0..INLINE_ANSWER_ORDER * 2 + 3)
+            .map(|i| match i % 3 {
+                0 => OwnedRecord::new(
+                    n("a."),
+                    Class::IN,
+                    Ttl::from_secs(60),
+                    AllRecordData::Cname(Cname::new(n("b."))),
+                ),
+                1 => a_record("a.", i as u8),
+                _ => OwnedRecord::new(
+                    n("a."),
+                    Class::IN,
+                    Ttl::from_secs(60),
+                    AllRecordData::Aaaa(Aaaa::new("::1".parse().unwrap())),
+                ),
+            })
+            .collect();
+        let tier = |r: &OwnedRecord| match r.rtype() {
+            Rtype::CNAME => 0,
+            Rtype::A => 1,
+            _ => 2,
+        };
+        for len in [2, INLINE_ANSWER_ORDER, INLINE_ANSWER_ORDER + 1, recs.len()] {
+            let answers = &recs[..len];
+            let order = AnswerOrder::new(answers, Rtype::A);
+            let order = order.as_slice();
+            let mut sorted = order.to_vec();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..len).collect::<Vec<_>>(), "len={len}");
+            let tiers: Vec<u8> = order.iter().map(|&i| tier(&answers[i])).collect();
+            assert!(tiers.windows(2).all(|w| w[0] <= w[1]), "len={len}");
+            for fixed in [0u8, 2] {
+                let kept: Vec<usize> = order
+                    .iter()
+                    .copied()
+                    .filter(|&i| tier(&answers[i]) == fixed)
+                    .collect();
+                assert!(kept.windows(2).all(|w| w[0] < w[1]), "len={len}");
+            }
+        }
+    }
+
+    /// One buffer reused across responses from every build path — plain,
+    /// compressed and truncated, long ones followed by short ones — must hold
+    /// exactly what a fresh build produces each time.
+    /// (owner, type, class, ttl, rdata) per record, and the offset the walk
+    /// ended at — uncompressed messages only, which is what both builds emit
+    /// while they stay inside the budget.
+    /// owner, type, class, ttl, rdata.
+    type WireRecord = (Vec<u8>, u16, u16, u32, Vec<u8>);
+    fn records_of(m: &[u8]) -> (Vec<WireRecord>, usize) {
+        let mut i = question_end(m).expect("one walkable question");
+        let count: usize = [6usize, 8, 10]
+            .iter()
+            .map(|&at| usize::from(u16::from_be_bytes([m[at], m[at + 1]])))
+            .sum();
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let name_at = i;
+            while m[i] != 0 {
+                assert_eq!(m[i] & 0xC0, 0, "uncompressed names only");
+                i += 1 + usize::from(m[i]);
+            }
+            i += 1;
+            let owner = m[name_at..i].to_vec();
+            let rtype = u16::from_be_bytes([m[i], m[i + 1]]);
+            let class = u16::from_be_bytes([m[i + 2], m[i + 3]]);
+            let ttl = u32::from_be_bytes([m[i + 4], m[i + 5], m[i + 6], m[i + 7]]);
+            let rdlen = usize::from(u16::from_be_bytes([m[i + 8], m[i + 9]]));
+            i += 10;
+            out.push((owner, rtype, class, ttl, m[i..i + rdlen].to_vec()));
+            i += rdlen;
+        }
+        (out, i)
+    }
+
+    #[test]
+    fn the_negative_ceiling_is_the_smaller_of_the_soa_ttl_and_its_minimum() {
+        use domain::base::Serial;
+        use domain::rdata::Soa;
+        let soa = |ttl: u32, minimum: u32| {
+            let n = |s: &str| Name::<Vec<u8>>::from_str(s).unwrap();
+            OwnedRecord::new(
+                n("example.com."),
+                Class::IN,
+                Ttl::from_secs(ttl),
+                OwnedData::Soa(Soa::new(
+                    n("ns.example.com."),
+                    n("hostmaster.example.com."),
+                    Serial(1),
+                    Ttl::from_secs(7200),
+                    Ttl::from_secs(3600),
+                    Ttl::from_secs(1_209_600),
+                    Ttl::from_secs(minimum),
+                )),
+            )
+        };
+        // RFC 2308 §5: whichever of the two is smaller.
+        assert_eq!(negative_ttl_cap(&[soa(900, 300)]), Some(300));
+        assert_eq!(negative_ttl_cap(&[soa(100, 3600)]), Some(100));
+        assert_eq!(negative_ttl_cap(&[soa(0, 300)]), Some(0));
+        // An answer with no SOA has no negative lifetime to cap.
+        assert_eq!(negative_ttl_cap(&[]), None);
+        assert_eq!(
+            negative_ttl_cap(&[OwnedRecord::new(
+                Name::<Vec<u8>>::from_str("example.com.").unwrap(),
+                Class::IN,
+                Ttl::from_secs(60),
+                OwnedData::A(A::from_octets(1, 2, 3, 4)),
+            )]),
+            None
+        );
+    }
+
+    #[test]
+    fn an_address_answer_matches_the_record_built_one() {
+        let v4 = |i: usize| std::net::IpAddr::V4(Ipv4Addr::new(10, 1, (i / 256) as u8, i as u8));
+        let v6 = |i: usize| {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001, 0xdb8, 0, 0, 0, 0, 1, i as u16,
+            ))
+        };
+        // Mixed case in the question: the answer echoes the question's own
+        // bytes, and every record owner repeats them.
+        for name in ["blocked.ads.example.", "Blocked.Ads.EXAMPLE.", LONG_NAME] {
+            for (qtype, mk) in [
+                (Rtype::A, &v4 as &dyn Fn(usize) -> std::net::IpAddr),
+                (Rtype::AAAA, &v6),
+            ] {
+                for count in [1usize, 2, 5, 8, 32] {
+                    for edns in [None, Some(ClientEdns { udp_size: 1232 })] {
+                        let req = Message::from_octets(make_query(name, qtype)).unwrap();
+                        let ips: Vec<std::net::IpAddr> = (0..count).map(mk).collect();
+                        let owner_name = req.first_question().unwrap().qname().to_vec();
+                        let owner = owner_name.as_slice();
+                        let answers: Vec<OwnedRecord> = ips
+                            .iter()
+                            .map(|ip| {
+                                let data = match ip {
+                                    std::net::IpAddr::V4(a) => {
+                                        let o = a.octets();
+                                        OwnedData::A(A::from_octets(o[0], o[1], o[2], o[3]))
+                                    }
+                                    std::net::IpAddr::V6(a) => {
+                                        OwnedData::Aaaa(domain::rdata::Aaaa::new(*a))
+                                    }
+                                };
+                                OwnedRecord::new(
+                                    owner_name.clone(),
+                                    Class::IN,
+                                    Ttl::from_secs(300),
+                                    data,
+                                )
+                            })
+                            .collect();
+                        let data = ResponseData {
+                            rcode: Rcode::NOERROR,
+                            answers: &answers,
+                            authority: &[],
+                            additional: &[],
+                            ttl_override: None,
+                            edns,
+                            shuffle_qtype: Some(qtype),
+                        };
+                        let addrs = AddrAnswers {
+                            owner,
+                            ips: &ips,
+                            qtype,
+                            ttl: 300,
+                            edns,
+                        };
+                        let via_records = build_response(&req, &data, None);
+                        let mut direct = Vec::new();
+                        let label = format!("{name} {qtype} x{count} edns={}", edns.is_some());
+                        assert!(
+                            build_addr_response_into(&req, &addrs, None, &mut direct),
+                            "{label}"
+                        );
+                        // Header (flags, rcode) and every section count.
+                        assert_eq!(direct[..12], via_records[..12], "{label}");
+                        assert_eq!(direct.len(), via_records.len(), "{label}");
+                        let (mut a, end_a) = records_of(&direct);
+                        let (mut b, end_b) = records_of(&via_records);
+                        assert_eq!(end_a, direct.len(), "{label}: trailing bytes");
+                        assert_eq!(end_b, via_records.len(), "{label}");
+                        // Order inside the set is randomised by both builds.
+                        a.sort();
+                        b.sort();
+                        assert_eq!(a, b, "{label}");
+                        if count == 1 {
+                            // Nothing to shuffle, so the bytes must match too.
+                            assert_eq!(direct, via_records, "{label}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_address_writer_declines_what_it_cannot_write() {
+        let req = Message::from_octets(make_query("blocked.ads.example.", Rtype::A)).unwrap();
+        let owner_name = req.first_question().unwrap().qname().to_vec();
+        let owner = owner_name.as_slice();
+        let v4: Vec<std::net::IpAddr> = (0..4)
+            .map(|i| std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, i)))
+            .collect();
+        let big: Vec<std::net::IpAddr> = (0..INLINE_ANSWER_ORDER + 1)
+            .map(|i| std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 1, i as u8)))
+            .collect();
+        let v6 = vec![std::net::IpAddr::V6("2001:db8::1".parse().unwrap())];
+        let base = AddrAnswers {
+            owner,
+            ips: &v4,
+            qtype: Rtype::A,
+            ttl: 300,
+            edns: None,
+        };
+        let cases: [(&str, AddrAnswers<'_>, Option<u16>); 5] = [
+            ("no addresses", AddrAnswers { ips: &[], ..base }, None),
+            (
+                "past the inline order",
+                AddrAnswers { ips: &big, ..base },
+                None,
+            ),
+            (
+                "address of the other family",
+                AddrAnswers { ips: &v6, ..base },
+                None,
+            ),
+            (
+                "a type this cannot synthesise",
+                AddrAnswers {
+                    qtype: Rtype::MX,
+                    ..base
+                },
+                None,
+            ),
+            ("past the datagram budget", base, Some(60)),
+        ];
+        for (label, data, limit) in cases {
+            let mut out = vec![0xAA; 8];
+            assert!(
+                !build_addr_response_into(&req, &data, limit, &mut out),
+                "{label}: should have declined"
+            );
+            assert!(out.is_empty(), "{label}: left bytes for the caller to send");
+        }
+        // The budget case is one the record path must still answer.
+        let answers = [OwnedRecord::new(
+            owner_name.clone(),
+            Class::IN,
+            Ttl::from_secs(300),
+            OwnedData::A(A::from_octets(10, 0, 0, 1)),
+        )];
+        let data = ResponseData {
+            rcode: Rcode::NOERROR,
+            answers: &answers,
+            authority: &[],
+            additional: &[],
+            ttl_override: None,
+            edns: None,
+            shuffle_qtype: Some(Rtype::A),
+        };
+        assert!(!build_response(&req, &data, Some(60)).is_empty());
+    }
+
+    #[test]
+    fn a_reused_response_buffer_matches_fresh_builds() {
+        let req = Message::from_octets(make_query(LONG_NAME, Rtype::A)).unwrap();
+        let mut reused = Vec::new();
+        for count in [1usize, 10, 40, 2, 5000, 1, 40, 1] {
+            let answers: Vec<OwnedRecord> = (0..count)
+                .map(|i| a_record(LONG_NAME, (i % 256) as u8))
+                .collect();
+            for limit in [Some(512u16), None] {
+                let data = ResponseData {
+                    rcode: Rcode::NOERROR,
+                    answers: &answers,
+                    authority: &[],
+                    additional: &[],
+                    ttl_override: None,
+                    edns: Some(ClientEdns { udp_size: 1232 }),
+                    shuffle_qtype: None,
+                };
+                build_response_into(&req, &data, limit, &mut reused);
+                assert_eq!(
+                    reused,
+                    build_response(&req, &data, limit),
+                    "count={count} limit={limit:?}"
+                );
+                // Independently of how the fresh build came out: within budget,
+                // and exactly as long as the records its header counts.
+                let budget = limit.map_or(usize::from(u16::MAX), usize::from);
+                assert!(reused.len() <= budget, "count={count} limit={limit:?}");
+                assert_eq!(
+                    counted_len(&reused),
+                    Some(reused.len()),
+                    "count={count} limit={limit:?}"
+                );
+            }
+        }
+    }
+
+    /// The length a message's header accounts for: the header, its one
+    /// question, then every counted record, walked on the wire.
+    fn counted_len(m: &[u8]) -> Option<usize> {
+        let mut i = question_end(m)?;
+        let records: usize = [6usize, 8, 10]
+            .iter()
+            .map(|&at| usize::from(u16::from_be_bytes([m[at], m[at + 1]])))
+            .sum();
+        for _ in 0..records {
+            loop {
+                let len = usize::from(*m.get(i)?);
+                if len & 0xC0 == 0xC0 {
+                    i += 2;
+                    break;
+                }
+                i += 1 + len;
+                if len == 0 {
+                    break;
+                }
+            }
+            let rdlen = usize::from(u16::from_be_bytes([*m.get(i + 8)?, *m.get(i + 9)?]));
+            i += 10 + rdlen;
+        }
+        Some(i)
     }
 }

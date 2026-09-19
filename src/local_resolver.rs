@@ -62,87 +62,89 @@ fn unmap(addr: IpAddr) -> IpAddr {
     }
 }
 
-/// Reports whether a PTR query name corresponds to a private/loopback/
-/// link-local address.
-pub fn is_private_ptr(qname: &str) -> bool {
-    let mut qname = qname.to_ascii_lowercase();
-    // Tolerate a missing root dot (some name renderings omit it) so the
-    // `.in-addr.arpa.` / `.ip6.arpa.` suffix checks still match.
-    if !qname.ends_with('.') {
-        qname.push('.');
-    }
+/// Labels in the longest reverse name: 32 nibbles, then `ip6` and `arpa`.
+const MAX_REVERSE_LABELS: usize = 34;
 
-    if let Some(trimmed) = qname.strip_suffix(".in-addr.arpa.") {
-        return match parse_ipv4_arpa_labels(trimmed) {
-            Some(octets) => {
-                let a = Ipv4Addr::from(octets);
-                a.is_private() || a.is_link_local() || a.is_loopback()
-            }
-            None => false,
+/// Reports whether a PTR query name, given in lower-cased wire form, is the
+/// reverse name of a private, loopback, or link-local address.
+pub fn is_private_ptr_name(name: &[u8]) -> bool {
+    let mut labels: [&[u8]; MAX_REVERSE_LABELS] = [&[]; MAX_REVERSE_LABELS];
+    let mut count = 0;
+    let mut i = 0;
+    loop {
+        let Some(&len) = name.get(i) else {
+            return false;
         };
-    }
-
-    if let Some(trimmed) = qname.strip_suffix(".ip6.arpa.") {
-        return match parse_ipv6_arpa_labels(trimmed) {
-            Some(bytes) => v6_is_private_special(Ipv6Addr::from(bytes)),
-            None => false,
+        let len = usize::from(len);
+        if len == 0 {
+            break;
+        }
+        if count == MAX_REVERSE_LABELS {
+            return false;
+        }
+        let Some(label) = name.get(i + 1..i + 1 + len) else {
+            return false;
         };
+        labels[count] = label;
+        count += 1;
+        i += 1 + len;
     }
-
-    false
+    let Some((&b"arpa", rest)) = labels[..count].split_last() else {
+        return false;
+    };
+    match rest.split_last() {
+        Some((&b"in-addr", addr)) => ipv4_from_arpa_labels(addr)
+            .is_some_and(|a| a.is_private() || a.is_link_local() || a.is_loopback()),
+        Some((&b"ip6", addr)) => ipv6_from_arpa_labels(addr).is_some_and(v6_is_private_special),
+        _ => false,
+    }
 }
 
-/// Parse the reversed dotted-octet portion of an in-addr.arpa query (e.g.
-/// `132.10.10.10`) into a big-endian `[u8; 4]`. Rejects wrong label counts,
-/// empty/over-long labels, and octets > 255.
-pub fn parse_ipv4_arpa_labels(s: &str) -> Option<[u8; 4]> {
+/// The address named by the labels in front of `in-addr.arpa` (e.g. `132`,
+/// `10`, `10`, `10`). Rejects a label count other than four, empty or
+/// over-long labels, and octets over 255.
+fn ipv4_from_arpa_labels(labels: &[&[u8]]) -> Option<Ipv4Addr> {
+    if labels.len() != 4 {
+        return None;
+    }
     let mut out = [0u8; 4];
-    let mut count = 0;
-    for (i, label) in s.split('.').enumerate() {
-        if i >= 4
-            || label.is_empty()
-            || label.len() > 3
-            || !label.bytes().all(|c| c.is_ascii_digit())
-        {
+    for (i, label) in labels.iter().enumerate() {
+        if label.is_empty() || label.len() > 3 || !label.iter().all(u8::is_ascii_digit) {
             return None;
         }
-        let v: u16 = label.parse().ok()?;
+        let v = label
+            .iter()
+            .fold(0u16, |acc, d| acc * 10 + u16::from(d - b'0'));
         if v > 255 {
             return None;
         }
         // Labels appear low-order first; index 3 receives the first label so
         // the result ends up in big-endian (wire) order.
         out[3 - i] = v as u8;
-        count += 1;
     }
-    if count != 4 {
-        return None;
-    }
-    Some(out)
+    Some(Ipv4Addr::from(out))
 }
 
-/// Parse the 32 nibble labels of an ip6.arpa query into a `[u8; 16]`.
-fn parse_ipv6_arpa_labels(s: &str) -> Option<[u8; 16]> {
+/// The address named by the 32 nibble labels in front of `ip6.arpa`.
+fn ipv6_from_arpa_labels(labels: &[&[u8]]) -> Option<Ipv6Addr> {
+    if labels.len() != 32 {
+        return None;
+    }
     let mut bytes = [0u8; 16];
-    let mut count = 0;
-    for (i, label) in s.split('.').enumerate() {
-        if i >= 32 || label.len() != 1 {
+    for (i, label) in labels.iter().enumerate() {
+        let &[c] = *label else {
             return None;
-        }
-        let v = hex_nibble(label.as_bytes()[0])?;
-        // label[0] is the lowest nibble; reverse into bytes16.
+        };
+        let v = hex_nibble(c)?;
+        // The first label is the lowest nibble; reverse into bytes16.
         let byte_idx = 15 - i / 2;
         if i % 2 == 0 {
             bytes[byte_idx] |= v;
         } else {
             bytes[byte_idx] |= v << 4;
         }
-        count += 1;
     }
-    if count != 32 {
-        return None;
-    }
-    Some(bytes)
+    Some(Ipv6Addr::from(bytes))
 }
 
 fn hex_nibble(c: u8) -> Option<u8> {
@@ -246,11 +248,23 @@ fn group_changed(files: &[&String], recorded: &HashMap<String, SystemTime>) -> b
     })
 }
 
-/// Bits in [`NameFilter`] (8 KiB). Sized so typical lease/hosts tables
-/// (dozens to a few thousand names) test negative essentially always, while
-/// a huge adblock-style table merely saturates the filter toward "always
-/// maybe" — degrading to the pre-filter cost, never below it.
-const FILTER_BITS: usize = 1 << 16;
+/// Bits a filter reserves per name. With k = 2 a freshly filled filter then
+/// sits about an eighth full, i.e. ~1.4% false positives — each costing one
+/// wasted map probe, never a wrong answer.
+const FILTER_BITS_PER_NAME: usize = 16;
+
+/// Bitmap bounds. The floor (8 KiB) covers the dozens-to-thousands of names a
+/// lease/hosts table normally holds; the ceiling (1 MiB) covers the ~500k
+/// names of an adblock-scale table, past which the table itself dwarfs the
+/// filter.
+const MIN_FILTER_BITS: usize = 1 << 16;
+const MAX_FILTER_BITS: usize = 1 << 23;
+
+/// How many filters [`FilterSet`] keeps live at once. Sizes at least double
+/// from slot to slot, so the retained total stays under twice the newest
+/// filter. Once the slots are spent the newest filter keeps absorbing names
+/// and saturates, which only costs map probes.
+const FILTER_SLOTS: usize = 4;
 
 /// Word width of the filter bitmap. `AtomicUsize` (never `AtomicU64`): the
 /// 32-bit MIPS release targets have no 64-bit atomics — `AtomicU64` does not
@@ -270,39 +284,188 @@ const WORD_BITS: usize = usize::BITS as usize;
 /// once.
 struct NameFilter {
     words: Box<[AtomicUsize]>,
+    /// One below the (power-of-two) bit count, masking a hash into range.
+    mask: usize,
 }
 
 impl NameFilter {
-    fn new() -> Self {
+    /// Bitmap size for a table of `names` names: the per-name reservation,
+    /// rounded up to a power of two and held inside the bounds above.
+    fn bits_for(names: usize) -> usize {
+        names
+            .saturating_mul(FILTER_BITS_PER_NAME)
+            .checked_next_power_of_two()
+            .unwrap_or(MAX_FILTER_BITS)
+            .clamp(MIN_FILTER_BITS, MAX_FILTER_BITS)
+    }
+
+    fn with_bits(bits: usize) -> Self {
+        debug_assert!(bits.is_power_of_two() && bits >= WORD_BITS);
         NameFilter {
-            words: (0..FILTER_BITS / WORD_BITS)
-                .map(|_| AtomicUsize::new(0))
-                .collect(),
+            words: (0..bits / WORD_BITS).map(|_| AtomicUsize::new(0)).collect(),
+            mask: bits - 1,
         }
+    }
+
+    fn bits(&self) -> usize {
+        self.mask + 1
     }
 
     /// The two bit positions for a name hash (`util::hash` of the wire
     /// name): low and high halves of the one hash.
-    fn bits_of(h: u64) -> [usize; 2] {
-        [
-            h as usize & (FILTER_BITS - 1),
-            (h >> 32) as usize & (FILTER_BITS - 1),
-        ]
+    fn bits_of(&self, h: u64) -> [usize; 2] {
+        [h as usize & self.mask, (h >> 32) as usize & self.mask]
     }
 
-    fn insert(&self, name: &[u8]) {
-        for i in Self::bits_of(crate::util::hash(name)) {
+    fn insert_hash(&self, h: u64) {
+        for i in self.bits_of(h) {
             self.words[i / WORD_BITS].fetch_or(1 << (i % WORD_BITS), Ordering::Relaxed);
         }
     }
 
     fn may_contain_hash(&self, h: u64) -> bool {
-        Self::bits_of(h).into_iter().all(|i| {
+        self.bits_of(h).into_iter().all(|i| {
             self.words[i / WORD_BITS].load(Ordering::Relaxed) & (1 << (i % WORD_BITS)) != 0
         })
     }
 }
 
+/// The filter lookups test against, plus the ones earlier reloads published.
+/// A filter cannot be resized in place and a lookup reads it without a lock,
+/// so a table that outgrows its filter gets a bigger one in a fresh slot and
+/// the outgrown ones stay live — a lookup that read the old index keeps a
+/// valid filter, and every live filter is fed every name, so growing can
+/// never turn a present name negative.
+struct FilterSet {
+    slots: [std::sync::OnceLock<NameFilter>; FILTER_SLOTS],
+    /// Index of the published filter; `usize::MAX` until the first load.
+    active: AtomicUsize,
+}
+
+impl FilterSet {
+    fn new() -> Self {
+        FilterSet {
+            slots: [const { std::sync::OnceLock::new() }; FILTER_SLOTS],
+            active: AtomicUsize::new(usize::MAX),
+        }
+    }
+
+    /// The filter to test against, absent only before the first load.
+    fn active(&self) -> Option<&NameFilter> {
+        self.slots.get(self.active.load(Ordering::Acquire))?.get()
+    }
+
+    /// Feed every name of the table about to be published into every live
+    /// filter, first growing into a fresh slot when the active filter is too
+    /// small for the table. Call this *before* publishing the table, so a
+    /// lookup that sees a name in the table also sees its bits.
+    fn refill<'a>(&self, names: impl Iterator<Item = &'a [u8]>, count: usize) {
+        let cur = self.active.load(Ordering::Relaxed);
+        let want = NameFilter::bits_for(count);
+        // `usize::MAX` wraps to 0, so the first load publishes slot 0.
+        let next = cur.wrapping_add(1);
+        let grow = next < FILTER_SLOTS
+            && self
+                .slots
+                .get(cur)
+                .and_then(std::sync::OnceLock::get)
+                .is_none_or(|f| f.bits() < want);
+        if grow {
+            self.slots[next].get_or_init(|| NameFilter::with_bits(want));
+        }
+        for name in names {
+            let h = crate::util::hash(name);
+            for f in self.slots.iter().filter_map(std::sync::OnceLock::get) {
+                f.insert_hash(h);
+            }
+        }
+        if grow {
+            // Published only now that it holds every name of the table.
+            self.active.store(next, Ordering::Release);
+        }
+    }
+}
+
+/// Addresses a name resolves to, copied out of the table. A hosts or lease
+/// entry names a handful of addresses, so the copy stays on the caller's
+/// stack; a longer entry spills to the heap rather than losing addresses.
+const INLINE_IPS: usize = 8;
+
+pub enum Ips {
+    Inline {
+        buf: [IpAddr; INLINE_IPS],
+        len: usize,
+    },
+    Spilled(Vec<IpAddr>),
+}
+
+impl Ips {
+    fn empty() -> Self {
+        Ips::Inline {
+            buf: [IpAddr::V4(Ipv4Addr::UNSPECIFIED); INLINE_IPS],
+            len: 0,
+        }
+    }
+
+    fn copied(ips: &[IpAddr]) -> Self {
+        if ips.len() > INLINE_IPS {
+            return Ips::Spilled(ips.to_vec());
+        }
+        let mut buf = [IpAddr::V4(Ipv4Addr::UNSPECIFIED); INLINE_IPS];
+        buf[..ips.len()].copy_from_slice(ips);
+        Ips::Inline {
+            buf,
+            len: ips.len(),
+        }
+    }
+
+    pub fn as_slice(&self) -> &[IpAddr] {
+        match self {
+            Ips::Inline { buf, len } => &buf[..*len],
+            Ips::Spilled(v) => v,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
+    /// Drop the addresses `keep` rejects, preserving the order of the rest.
+    pub fn retain(&mut self, keep: impl Fn(IpAddr) -> bool) {
+        match self {
+            Ips::Inline { buf, len } => {
+                let mut kept = 0;
+                for i in 0..*len {
+                    if keep(buf[i]) {
+                        buf[kept] = buf[i];
+                        kept += 1;
+                    }
+                }
+                *len = kept;
+            }
+            Ips::Spilled(v) => v.retain(|ip| keep(*ip)),
+        }
+    }
+}
+
+/// Which group's default paths to probe, for the groups the config named no
+/// file of its own. The two are independent — naming a lease file does not
+/// silence the hosts default, and `[hosts]` entries overlay the hosts files
+/// rather than replacing them — which is what the ReadMe documents.
+pub struct AutoDetect {
+    pub lease: bool,
+    pub hosts: bool,
+}
+impl AutoDetect {
+    /// Probe neither group.
+    #[cfg(test)]
+    pub fn none() -> Self {
+        AutoDetect {
+            lease: false,
+            hosts: false,
+        }
+    }
+}
 /// In-memory resolver over DHCP lease + hosts files, plus `[hosts]` statics.
 /// Supports reverse (PTR) and forward (A/AAAA) lookups. Reload is driven by a
 /// periodic background task (see `app`), never by lookups: the lookup path
@@ -317,7 +480,7 @@ pub struct PtrResolver {
     static_fwd: HashMap<Vec<u8>, Vec<IpAddr>>,
     maps: RwLock<Maps>,
     /// Lock-free negative filter over `maps.fwd` keys (see [`NameFilter`]).
-    fwd_filter: NameFilter,
+    fwd_filter: FilterSet,
 }
 
 impl PtrResolver {
@@ -327,26 +490,30 @@ impl PtrResolver {
     pub fn new(
         mut lease_files: Vec<String>,
         hosts_files: Vec<String>,
-        auto_detect: bool,
+        auto: AutoDetect,
         static_hosts: &HashMap<String, Vec<IpAddr>>,
     ) -> Option<PtrResolver> {
         let mut auto_hosts_files = Vec::new();
-        if auto_detect {
+        if auto.lease {
             for f in DEFAULT_LEASE_FILES {
                 if std::path::Path::new(f).exists() {
                     lease_files.push((*f).to_string());
                 }
             }
-            if static_hosts.is_empty() {
-                for f in DEFAULT_HOSTS_FILES {
-                    if std::path::Path::new(f).exists() {
-                        auto_hosts_files.push((*f).to_string());
-                    }
+        }
+        if auto.hosts {
+            for f in DEFAULT_HOSTS_FILES {
+                if std::path::Path::new(f).exists() {
+                    auto_hosts_files.push((*f).to_string());
                 }
             }
-            if lease_files.is_empty() && auto_hosts_files.is_empty() && static_hosts.is_empty() {
-                return None;
-            }
+        }
+        if lease_files.is_empty()
+            && hosts_files.is_empty()
+            && auto_hosts_files.is_empty()
+            && static_hosts.is_empty()
+        {
+            return None;
         }
 
         let mut static_fwd = HashMap::new();
@@ -369,7 +536,7 @@ impl PtrResolver {
             static_ptr,
             static_fwd,
             maps: RwLock::new(Maps::default()),
-            fwd_filter: NameFilter::new(),
+            fwd_filter: FilterSet::new(),
         };
         r.reload(Changed::all());
         Some(r)
@@ -405,17 +572,22 @@ impl PtrResolver {
     /// rejected by the lock-free filter before paying for the RwLock +
     /// HashMap probe. `name_hash` is the caller's per-query `util::hash` of
     /// `qname_lower` (`QueryInfo::name_hash`), so the name isn't re-hashed.
-    pub fn lookup_ip(&self, qname_lower: &[u8], name_hash: u64) -> Vec<IpAddr> {
-        if !self.fwd_filter.may_contain_hash(name_hash) {
-            return Vec::new();
+    ///
+    /// The addresses are copied out rather than borrowed: the answer is built
+    /// after the lock is released, and a reload may replace the table in
+    /// between.
+    pub fn lookup_ip(&self, qname_lower: &[u8], name_hash: u64) -> Ips {
+        if self
+            .fwd_filter
+            .active()
+            .is_some_and(|f| !f.may_contain_hash(name_hash))
+        {
+            return Ips::empty();
         }
-        self.maps
-            .read()
-            .unwrap()
-            .fwd
-            .get(qname_lower)
-            .cloned()
-            .unwrap_or_default()
+        match self.maps.read().unwrap().fwd.get(qname_lower) {
+            Some(ips) => Ips::copied(ips),
+            None => Ips::empty(),
+        }
     }
 
     /// Reload if any watched file changed. Runs blocking file IO — call it
@@ -484,9 +656,8 @@ impl PtrResolver {
             }
             // Publish filter bits for every (possibly new) name BEFORE swapping
             // the table in, so a lookup that sees the table also sees the bits.
-            for k in fwd.keys() {
-                self.fwd_filter.insert(k);
-            }
+            self.fwd_filter
+                .refill(fwd.keys().map(Vec::as_slice), fwd.len());
             hosts_times = Some(t);
             new_fwd = Some(fwd);
             p
@@ -598,7 +769,13 @@ fn load_hosts(
                 continue;
             }
             if let Some(k) = name_to_wire(hostname, true) {
-                fwd.entry(k).or_default().push(ip);
+                // The same address can be named twice (a repeated line, or one
+                // name listed in several hosts files); a duplicate RR in the
+                // answer is noise the client has to filter.
+                let ips = fwd.entry(k).or_default();
+                if !ips.contains(&ip) {
+                    ips.push(ip);
+                }
             }
         }
     }
@@ -686,21 +863,238 @@ mod tests {
             ("abc.2.3.4.in-addr.arpa.", false),
         ];
         for (qname, want) in cases {
-            assert_eq!(is_private_ptr(qname), want, "qname={qname}");
+            let wire = name_to_wire(qname, true).unwrap();
+            assert_eq!(is_private_ptr_name(&wire), want, "qname={qname}");
+            assert_eq!(
+                reference::is_private_ptr(qname),
+                want,
+                "reference, qname={qname}"
+            );
         }
     }
 
     #[test]
     fn arpa_labels_edges() {
-        assert_eq!(
-            parse_ipv4_arpa_labels("132.10.10.10"),
-            Some([10, 10, 10, 132])
-        );
-        assert_eq!(parse_ipv4_arpa_labels("1.2.3"), None); // too few
-        assert_eq!(parse_ipv4_arpa_labels("1.2.3.4.5"), None); // too many
-        assert_eq!(parse_ipv4_arpa_labels("256.1.1.1"), None); // out of range
-        assert_eq!(parse_ipv4_arpa_labels("0010.1.1.1"), None); // over-long label
-        assert_eq!(parse_ipv4_arpa_labels("a.1.1.1"), None); // non-digit
+        let v4 = |s: &str| {
+            let labels: Vec<&[u8]> = s.split('.').map(str::as_bytes).collect();
+            ipv4_from_arpa_labels(&labels)
+        };
+        assert_eq!(v4("132.10.10.10"), Some(Ipv4Addr::new(10, 10, 10, 132)));
+        assert_eq!(v4("1.2.3"), None); // too few
+        assert_eq!(v4("1.2.3.4.5"), None); // too many
+        assert_eq!(v4("256.1.1.1"), None); // out of range
+        assert_eq!(v4("0010.1.1.1"), None); // over-long label
+        assert_eq!(v4("a.1.1.1"), None); // non-digit
+        assert_eq!(v4("01.0.0.10"), Some(Ipv4Addr::new(10, 0, 0, 1))); // leading zero
+    }
+
+    /// The string-based classification the wire form must agree with.
+    mod reference {
+        use super::super::hex_nibble;
+        use crate::util::v6_is_private_special;
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        pub fn is_private_ptr(qname: &str) -> bool {
+            let mut qname = qname.to_ascii_lowercase();
+            if !qname.ends_with('.') {
+                qname.push('.');
+            }
+            if let Some(trimmed) = qname.strip_suffix(".in-addr.arpa.") {
+                return match parse_ipv4_arpa_labels(trimmed) {
+                    Some(octets) => {
+                        let a = Ipv4Addr::from(octets);
+                        a.is_private() || a.is_link_local() || a.is_loopback()
+                    }
+                    None => false,
+                };
+            }
+            if let Some(trimmed) = qname.strip_suffix(".ip6.arpa.") {
+                return match parse_ipv6_arpa_labels(trimmed) {
+                    Some(bytes) => v6_is_private_special(Ipv6Addr::from(bytes)),
+                    None => false,
+                };
+            }
+            false
+        }
+
+        fn parse_ipv4_arpa_labels(s: &str) -> Option<[u8; 4]> {
+            let mut out = [0u8; 4];
+            let mut count = 0;
+            for (i, label) in s.split('.').enumerate() {
+                if i >= 4
+                    || label.is_empty()
+                    || label.len() > 3
+                    || !label.bytes().all(|c| c.is_ascii_digit())
+                {
+                    return None;
+                }
+                let v: u16 = label.parse().ok()?;
+                if v > 255 {
+                    return None;
+                }
+                out[3 - i] = v as u8;
+                count += 1;
+            }
+            if count != 4 {
+                return None;
+            }
+            Some(out)
+        }
+
+        fn parse_ipv6_arpa_labels(s: &str) -> Option<[u8; 16]> {
+            let mut bytes = [0u8; 16];
+            let mut count = 0;
+            for (i, label) in s.split('.').enumerate() {
+                if i >= 32 || label.len() != 1 {
+                    return None;
+                }
+                let v = hex_nibble(label.as_bytes()[0])?;
+                let byte_idx = 15 - i / 2;
+                if i % 2 == 0 {
+                    bytes[byte_idx] |= v;
+                } else {
+                    bytes[byte_idx] |= v << 4;
+                }
+                count += 1;
+            }
+            if count != 32 {
+                return None;
+            }
+            Some(bytes)
+        }
+    }
+
+    /// The wire-form classification runs on the query path; the string form it
+    /// must agree with rendered the name first. Compared over reverse names of
+    /// private and public addresses of both families, the same names with one
+    /// byte replaced (by digits, hex letters in both cases, or characters a
+    /// rendering escapes), and runs of random labels in front of the real
+    /// suffixes and near misses.
+    #[test]
+    fn wire_form_private_ptr_agrees_with_the_rendered_form() {
+        let mut state: u64 = 0x5eed_cafe_f00d_d00d;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let alphabet: &[u8] = b"0123456789abcdefABCDEFgx.-\\ \x80";
+        let suffixes: [&[&[u8]]; 7] = [
+            &[b"in-addr", b"arpa"],
+            &[b"ip6", b"arpa"],
+            &[b"IN-ADDR", b"ARPA"],
+            &[b"Ip6", b"Arpa"],
+            &[b"arpa"],
+            &[b"xin-addr", b"arpa"],
+            &[b"in-addr", b"arpa", b"x"],
+        ];
+        let (mut private, mut public, mut total) = (0usize, 0usize, 0usize);
+        for round in 0..200_000u32 {
+            let mut wire = if round % 3 == 2 {
+                // Random labels in front of a suffix.
+                let suffix = suffixes[(rnd() % suffixes.len() as u64) as usize];
+                let n_labels = match round % 4 {
+                    0 => 4,
+                    1 => 32,
+                    _ => (rnd() % 36) as usize,
+                };
+                let mut wire = Vec::new();
+                for _ in 0..n_labels {
+                    let len = 1 + (rnd() % 4) as usize;
+                    wire.push(len as u8);
+                    for _ in 0..len {
+                        wire.push(alphabet[(rnd() % alphabet.len() as u64) as usize]);
+                    }
+                }
+                for label in suffix {
+                    wire.push(label.len() as u8);
+                    wire.extend_from_slice(label);
+                }
+                wire.push(0);
+                wire
+            } else {
+                // The reverse name of an address that is private about half
+                // the time.
+                let r = rnd();
+                let addr = if round % 3 == 0 {
+                    let [a, b, c, d] = (r as u32).to_be_bytes();
+                    IpAddr::V4(match r >> 32 & 7 {
+                        0 => Ipv4Addr::new(10, b, c, d),
+                        1 => Ipv4Addr::new(172, 16 | (b & 0x1f), c, d),
+                        2 => Ipv4Addr::new(192, 168, c, d),
+                        3 => Ipv4Addr::new(169, 254, c, d),
+                        _ => Ipv4Addr::new(a, b, c, d),
+                    })
+                } else {
+                    let mut o = [0u8; 16];
+                    for (i, byte) in o.iter_mut().enumerate() {
+                        *byte = (rnd() >> (i % 8)) as u8;
+                    }
+                    match r >> 32 & 7 {
+                        0 => o[0] = 0xfc | (o[0] & 1),
+                        1 => {
+                            o[0] = 0xfe;
+                            o[1] = 0x80 | (o[1] & 0x3f);
+                        }
+                        2 => o = Ipv6Addr::LOCALHOST.octets(),
+                        _ => {}
+                    }
+                    IpAddr::V6(Ipv6Addr::from(o))
+                };
+                let mut text = ip_to_ptr_name(addr);
+                if r >> 42 & 1 == 1 {
+                    // Leading zeros on the octet labels: up to three digits
+                    // still name the octet, a fourth makes the label invalid.
+                    let mut bits = r >> 43;
+                    text = text
+                        .split('.')
+                        .map(|l| {
+                            let pad = (bits & 3) as usize;
+                            bits >>= 2;
+                            if l.bytes().all(|b| b.is_ascii_digit()) && l.len() <= 3 {
+                                format!("{}{l}", "0".repeat(pad))
+                            } else {
+                                l.to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(".");
+                }
+                let mut wire = name_to_wire(&text, false).unwrap();
+                if r >> 40 & 1 == 1 {
+                    wire.make_ascii_uppercase();
+                }
+                if r >> 41 & 1 == 1 {
+                    // One byte replaced; label length bytes are fair game too.
+                    let at = (rnd() % (wire.len() as u64 - 1)) as usize;
+                    wire[at] = alphabet[(rnd() % alphabet.len() as u64) as usize];
+                }
+                wire
+            };
+            wire.truncate(wire.len().min(255));
+            let Ok(name) = Name::from_octets(wire.clone()) else {
+                continue;
+            };
+            let mut lower = wire.clone();
+            lower.make_ascii_lowercase();
+            let want = reference::is_private_ptr(&name.to_string());
+            assert_eq!(
+                is_private_ptr_name(&lower),
+                want,
+                "disagreement on {:?} ({name})",
+                wire
+            );
+            total += 1;
+            if want {
+                private += 1;
+            } else {
+                public += 1;
+            }
+        }
+        assert!(total > 100_000, "only {total} names compared");
+        assert!(private > 10_000, "only {private} private names compared");
+        assert!(public > 20_000, "only {public} non-private names compared");
     }
 
     fn ip(s: &str) -> IpAddr {
@@ -709,16 +1103,265 @@ mod tests {
 
     #[test]
     fn name_filter_rejects_absent_accepts_inserted() {
-        let f = NameFilter::new();
+        let f = NameFilter::with_bits(MIN_FILTER_BITS);
         let h = |name: &str| crate::util::hash(&name_to_wire(name, true).unwrap());
         assert!(
             !f.may_contain_hash(h("myhost.lan")),
             "empty filter rejects everything"
         );
-        f.insert(&name_to_wire("myhost.lan", true).unwrap());
+        f.insert_hash(h("myhost.lan"));
         assert!(f.may_contain_hash(h("myhost.lan")), "no false negatives");
         // A distinct name stays (deterministically, for this input) negative.
         assert!(!f.may_contain_hash(h("www.example.com")));
+    }
+
+    #[test]
+    fn an_address_list_spills_only_past_the_inline_capacity() {
+        let v4 = |i: usize| IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, i as u8));
+        for n in [0usize, 1, INLINE_IPS - 1, INLINE_IPS, INLINE_IPS + 1, 300] {
+            let ips: Vec<IpAddr> = (0..n).map(v4).collect();
+            let copied = Ips::copied(&ips);
+            assert_eq!(copied.as_slice(), ips.as_slice(), "n={n}");
+            assert_eq!(copied.is_empty(), n == 0, "n={n}");
+            assert_eq!(
+                matches!(copied, Ips::Spilled(_)),
+                n > INLINE_IPS,
+                "n={n}: spilled when it need not, or lost addresses"
+            );
+        }
+    }
+
+    #[test]
+    fn retaining_addresses_keeps_the_rest_in_order() {
+        let v4 = |i: usize| IpAddr::V4(Ipv4Addr::new(10, 0, 0, i as u8));
+        let v6 = |i: usize| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i as u16));
+        // Both storage forms: interleaved so a wrong compaction reorders.
+        for n in [4usize, INLINE_IPS * 3] {
+            let mixed: Vec<IpAddr> = (0..n)
+                .map(|i| if i % 2 == 0 { v4(i) } else { v6(i) })
+                .collect();
+            let mut ips = Ips::copied(&mixed);
+            ips.retain(|ip| ip.is_ipv4());
+            let want: Vec<IpAddr> = mixed.iter().copied().filter(IpAddr::is_ipv4).collect();
+            assert_eq!(ips.as_slice(), want.as_slice(), "n={n}");
+            ips.retain(|ip| !ip.is_ipv4());
+            assert!(ips.is_empty(), "n={n}");
+        }
+    }
+
+    #[test]
+    fn filter_size_follows_the_table_within_its_bounds() {
+        assert_eq!(NameFilter::bits_for(0), MIN_FILTER_BITS);
+        assert_eq!(NameFilter::bits_for(1), MIN_FILTER_BITS);
+        // Tables the floor already covers keep the floor.
+        assert_eq!(
+            NameFilter::bits_for(MIN_FILTER_BITS / FILTER_BITS_PER_NAME),
+            MIN_FILTER_BITS
+        );
+        assert_eq!(NameFilter::bits_for(usize::MAX), MAX_FILTER_BITS);
+        let mut prev = 0;
+        for names in [0, 1_000, 10_000, 100_000, 1_000_000, 10_000_000] {
+            let bits = NameFilter::bits_for(names);
+            assert!(bits.is_power_of_two(), "{names} names -> {bits} bits");
+            assert!(bits >= prev, "must not shrink as the table grows");
+            assert!(
+                bits >= (names * FILTER_BITS_PER_NAME).min(MAX_FILTER_BITS),
+                "{names} names get too few bits"
+            );
+            prev = bits;
+        }
+    }
+
+    /// Wire names for a generated table, distinct across `tag`.
+    fn table_names(tag: &str, count: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|i| name_to_wire(&format!("n{i}.{tag}.lan"), true).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_big_table_gets_a_filter_that_still_rejects() {
+        let names = table_names("big", 100_000);
+        let set = FilterSet::new();
+        set.refill(names.iter().map(Vec::as_slice), names.len());
+        let f = set.active().expect("a load published a filter");
+        assert_eq!(f.bits(), NameFilter::bits_for(names.len()));
+        for n in &names {
+            assert!(
+                f.may_contain_hash(crate::util::hash(n)),
+                "no false negatives"
+            );
+        }
+        let absent = table_names("absent", 100_000);
+        let fp = absent
+            .iter()
+            .filter(|n| f.may_contain_hash(crate::util::hash(n)))
+            .count();
+        // ~1.4% by construction. The bound sits below what this table would
+        // give from a single hash bit, so a filter that is undersized or
+        // weakened fails here instead of quietly costing a probe per query.
+        assert!(
+            fp * 50 < absent.len(),
+            "{fp} false positives in 100k probes"
+        );
+    }
+
+    #[test]
+    fn a_growing_table_keeps_every_filter_answering_for_it() {
+        let set = FilterSet::new();
+        let mut live: Vec<usize> = Vec::new();
+        let mut all: Vec<Vec<u8>> = Vec::new();
+        // Each round's table is the previous one plus enough names to outgrow
+        // its filter, which is what makes the set grow into a fresh slot.
+        for round in 0..FILTER_SLOTS + 2 {
+            all.extend(table_names(&format!("r{round}"), 2_000 << round));
+            set.refill(all.iter().map(Vec::as_slice), all.len());
+            let bits = set.active().expect("published").bits();
+            assert!(
+                live.last().is_none_or(|&b| bits >= b),
+                "round {round} shrank the filter"
+            );
+            live.push(bits);
+            // Every filter a lookup could still be holding answers for the
+            // whole current table, so growth cannot make a name look absent.
+            for slot in set.slots.iter().filter_map(std::sync::OnceLock::get) {
+                for n in &all {
+                    assert!(
+                        slot.may_contain_hash(crate::util::hash(n)),
+                        "round {round}: a live filter lost a name"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            set.slots.iter().filter(|s| s.get().is_some()).count(),
+            FILTER_SLOTS,
+            "growth stops once the slots are spent"
+        );
+        // Reloads of a table its filter already fits must not spend a slot:
+        // the slots exist for growth, and there are only so many.
+        let spent = FilterSet::new();
+        let small = table_names("small", 100);
+        for _ in 0..5 {
+            spent.refill(small.iter().map(Vec::as_slice), small.len());
+        }
+        assert_eq!(spent.active.load(Ordering::Relaxed), 0);
+        assert_eq!(spent.slots.iter().filter(|s| s.get().is_some()).count(), 1);
+        assert_eq!(
+            set.active.load(Ordering::Relaxed),
+            FILTER_SLOTS - 1,
+            "the newest slot stays published"
+        );
+    }
+
+    #[test]
+    fn a_lookup_before_the_first_load_is_not_filtered_out() {
+        // `active()` is None only in that window; a None filter must mean
+        // "ask the table", never "absent".
+        let set = FilterSet::new();
+        assert!(set.active().is_none());
+        let wire = name_to_wire("myhost.lan", true).unwrap();
+        set.refill(std::iter::once(wire.as_slice()), 1);
+        assert!(set
+            .active()
+            .expect("published")
+            .may_contain_hash(crate::util::hash(&wire)));
+    }
+
+    #[test]
+    fn a_name_listed_twice_answers_with_one_record_per_address() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mppdns-dup-{}.hosts", std::process::id()));
+        // The same pair twice (a repeated line), then a second address for the
+        // same name, which is a real second record.
+        std::fs::write(
+            &path,
+            "10.0.0.5 dup.lan\n10.0.0.5 dup.lan alias.lan\n10.0.0.6 dup.lan\n",
+        )
+        .unwrap();
+        let r = PtrResolver::new(
+            vec![],
+            vec![path.to_string_lossy().into_owned()],
+            AutoDetect::none(),
+            &HashMap::new(),
+        )
+        .expect("resolver present");
+        let wire = name_to_wire("dup.lan", true).unwrap();
+        let ips = r.lookup_ip(&wire, crate::util::hash(&wire));
+        assert_eq!(
+            ips.as_slice(),
+            [ip("10.0.0.5"), ip("10.0.0.6")],
+            "a repeated line must not become a repeated record"
+        );
+        let alias = name_to_wire("alias.lan", true).unwrap();
+        assert_eq!(
+            r.lookup_ip(&alias, crate::util::hash(&alias)).as_slice(),
+            [ip("10.0.0.5")]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn config_entries_do_not_switch_off_the_hosts_file_default() {
+        if !std::path::Path::new("/etc/hosts").exists() {
+            return; // nothing auto-detectable here
+        }
+        // The ReadMe promises `/etc/hosts` whenever `hosts_file` is unset, and
+        // `[hosts]` entries that overlay it rather than replace it.
+        let mut statics: HashMap<String, Vec<IpAddr>> = HashMap::new();
+        statics.insert("static.lan.".to_string(), vec![ip("172.16.0.9")]);
+        let r = PtrResolver::new(
+            vec![],
+            vec![],
+            AutoDetect {
+                lease: false,
+                hosts: true,
+            },
+            &statics,
+        )
+        .expect("resolver present");
+        assert!(
+            r.hosts_group().iter().any(|f| *f == "/etc/hosts"),
+            "[hosts] entries must not switch off the /etc/hosts default"
+        );
+        let wire = name_to_wire("static.lan", true).unwrap();
+        assert_eq!(
+            r.lookup_ip(&wire, crate::util::hash(&wire)).as_slice(),
+            [ip("172.16.0.9")],
+            "and the config entries still resolve"
+        );
+    }
+
+    #[test]
+    fn naming_one_group_leaves_the_other_groups_default_alone() {
+        if !std::path::Path::new("/etc/hosts").exists() {
+            return;
+        }
+        // Naming a lease file says nothing about hosts files.
+        let lease = std::env::temp_dir().join(format!("mppdns-b12-{}.leases", std::process::id()));
+        std::fs::write(
+            &lease,
+            "1700000000 aa:bb:cc:dd:ee:ff 192.168.1.50 leasehost *\n",
+        )
+        .unwrap();
+        let r = PtrResolver::new(
+            vec![lease.to_string_lossy().into_owned()],
+            vec![],
+            AutoDetect {
+                lease: false,
+                hosts: true,
+            },
+            &HashMap::new(),
+        )
+        .expect("resolver present");
+        assert!(r.hosts_group().iter().any(|f| *f == "/etc/hosts"));
+        assert_eq!(
+            r.lookup(&name_to_wire(&ip_to_ptr_name_str("192.168.1.50"), true).unwrap())
+                .as_deref(),
+            Some("leasehost"),
+            "the named lease file is still read"
+        );
+        let _ = std::fs::remove_file(&lease);
     }
 
     #[test]
@@ -740,7 +1383,7 @@ mod tests {
         let r = PtrResolver::new(
             vec![lease.to_string_lossy().into_owned()],
             vec![hosts.to_string_lossy().into_owned()],
-            false,
+            AutoDetect::none(),
             &statics,
         )
         .expect("resolver present");
@@ -748,6 +1391,8 @@ mod tests {
         let fwd = |name: &str| {
             let wire = name_to_wire(name, true).unwrap();
             r.lookup_ip(&wire, crate::util::hash(&wire))
+                .as_slice()
+                .to_vec()
         };
         let rev = |ipstr: &str| r.lookup(&name_to_wire(&ip_to_ptr_name_str(ipstr), true).unwrap());
 
@@ -793,13 +1438,15 @@ mod tests {
                 good.to_string_lossy().into_owned(),
                 bad.to_string_lossy().into_owned(),
             ],
-            false,
+            AutoDetect::none(),
             &HashMap::new(),
         )
         .expect("resolver present");
         let fwd = |name: &str| {
             let wire = name_to_wire(name, true).unwrap();
             r.lookup_ip(&wire, crate::util::hash(&wire))
+                .as_slice()
+                .to_vec()
         };
         assert_eq!(
             fwd("myhost.lan"),
@@ -845,8 +1492,16 @@ mod tests {
         if !std::path::Path::new("/etc/hosts").exists() {
             return; // nothing auto-detectable here
         }
-        let r = PtrResolver::new(vec![], vec![], true, &HashMap::new())
-            .expect("auto-detection finds /etc/hosts");
+        let r = PtrResolver::new(
+            vec![],
+            vec![],
+            AutoDetect {
+                lease: true,
+                hosts: true,
+            },
+            &HashMap::new(),
+        )
+        .expect("auto-detection finds /etc/hosts");
         assert!(
             r.hosts_group().iter().any(|f| *f == "/etc/hosts"),
             "auto-detected hosts file must be in the watch set"
@@ -892,13 +1547,15 @@ mod tests {
         let r = PtrResolver::new(
             vec![lease.to_string_lossy().into_owned()],
             vec![hosts.to_string_lossy().into_owned()],
-            false,
+            AutoDetect::none(),
             &HashMap::new(),
         )
         .expect("resolver present");
         let fwd = |name: &str| {
             let wire = name_to_wire(name, true).unwrap();
             r.lookup_ip(&wire, crate::util::hash(&wire))
+                .as_slice()
+                .to_vec()
         };
         let rev = |ipstr: &str| r.lookup(&name_to_wire(&ip_to_ptr_name_str(ipstr), true).unwrap());
         assert_eq!(fwd("myhost.lan"), vec![ip("10.0.0.5")]);
@@ -972,7 +1629,7 @@ mod tests {
         let r = PtrResolver::new(
             vec![lease.to_string_lossy().into_owned()],
             vec![hosts.to_string_lossy().into_owned()],
-            false,
+            AutoDetect::none(),
             &statics,
         )
         .expect("resolver present");
@@ -987,7 +1644,7 @@ mod tests {
         let r2 = PtrResolver::new(
             vec![lease.to_string_lossy().into_owned()],
             vec![hosts.to_string_lossy().into_owned()],
-            false,
+            AutoDetect::none(),
             &HashMap::new(),
         )
         .expect("resolver present");

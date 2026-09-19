@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::forcefall::ForceFallMatcher;
 use crate::handler::{AaaaMode, Handler};
 use crate::hook::HookMonitor;
-use crate::local_resolver::PtrResolver;
+use crate::local_resolver::{AutoDetect, PtrResolver};
 use crate::log;
 use crate::server::{serve_tcp, serve_udp};
 use crate::sysinfo::{calculate_cache_size, calculate_fallback_cache_size, get_available_memory};
@@ -53,11 +53,14 @@ struct Caps {
 /// Derive the ceilings from `fd_limit` (`None` when it cannot be read, which
 /// means "assume plenty").
 ///
-/// Every in-flight forwarded query holds at least one upstream socket, and every
-/// accepted TCP connection is a descriptor of its own. Ceilings above what the
-/// process may open turn overload into `EMFILE` — a SERVFAIL for the client —
-/// rather than the intended shed, which drops a datagram the client will retry.
-fn caps_for(fd_limit: Option<usize>) -> Caps {
+/// Every in-flight forwarded query holds `sockets_per_query` upstream sockets —
+/// the fan-out queries several upstreams at once — and every accepted TCP
+/// connection is a descriptor of its own. Ceilings above what the process may
+/// open turn overload into `EMFILE` — a SERVFAIL for the client — rather than
+/// the intended shed, which drops a datagram the client will retry. The
+/// connection ceiling is not divided: a connection costs one descriptor
+/// whether or not the query on it is being forwarded.
+fn caps_for(fd_limit: Option<usize>, sockets_per_query: usize) -> Caps {
     let Some(limit) = fd_limit else {
         return Caps {
             udp: MAX_CONCURRENT_UDP,
@@ -66,10 +69,44 @@ fn caps_for(fd_limit: Option<usize>) -> Caps {
         };
     };
     let budget = limit.saturating_sub(FD_RESERVE);
+    let per_query = sockets_per_query.max(1);
     Caps {
-        udp: (budget / 2).clamp(MIN_CONCURRENT_UDP, MAX_CONCURRENT_UDP),
+        udp: (budget / 2 / per_query).clamp(MIN_CONCURRENT_UDP, MAX_CONCURRENT_UDP),
         tcp_conns: (budget * 3 / 10).clamp(MIN_TCP_CONNS, MAX_TCP_CONNS),
-        tcp: (budget / 5).clamp(MIN_CONCURRENT_TCP, MAX_CONCURRENT_TCP),
+        tcp: (budget / 5 / per_query).clamp(MIN_CONCURRENT_TCP, MAX_CONCURRENT_TCP),
+    }
+}
+
+/// The deadlines the two upstream stages run on, all derived from `qtime`.
+struct Timings {
+    /// How long the main DNS gets alone before the fallback joins in.
+    hedge_after: Duration,
+    /// The main's whole deadline. It is the full window the client waits, not
+    /// `qtime`: once the fallback has joined in, a main answer that still
+    /// arrives first is the answer this client asked for — and only a main
+    /// that misses this deadline is the failure the breaker counts.
+    main: Duration,
+    /// The fallback's deadline, and so the longest the client waits.
+    fall: Duration,
+}
+impl Timings {
+    fn from_qtime(qtime: Duration) -> Self {
+        let fall = qtime * 10;
+        Timings {
+            hedge_after: qtime,
+            main: qtime + fall,
+            fall,
+        }
+    }
+}
+/// Which group of default paths to probe. Each group answers only for itself:
+/// naming a lease file says nothing about hosts files, and `[hosts]` entries
+/// overlay the hosts files instead of standing in for them — which is what the
+/// ReadMe promises.
+fn auto_detect_for(cfg: &Config) -> AutoDetect {
+    AutoDetect {
+        lease: cfg.lease_file.is_empty(),
+        hosts: cfg.hosts_file.is_empty(),
     }
 }
 
@@ -210,10 +247,10 @@ async fn serve(
         ));
     }
 
-    let qtime = Duration::from_millis(cfg.qtime as u64);
+    let timings = Timings::from_qtime(Duration::from_millis(cfg.qtime as u64));
     // Only the main forwarder gets the fail-fast breaker (see `Breaker`).
-    let main_fwd = Forwarder::with_breaker(main, qtime);
-    let fall_fwd = Forwarder::new(fall, qtime * 10);
+    let main_fwd = Forwarder::with_breaker(main, timings.main);
+    let fall_fwd = Forwarder::new(fall, timings.fall);
 
     let avail = get_available_memory();
     let cache_cap = calculate_cache_size(avail);
@@ -244,11 +281,10 @@ async fn serve(
 
     // Local resolver (lease/hosts files + [hosts] statics) — None if nothing
     // to resolve.
-    let auto_detect = cfg.lease_file.is_empty() && cfg.hosts_file.is_empty();
     let resolver = PtrResolver::new(
         cfg.lease_file.clone(),
         cfg.hosts_file.clone(),
-        auto_detect,
+        auto_detect_for(cfg),
         &cfg.hosts,
     )
     .map(Arc::new);
@@ -330,7 +366,8 @@ async fn serve(
     };
 
     let handler = Arc::new(Handler {
-        main: main_fwd,
+        main: Arc::new(main_fwd),
+        hedge_after: timings.hedge_after,
         fallback: fall_fwd,
         cache: cache.clone(),
         fall_cache,
@@ -349,7 +386,15 @@ async fn serve(
         pplog,
     });
 
-    let caps = caps_for(fd_limit());
+    // Main and fallback are queried in sequence, so a query's peak descriptor
+    // use is the wider of the two fan-outs, not their sum.
+    let caps = caps_for(
+        fd_limit(),
+        handler
+            .main
+            .sockets_per_query()
+            .max(handler.fallback.sockets_per_query()),
+    );
     log::info(&format!(
         "concurrency udp {} tcp {} tcp-conns {} (fd limit {})",
         log::hl_value(caps.udp),
@@ -364,8 +409,28 @@ async fn serve(
     let tcp_sem = Arc::new(Semaphore::new(caps.tcp));
     let tcp_conn_sem = Arc::new(Semaphore::new(caps.tcp_conns));
 
+    // An address the user asked for by name must work; an auto-detected one
+    // may have gone away since detection (an interface came down), so it is
+    // only logged and skipped.
+    let listen_is_configured = !cfg.listen.is_empty();
     let mut servers = Vec::new();
     for addr in &listen {
+        // TCP first, and without SO_REUSEPORT: this bind is what makes the
+        // whole address exclusive. The UDP shards below *do* set SO_REUSEPORT
+        // and would otherwise happily share the port with a second instance,
+        // leaving the kernel to split clients between two configurations.
+        let tcp = match TcpListener::bind(addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                let msg = format!("listen tcp://{addr} err: {e}");
+                if listen_is_configured {
+                    return Err(msg);
+                }
+                log::error(&msg);
+                continue;
+            }
+        };
+
         // Resolve once; SO_REUSEPORT-sharded receive loops (see `udp_shards`).
         // If the sharded bind fails (e.g. SO_REUSEPORT unsupported), fall back
         // to a single plain socket, preserving old behavior.
@@ -403,29 +468,32 @@ async fn serve(
                         shutdown_rx.clone(),
                     )));
                 }
-                Err(e) => log::error(&format!("listen udp://{addr} err: {e}")),
+                Err(e) => {
+                    let msg = format!("listen udp://{addr} err: {e}");
+                    if listen_is_configured {
+                        return Err(msg);
+                    }
+                    log::error(&msg);
+                }
             }
         }
-        match TcpListener::bind(addr).await {
-            Ok(l) => {
-                servers.push(tokio::spawn(serve_tcp(
-                    l,
-                    handler.clone(),
-                    tcp_sem.clone(),
-                    tcp_conn_sem.clone(),
-                    shutdown_rx.clone(),
-                )));
-                log::info(&format!("listen: {}", log::hl_addr(addr)));
-            }
-            Err(e) => log::error(&format!("listen tcp://{addr} err: {e}")),
-        }
+        servers.push(tokio::spawn(serve_tcp(
+            tcp,
+            handler.clone(),
+            tcp_sem.clone(),
+            tcp_conn_sem.clone(),
+            shutdown_rx.clone(),
+        )));
+        log::info(&format!("listen: {}", log::hl_addr(addr)));
     }
     if servers.is_empty() {
         return Err("failed to listen on any address".into());
     }
 
     // Cache janitor.
-    let jan = tokio::spawn(janitor(cache.clone(), shutdown_rx.clone()));
+    let jan = tokio::spawn(janitor(handler.caches(), shutdown_rx.clone()));
+    // Everything is bound and serving; a `-d` parent is waiting to hear it.
+    crate::ready::serving();
 
     wait_for_signal().await;
     log::info(&format!(
@@ -452,7 +520,16 @@ async fn serve(
     Ok(())
 }
 
-async fn janitor(cache: Arc<Cache>, mut shutdown: watch::Receiver<bool>) {
+fn sweep_all(caches: &[Arc<Cache>]) {
+    for c in caches {
+        c.sweep();
+    }
+}
+
+/// Drop expired entries from every cache the handler fills. Expired entries
+/// are never served, so this only returns their memory — a cache left out of
+/// the sweep holds dead entries until its own capacity evicts them.
+async fn janitor(caches: [Arc<Cache>; 2], mut shutdown: watch::Receiver<bool>) {
     let mut tick = tokio::time::interval(Duration::from_secs(10));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -460,7 +537,7 @@ async fn janitor(cache: Arc<Cache>, mut shutdown: watch::Receiver<bool>) {
             _ = shutdown.changed() => {
                 if *shutdown.borrow() { break; }
             }
-            _ = tick.tick() => cache.sweep(),
+            _ = tick.tick() => sweep_all(&caches),
         }
     }
 }
@@ -490,7 +567,7 @@ mod tests {
 
     #[test]
     fn caps_stay_at_the_ceilings_when_descriptors_are_plentiful() {
-        let plenty = caps_for(Some(1_048_576));
+        let plenty = caps_for(Some(1_048_576), 1);
         assert_eq!(
             plenty,
             Caps {
@@ -501,14 +578,14 @@ mod tests {
         );
         // An unreadable or unlimited rlimit means "assume plenty", not "assume
         // nothing" — the floors would otherwise cripple a healthy machine.
-        assert_eq!(caps_for(None), plenty);
+        assert_eq!(caps_for(None, 3), plenty);
     }
 
     #[test]
     fn caps_fit_inside_a_small_descriptor_limit() {
         // The default on the routers this targets.
         let limit = 1024;
-        let c = caps_for(Some(limit));
+        let c = caps_for(Some(limit), 1);
         // Each in-flight query holds an upstream socket and each accepted
         // connection is a descriptor, so the three together plus the reserve
         // must stay inside the limit.
@@ -519,11 +596,106 @@ mod tests {
         assert!(c.udp < MAX_CONCURRENT_UDP, "must actually scale down");
         assert!(c.udp >= MIN_CONCURRENT_UDP);
     }
+    #[test]
+    fn caps_leave_room_for_every_socket_a_query_fans_out_to() {
+        for limit in [1024usize, 4096, 16_384] {
+            let single = caps_for(Some(limit), 1);
+            for per_query in 1..=3 {
+                let c = caps_for(Some(limit), per_query);
+                // The descriptors a saturated forwarder holds: one per socket
+                // of every in-flight query, plus one per accepted connection.
+                assert!(
+                    (c.udp + c.tcp) * per_query + c.tcp_conns + FD_RESERVE <= limit,
+                    "{c:?} x{per_query} + reserve overruns {limit}"
+                );
+                assert!(
+                    c.udp <= single.udp && c.tcp <= single.tcp,
+                    "fanning out cannot raise a ceiling"
+                );
+                assert_eq!(
+                    c.tcp_conns, single.tcp_conns,
+                    "a connection costs one descriptor whatever the fan-out"
+                );
+            }
+            // A single upstream is the common config: its budget is unchanged.
+            assert_eq!(caps_for(Some(limit), 1), single);
+        }
+    }
+
+    #[test]
+    fn the_main_stage_may_answer_for_as_long_as_the_client_waits() {
+        for ms in [50u64, 250, 1_000] {
+            let t = Timings::from_qtime(Duration::from_millis(ms));
+            assert_eq!(t.hedge_after, Duration::from_millis(ms), "{ms}ms");
+            // The fallback joins in at the threshold; the main keeps going to
+            // the end of the window, so a late main answer can still win —
+            // and a main cut off at the threshold would look like a failure
+            // to the breaker when it is only slow.
+            assert!(
+                t.hedge_after < t.main,
+                "{ms}ms: the main must outlast the threshold"
+            );
+            assert!(
+                t.main >= t.hedge_after + t.fall,
+                "{ms}ms: the main must last as long as the client is willing to wait"
+            );
+        }
+    }
+
+    #[test]
+    fn each_file_group_probes_its_own_default() {
+        let with = |lease: &[&str], hosts: &[&str]| {
+            auto_detect_for(&Config {
+                lease_file: lease.iter().map(|s| (*s).to_string()).collect(),
+                hosts_file: hosts.iter().map(|s| (*s).to_string()).collect(),
+                hosts: [("static.lan.".to_string(), Vec::new())]
+                    .into_iter()
+                    .collect(),
+                ..Config::default()
+            })
+        };
+        let a = with(&[], &[]);
+        assert!(a.lease && a.hosts, "nothing named: both defaults apply");
+        let b = with(&["/tmp/x.leases"], &[]);
+        assert!(!b.lease && b.hosts, "a named lease file leaves hosts alone");
+        let c = with(&[], &["/tmp/x.hosts"]);
+        assert!(
+            c.lease && !c.hosts,
+            "a named hosts file leaves leases alone"
+        );
+        let d = with(&["/tmp/x.leases"], &["/tmp/x.hosts"]);
+        assert!(!d.lease && !d.hosts);
+    }
+
+    #[test]
+    fn the_sweep_reaches_every_cache_it_is_given() {
+        use crate::cache::{CacheKey, CachedMsg};
+        let caches = [Arc::new(Cache::new(64)), Arc::new(Cache::new(64))];
+        for (i, c) in caches.iter().enumerate() {
+            c.store(
+                CacheKey::new(vec![i as u8, 0], 1, 1),
+                Arc::new(CachedMsg {
+                    rcode: domain::base::iana::Rcode::NOERROR,
+                    answers: vec![],
+                    authority: vec![],
+                    additional: vec![],
+                }),
+                1,
+            );
+        }
+        // A stored TTL is at least a second, so wait one out rather than
+        // reaching into the entry.
+        std::thread::sleep(Duration::from_millis(1100));
+        sweep_all(&caches);
+        for (i, c) in caches.iter().enumerate() {
+            assert_eq!(c.len(), 0, "cache {i} kept an expired entry");
+        }
+    }
 
     #[test]
     fn caps_never_fall_below_the_floors() {
         for limit in [0usize, 1, 64, FD_RESERVE, FD_RESERVE + 1] {
-            let c = caps_for(Some(limit));
+            let c = caps_for(Some(limit), 3);
             assert_eq!(c.udp, MIN_CONCURRENT_UDP, "limit={limit}");
             assert_eq!(c.tcp, MIN_CONCURRENT_TCP, "limit={limit}");
             assert_eq!(c.tcp_conns, MIN_TCP_CONNS, "limit={limit}");
@@ -532,9 +704,9 @@ mod tests {
 
     #[test]
     fn caps_grow_monotonically_with_the_limit() {
-        let mut prev = caps_for(Some(0));
+        let mut prev = caps_for(Some(0), 2);
         for limit in (0..20_000).step_by(97) {
-            let c = caps_for(Some(limit));
+            let c = caps_for(Some(limit), 2);
             assert!(c.udp >= prev.udp && c.tcp >= prev.tcp && c.tcp_conns >= prev.tcp_conns);
             prev = c;
         }

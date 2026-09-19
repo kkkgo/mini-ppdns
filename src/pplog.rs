@@ -10,10 +10,10 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::aead::AeadInOut;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use domain::base::iana::Rtype;
 use domain::base::rdata::ComposeRecordData;
@@ -70,7 +70,9 @@ pub struct QueryEntry<'a> {
     pub rcode: u8,
     pub route: u8,
     pub duration_ms: u16,
-    pub query_name: &'a str,
+    /// The question name in wire form; the payload carries it in
+    /// presentation form (see `encode::write_name`).
+    pub qname_wire: &'a [u8],
     pub upstream: &'a str,
     pub answers: &'a [OwnedRecord],
     pub additional: &'a [OwnedRecord],
@@ -81,12 +83,74 @@ pub fn dur_to_ms(d: Duration) -> u16 {
     d.as_millis().min(0xFFFF) as u16
 }
 
-/// Mutable session state guarded by the lock: just the nonce inputs. Kept tiny
-/// so the lock is held only long enough to reserve a unique (session_id, seq)
-/// nonce — AEAD sealing happens outside the lock.
-struct Session {
+/// A payload queued for the sender task: what to seal, and at which level.
+struct Outgoing {
+    level: u8,
+    payload: Vec<u8>,
+}
+/// Packet framing and AEAD sealing.
+///
+/// Owned by the sender task alone, which is what lets the nonce counter live
+/// without a lock and the per-packet buffers be reused: sealing a 40-byte
+/// payload costs microseconds, far more than everything else a report does,
+/// and the query path must not pay it.
+struct Sealer {
+    cipher: ChaCha20Poly1305,
+    key_hint: [u8; 4],
     session_id: [u8; 8],
     seq: u32,
+    /// Plaintext buffer, sealed in place, so a packet allocates nothing.
+    inner: Vec<u8>,
+    packet: Vec<u8>,
+}
+impl Sealer {
+    fn new(cipher: ChaCha20Poly1305, key_hint: [u8; 4]) -> Self {
+        Sealer {
+            cipher,
+            key_hint,
+            session_id: random8(),
+            seq: 0,
+            inner: Vec::with_capacity(MAX_PACKET_SIZE),
+            packet: Vec::with_capacity(MAX_PACKET_SIZE),
+        }
+    }
+    /// Frame `payload` into a packet and seal it. Returns the packet bytes,
+    /// valid until the next call.
+    fn seal(&mut self, level: u8, payload: &[u8]) -> Option<&[u8]> {
+        self.seq = self.seq.wrapping_add(1);
+        if self.seq == 0 {
+            // seq wrapped: a fresh session id keeps the nonce unique.
+            self.session_id = random8();
+            self.seq = 1;
+        }
+        let mut nonce = [0u8; 12];
+        nonce[..8].copy_from_slice(&self.session_id);
+        nonce[8..].copy_from_slice(&self.seq.to_be_bytes());
+        let mut header = [0u8; HEADER_SIZE];
+        header[0] = MAGIC0;
+        header[1] = MAGIC1;
+        header[2..6].copy_from_slice(&self.key_hint);
+        header[6..18].copy_from_slice(&nonce);
+        let Sealer {
+            cipher,
+            inner,
+            packet,
+            ..
+        } = self;
+        inner.clear();
+        inner.extend_from_slice(&self.seq.to_be_bytes());
+        inner.push(level);
+        inner.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        inner.extend_from_slice(payload);
+        // The header is the associated data, as the collector expects.
+        cipher
+            .encrypt_in_place(&Nonce::from(nonce), &header, inner)
+            .ok()?;
+        packet.clear();
+        packet.extend_from_slice(&header);
+        packet.extend_from_slice(inner);
+        Some(packet)
+    }
 }
 
 pub struct Config {
@@ -97,15 +161,13 @@ pub struct Config {
 }
 
 /// Best-effort encrypted UDP reporter.
+///
+/// The query path only encodes a payload and queues it: framing, nonce
+/// assignment and AEAD sealing all run in the sender task (see [`Sealer`]),
+/// off the receive loop that answers clients.
 pub struct Reporter {
     level: u8,
-    // Immutable after construction → shared without locking. `ChaCha20Poly1305`
-    // is `Sync` and `encrypt` is a pure function of (key, nonce, plaintext), so
-    // sealing runs concurrently outside the session lock.
-    cipher: ChaCha20Poly1305,
-    key_hint: [u8; 4],
-    session: Mutex<Session>,
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<Outgoing>,
     // Unix time (seconds) of the last report; u32 for 32-bit MIPS (no 64-bit
     // atomics). Second granularity is fine for the heartbeat's liveness check.
     last_report: AtomicU32,
@@ -140,21 +202,18 @@ impl Reporter {
         let sock = tokio::net::UdpSocket::bind(bind).await.ok()?;
         sock.connect(&cfg.server).await.ok()?;
 
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
+        let (tx, mut rx) = mpsc::channel::<Outgoing>(CHANNEL_SIZE);
         tokio::spawn(async move {
-            while let Some(pkt) = rx.recv().await {
-                let _ = tokio::time::timeout(WRITE_TIMEOUT, sock.send(&pkt)).await;
+            let mut sealer = Sealer::new(cipher, key_hint);
+            while let Some(msg) = rx.recv().await {
+                if let Some(pkt) = sealer.seal(msg.level, &msg.payload) {
+                    let _ = tokio::time::timeout(WRITE_TIMEOUT, sock.send(pkt)).await;
+                }
             }
         });
 
         let reporter = Arc::new(Reporter {
             level: cfg.level as u8,
-            cipher,
-            key_hint,
-            session: Mutex::new(Session {
-                session_id: random8(),
-                seq: 0,
-            }),
             tx,
             last_report: AtomicU32::new(0),
             heartbeat_secs: cfg.heartbeat.max(0),
@@ -187,7 +246,7 @@ impl Reporter {
         } else {
             encode::encode_query(entry, level, ts)
         };
-        self.seal_and_send(level, &payload);
+        self.queue(level, payload);
     }
 
     /// Report a level-5 event (heartbeat, hook transitions, …). Sent only when
@@ -197,58 +256,14 @@ impl Reporter {
             return;
         }
         let payload = encode::encode_event(severity, msg, now_secs());
-        self.seal_and_send(5, &payload);
+        self.queue(5, payload);
     }
 
-    fn seal_and_send(&self, level: u8, payload: &[u8]) {
-        // Hold the lock only to reserve a unique nonce (session_id, seq); the
-        // AEAD sealing below runs lock-free. seq is monotonic under the lock and
-        // the session id rotates atomically with the wrap, so the nonce never
-        // repeats.
-        let (session_id, seq) = {
-            let mut s = self.session.lock().unwrap();
-            s.seq = s.seq.wrapping_add(1);
-            if s.seq == 0 {
-                // seq wrapped: new session id so the nonce never repeats.
-                s.session_id = random8();
-                s.seq = 1;
-            }
-            (s.session_id, s.seq)
-        };
-
-        let mut nonce = [0u8; 12];
-        nonce[..8].copy_from_slice(&session_id);
-        nonce[8..].copy_from_slice(&seq.to_be_bytes());
-
-        let mut header = [0u8; HEADER_SIZE];
-        header[0] = MAGIC0;
-        header[1] = MAGIC1;
-        header[2..6].copy_from_slice(&self.key_hint);
-        header[6..18].copy_from_slice(&nonce);
-
-        let mut inner = Vec::with_capacity(INNER_HEADER_SIZE + payload.len());
-        inner.extend_from_slice(&seq.to_be_bytes());
-        inner.push(level);
-        inner.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        inner.extend_from_slice(payload);
-
-        let ct = match self.cipher.encrypt(
-            &Nonce::from(nonce),
-            Payload {
-                msg: &inner,
-                aad: &header,
-            },
-        ) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-
-        let mut pkt = Vec::with_capacity(HEADER_SIZE + ct.len());
-        pkt.extend_from_slice(&header);
-        pkt.extend_from_slice(&ct);
-        let _ = self.tx.try_send(pkt);
+    /// Hand a payload to the sender task, which frames and seals it. Dropped
+    /// when the queue is full: telemetry never stalls a query.
+    fn queue(&self, level: u8, payload: Vec<u8>) {
+        let _ = self.tx.try_send(Outgoing { level, payload });
     }
-
     async fn heartbeat_loop(self: Arc<Self>) {
         let interval = Duration::from_secs(self.heartbeat_secs as u64);
         let mut tick = tokio::time::interval(interval);
@@ -301,27 +316,34 @@ mod encode {
         b.extend_from_slice(&ts.to_be_bytes());
 
         // flags + client IP (4 or 16 bytes)
-        let (is_v6, ip_bytes): (bool, Vec<u8>) = match e.client {
-            IpAddr::V4(v4) => (false, v4.octets().to_vec()),
+        let v6 = match e.client {
+            IpAddr::V4(_) => None,
             IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-                Some(v4) => (false, v4.octets().to_vec()),
-                None => (true, v6.octets().to_vec()),
+                Some(_) => None,
+                None => Some(v6),
             },
         };
-        b.push(if is_v6 { FLAG_IPV6 } else { 0 });
-        b.extend_from_slice(&ip_bytes);
+        b.push(if v6.is_some() { FLAG_IPV6 } else { 0 });
+        match (e.client, v6) {
+            (_, Some(v6)) => b.extend_from_slice(&v6.octets()),
+            (IpAddr::V4(v4), _) => b.extend_from_slice(&v4.octets()),
+            (IpAddr::V6(mapped), _) => {
+                b.extend_from_slice(&mapped.to_ipv4_mapped().expect("mapped").octets())
+            }
+        }
 
         b.extend_from_slice(&e.qtype.to_be_bytes());
         b.push(e.rcode);
         b.push(e.route);
         b.extend_from_slice(&e.duration_ms.to_be_bytes());
 
-        // name (trailing dot stripped, capped 255)
-        let name = e.query_name.strip_suffix('.').unwrap_or(e.query_name);
-        let nb = name.as_bytes();
-        let n = nb.len().min(255);
-        b.push(n as u8);
-        b.extend_from_slice(&nb[..n]);
+        // name in presentation form (no root dot), capped at 255 bytes
+        let at = b.len();
+        b.push(0);
+        write_name(&mut b, e.qname_wire);
+        let n = (b.len() - at - 1).min(255);
+        b.truncate(at + 1 + n);
+        b[at] = n as u8;
 
         if level < 2 {
             return b;
@@ -342,6 +364,40 @@ mod encode {
         b
     }
 
+    /// Append a wire-form name in presentation form, without the root dot.
+    /// Escaping matches the `domain` crate's `Display`: space, dot and
+    /// backslash take a backslash, and anything outside printable ASCII
+    /// becomes a three-digit `\\DDD` escape. The root name renders empty.
+    pub fn write_name(b: &mut Vec<u8>, wire: &[u8]) {
+        let mut i = 0;
+        let mut first = true;
+        while let Some(&len) = wire.get(i) {
+            let len = usize::from(len);
+            if len == 0 {
+                break;
+            }
+            let Some(label) = wire.get(i + 1..i + 1 + len) else {
+                break;
+            };
+            if !first {
+                b.push(b'.');
+            }
+            first = false;
+            for &c in label {
+                match c {
+                    b' ' | b'.' | b'\\' => b.extend_from_slice(&[b'\\', c]),
+                    0x20..=0x7E => b.push(c),
+                    _ => b.extend_from_slice(&[
+                        b'\\',
+                        b'0' + c / 100,
+                        b'0' + (c / 10) % 10,
+                        b'0' + c % 10,
+                    ]),
+                }
+            }
+            i += 1 + len;
+        }
+    }
     /// count(1) + per-RR: type(2) + ttl(4) + rdlen(2) + rdata. OPT is skipped.
     fn encode_rr_section(b: &mut Vec<u8>, records: &[&OwnedRecord]) {
         let count_idx = b.len();
@@ -443,6 +499,7 @@ mod encode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chacha20poly1305::aead::{Aead, Payload};
 
     #[test]
     fn uuid_parsing() {
@@ -466,7 +523,7 @@ mod tests {
             rcode: 0,
             route: ROUTE_LOCAL,
             duration_ms: 5,
-            query_name: "example.com.",
+            qname_wire: b"\x07example\x03com\x00",
             upstream: "",
             answers: &[],
             additional: &[],
@@ -492,7 +549,7 @@ mod tests {
             rcode: RCODE_NODATA,
             route: ROUTE_FALL,
             duration_ms: 0,
-            query_name: "x.",
+            qname_wire: b"\x01x\x00",
             upstream: "1.1.1.1:53",
             answers: &[],
             additional: &[],
@@ -505,53 +562,150 @@ mod tests {
     }
 
     #[test]
-    fn seal_roundtrip() {
-        // Build a session, seal a payload, and decrypt it back with the same
-        // key/nonce to prove the header+inner framing.
+    fn the_sealer_frames_what_a_collector_decrypts() {
+        // Seal through the production sealer and take it apart the way the
+        // collector does: header as associated data, then the inner framing.
         let uuid = parse_uuid("00112233445566778899aabbccddeeff").unwrap();
         let hash = Sha256::digest(uuid);
         let cipher = ChaCha20Poly1305::new_from_slice(&hash).unwrap();
-        let session_id = [1u8, 2, 3, 4, 5, 6, 7, 8];
-        let seq: u32 = 1;
+        let mut key_hint = [0u8; 4];
+        key_hint.copy_from_slice(&hash[..4]);
+        let mut sealer = Sealer::new(cipher.clone(), key_hint);
+        let mut seen_nonces = std::collections::HashSet::new();
+        for (i, payload) in [
+            b"hello-telemetry".to_vec(),
+            Vec::new(),
+            vec![0xA5; MAX_INNER_PAYLOAD],
+            b"third".to_vec(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let level = (i as u8 % 5) + 1;
+            let pkt = sealer.seal(level, &payload).expect("sealed").to_vec();
+            assert!(
+                pkt.len() <= MAX_PACKET_SIZE,
+                "packet {i} overruns the datagram"
+            );
+            assert_eq!(&pkt[..2], &[MAGIC0, MAGIC1]);
+            assert_eq!(&pkt[2..6], &hash[..4], "key hint");
+            let header = &pkt[..HEADER_SIZE];
+            let mut nonce = [0u8; 12];
+            nonce.copy_from_slice(&pkt[6..18]);
+            assert!(seen_nonces.insert(nonce), "a nonce repeated");
+            let pt = cipher
+                .decrypt(
+                    &Nonce::from(nonce),
+                    Payload {
+                        msg: &pkt[HEADER_SIZE..],
+                        aad: header,
+                    },
+                )
+                .expect("collector decrypts with the header as AAD");
+            let seq = u32::from_be_bytes([pt[0], pt[1], pt[2], pt[3]]);
+            assert_eq!(seq, i as u32 + 1, "sequence numbers run in order");
+            // The nonce carries the same sequence number as the sealed body.
+            assert_eq!(&nonce[8..], &seq.to_be_bytes());
+            assert_eq!(pt[4], level);
+            assert_eq!(
+                u16::from_be_bytes([pt[5], pt[6]]) as usize,
+                payload.len(),
+                "declared payload length"
+            );
+            assert_eq!(&pt[INNER_HEADER_SIZE..], &payload[..]);
+        }
+    }
+    #[test]
+    fn an_over_long_name_is_capped_to_the_length_byte() {
+        // Every byte escapes to four, so this renders far past 255 and the
+        // payload's one-byte length must still describe what follows.
+        let mut wire = Vec::new();
+        for _ in 0..4 {
+            wire.push(60u8);
+            wire.extend(std::iter::repeat_n(0u8, 60));
+        }
+        wire.push(0);
+        let e = QueryEntry {
+            client: "1.2.3.4".parse().unwrap(),
+            qtype: 1,
+            rcode: 0,
+            route: ROUTE_LOCAL,
+            duration_ms: 0,
+            qname_wire: &wire,
+            upstream: "",
+            answers: &[],
+            additional: &[],
+        };
+        let out = encode::encode_query(&e, 1, 0);
+        assert_eq!(out[15], 255, "length byte");
+        assert_eq!(out.len(), 16 + 255, "name truncated to the declared length");
+    }
 
-        let mut nonce = [0u8; 12];
-        nonce[..8].copy_from_slice(&session_id);
-        nonce[8..].copy_from_slice(&seq.to_be_bytes());
-        let mut header = [0u8; 18];
-        header[0] = MAGIC0;
-        header[1] = MAGIC1;
-        header[2..6].copy_from_slice(&hash[..4]);
-        header[6..18].copy_from_slice(&nonce);
+    #[test]
+    fn rendered_names_match_the_display_they_replaced() {
+        use domain::base::Name;
+        // Names built from the bytes that make rendering interesting: the
+        // escaped characters, the printable range, and everything outside it.
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut compared = 0;
+        let mut escaped = 0;
+        for round in 0..20_000u32 {
+            let mut wire: Vec<u8> = Vec::new();
+            if round > 0 {
+                for _ in 0..1 + rng() % 4 {
+                    let len = 1 + (rng() % 9) as usize;
+                    if wire.len() + len + 2 > 255 {
+                        break;
+                    }
+                    wire.push(len as u8);
+                    for _ in 0..len {
+                        wire.push(match rng() % 8 {
+                            0 => b'.',
+                            1 => b'\\',
+                            2 => b' ',
+                            3 => (rng() % 256) as u8,
+                            4 => 0x7F,
+                            _ => b"abzAZ09-_*"[(rng() % 10) as usize],
+                        });
+                    }
+                }
+            }
+            wire.push(0); // root, and for round 0 the root name itself
+            let Ok(name) = Name::from_octets(wire.clone()) else {
+                continue;
+            };
+            // `Display` already omits the root dot, except for the root
+            // name itself, which the payload carries as an empty name.
+            let shown = name.to_string();
+            let want = if name.is_root() { "" } else { shown.as_str() };
+            let mut got = Vec::new();
+            encode::write_name(&mut got, &wire);
+            assert_eq!(String::from_utf8_lossy(&got), want, "wire={wire:?}");
+            compared += 1;
+            escaped += usize::from(got.contains(&b'\\'));
+        }
+        assert!(compared > 10_000, "only {compared} names compared");
+        assert!(escaped > 1_000, "only {escaped} names exercised an escape");
+    }
 
-        let payload = b"hello-telemetry";
-        let mut inner = Vec::new();
-        inner.extend_from_slice(&seq.to_be_bytes());
-        inner.push(1);
-        inner.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        inner.extend_from_slice(payload);
-
-        let ct = cipher
-            .encrypt(
-                &Nonce::from(nonce),
-                Payload {
-                    msg: &inner,
-                    aad: &header,
-                },
-            )
-            .unwrap();
-        // Decrypt using the header as AAD (what the collector does).
-        let pt = cipher
-            .decrypt(
-                &Nonce::from(nonce),
-                Payload {
-                    msg: &ct,
-                    aad: &header,
-                },
-            )
-            .unwrap();
-        assert_eq!(pt, inner);
-        assert_eq!(&pt[0..4], &seq.to_be_bytes());
-        assert_eq!(pt[4], 1); // level
-        assert_eq!(&pt[7..], payload);
+    #[test]
+    fn a_wrapped_sequence_starts_a_new_session() {
+        let hash = Sha256::digest(parse_uuid("00112233445566778899aabbccddeeff").unwrap());
+        let cipher = ChaCha20Poly1305::new_from_slice(&hash).unwrap();
+        let mut sealer = Sealer::new(cipher, [0; 4]);
+        sealer.seq = u32::MAX - 1;
+        let before = sealer.session_id;
+        let last = sealer.seal(1, b"x").expect("sealed")[6..18].to_vec();
+        assert_eq!(&last[8..], &u32::MAX.to_be_bytes());
+        let wrapped = sealer.seal(1, b"x").expect("sealed")[6..18].to_vec();
+        // Reusing (session id, seq) would reuse a nonce, which breaks the AEAD.
+        assert_eq!(&wrapped[8..], &1u32.to_be_bytes(), "seq restarts at 1");
+        assert_ne!(&wrapped[..8], &before[..], "with a fresh session id");
     }
 }

@@ -214,7 +214,11 @@ fn parse_hosts(line: &str, cfg: &mut Config, warnings: &mut Vec<String>) {
             .unwrap_or(domain)
             .to_ascii_lowercase();
         let key = format!("{base}.");
-        cfg.hosts.entry(key).or_default().push(ip);
+        // Same reason as the hosts-file loader: no duplicate RRs.
+        let ips = cfg.hosts.entry(key).or_default();
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
     }
 }
 
@@ -274,6 +278,22 @@ fn parse_hook(line: &str, cfg: &mut Config, warnings: &mut Vec<String>) {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn a_hosts_entry_repeated_in_the_config_is_kept_once() {
+        let (cfg, _) =
+            parse_str("[hosts]\n10.0.0.5 dup.lan\n10.0.0.5 dup.lan alias.lan\n10.0.0.6 dup.lan\n");
+        let ips = cfg.hosts.get("dup.lan.").expect("entry");
+        assert_eq!(
+            ips,
+            &vec![
+                "10.0.0.5".parse::<IpAddr>().unwrap(),
+                "10.0.0.6".parse().unwrap()
+            ],
+            "a repeated line must not become a repeated record"
+        );
+        assert_eq!(cfg.hosts.get("alias.lan.").map(Vec::len), Some(1));
+    }
 
     fn parse_str(contents: &str) -> (Config, Vec<String>) {
         let mut path = std::env::temp_dir();

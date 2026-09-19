@@ -30,6 +30,10 @@ const UDP_RECV_BUF: usize = 4096;
 const TCP_MAX_MSG: usize = 65535;
 /// Cap on idle connections retained per upstream (bounds fd usage under bursts).
 const MAX_IDLE_CONNS: usize = 128;
+/// How long a pooled connection may sit idle before it is dropped instead of
+/// reused. Comfortably under the shortest NAT/conntrack idle timeouts a home
+/// router runs with, so a reused connection is one the path still carries.
+const MAX_IDLE_AGE: Duration = Duration::from_secs(10);
 /// Consecutive hard failures (timeout / socket error / unparseable reply) that
 /// trip the main upstream's breaker. Large enough that ordinary packet loss
 /// cannot trip it — five independent losses in a row — small enough to react
@@ -37,8 +41,11 @@ const MAX_IDLE_CONNS: usize = 128;
 const BREAKER_FAILS: u32 = 5;
 /// How long a tripped upstream is skipped before one probe is let through.
 /// One second, so recovery is noticed almost immediately — switching *back* to
-/// the main DNS has to stay fast.
-const BREAKER_COOLDOWN_SECS: u32 = 1;
+/// the main DNS has to stay fast. Counted in deciseconds: whole seconds would
+/// round the deadline down to the current second, cutting the cooldown to
+/// whatever is left of it. `u32` deciseconds still spans 13 years, and the
+/// 32-bit MIPS targets have no 64-bit atomics.
+const BREAKER_COOLDOWN_DS: u32 = 10;
 /// Upstream label reported when the breaker answered instead of the network.
 const CIRCUIT_OPEN: &str = "circuit-open";
 
@@ -61,7 +68,11 @@ pub struct Upstream {
     /// Idle connected sockets, each carrying its own receive buffer so the hot
     /// path does not allocate (and zero) a fresh `UDP_RECV_BUF` per query.
     idle_udp: Mutex<Vec<(UdpSocket, Vec<u8>)>>,
-    idle_tcp: Mutex<Vec<TcpStream>>,
+    /// Idle connections with the moment each was returned: one a NAT or
+    /// firewall has blackholed answers nothing and has no FIN to notice, so a
+    /// query on it burns the whole deadline. Anything idle past
+    /// [`MAX_IDLE_AGE`] is dropped rather than reused.
+    idle_tcp: Mutex<Vec<(TcpStream, Instant)>>,
 }
 
 impl Upstream {
@@ -98,8 +109,11 @@ impl Upstream {
                 let resp = timeout(deadline, self.query_udp(query))
                     .await
                     .map_err(|_| "timeout".to_string())??;
-                // Truncated → retry over TCP (RFC 1035 fallback).
-                if resp.len() >= 3 && (resp[2] & 0x02) != 0 {
+                // Truncated → retry over TCP (RFC 1035 fallback). A datagram
+                // that exactly fills the receive buffer counts as truncated
+                // too: the kernel drops the tail without reporting an error,
+                // so the alternative is serving (and caching) a partial RRset.
+                if resp.len() >= 3 && ((resp[2] & 0x02) != 0 || resp.len() == UDP_RECV_BUF) {
                     let remaining = deadline.saturating_sub(start.elapsed());
                     if remaining.is_zero() {
                         return Err("timeout".to_string());
@@ -165,7 +179,19 @@ impl Upstream {
     async fn query_tcp(&self, query: &[u8]) -> Result<Vec<u8>, String> {
         // Try a pooled connection; on failure (peer may have closed an idle
         // conn) retry once with a fresh dial.
-        let pooled = self.idle_tcp.lock().unwrap().pop();
+        let pooled = {
+            let mut idle = self.idle_tcp.lock().unwrap();
+            match idle.pop() {
+                Some((stream, since)) if since.elapsed() <= MAX_IDLE_AGE => Some(stream),
+                // Returned connections are pushed, so the rest of the pool is
+                // older still: it is all past its idle limit too.
+                Some(_) => {
+                    idle.clear();
+                    None
+                }
+                None => None,
+            }
+        };
         if let Some(stream) = pooled {
             if let Ok(resp) = self.tcp_exchange(stream, query).await {
                 return Ok(resp);
@@ -209,7 +235,7 @@ impl Upstream {
         }
         let mut idle = self.idle_tcp.lock().unwrap();
         if idle.len() < MAX_IDLE_CONNS {
-            idle.push(stream);
+            idle.push((stream, Instant::now()));
         }
         Ok(resp)
     }
@@ -294,9 +320,9 @@ struct Breaker {
     base: Instant,
     /// Consecutive hard failures.
     fails: AtomicU32,
-    /// Cooldown deadline, seconds since `base`; 0 means "closed" (not tripped).
-    /// `AtomicU32`, never `AtomicU64`: 32-bit MIPS release targets have no
-    /// 64-bit atomics. Seconds give 136 years of headroom.
+    /// Cooldown deadline, deciseconds since `base`; 0 means "closed" (not
+    /// tripped). `AtomicU32`, never `AtomicU64`: 32-bit MIPS release targets
+    /// have no 64-bit atomics. Deciseconds give 13 years of headroom.
     open_until: AtomicU32,
     /// Held by the one query currently probing a tripped upstream.
     probing: AtomicBool,
@@ -334,8 +360,8 @@ impl Breaker {
         }
     }
 
-    fn now_secs(&self) -> u32 {
-        self.base.elapsed().as_secs() as u32
+    fn now_ds(&self) -> u32 {
+        (self.base.elapsed().as_millis() / 100) as u32
     }
 
     fn admit(&self) -> Admit<'_> {
@@ -343,7 +369,7 @@ impl Breaker {
         if until == 0 {
             return Admit::Closed;
         }
-        if self.now_secs() < until {
+        if self.now_ds() < until {
             return Admit::Open;
         }
         // Cooldown elapsed: exactly one caller becomes the probe, the rest keep
@@ -370,7 +396,7 @@ impl Breaker {
             // Also re-arms after a failed probe, which lands here with the
             // streak already past the threshold.
             self.open_until
-                .store(self.now_secs() + BREAKER_COOLDOWN_SECS, Ordering::Relaxed);
+                .store(self.now_ds() + BREAKER_COOLDOWN_DS, Ordering::Relaxed);
         }
     }
 }
@@ -395,6 +421,19 @@ pub struct ForwardResult {
 }
 
 impl Forwarder {
+    /// Whether the breaker is currently refusing queries (tests only).
+    #[cfg(test)]
+    pub fn breaker_is_open(&self) -> bool {
+        self.breaker
+            .as_ref()
+            .is_some_and(|b| b.open_until.load(Ordering::Relaxed) != 0)
+    }
+
+    /// Descriptors one in-flight query can hold here: the fan-out asks this
+    /// many upstreams at once, each on its own socket.
+    pub fn sockets_per_query(&self) -> usize {
+        MAX_CONCURRENT_QUERIES.min(self.upstreams.len()).max(1)
+    }
     pub fn new(upstreams: Vec<Arc<Upstream>>, timeout: Duration) -> Self {
         Forwarder {
             upstreams,
@@ -568,6 +607,33 @@ mod tests {
     use domain::base::iana::Rtype;
     use domain::base::{MessageBuilder, Name};
     use std::str::FromStr;
+
+    #[test]
+    fn a_query_claims_one_socket_per_upstream_it_fans_out_to() {
+        let fwd = |n: usize| {
+            Forwarder::new(
+                (0..n)
+                    .map(|i| {
+                        Arc::new(
+                            Upstream::parse(&format!("udp://127.0.0.1:{}", 60000 + i)).unwrap(),
+                        )
+                    })
+                    .collect(),
+                Duration::from_millis(100),
+            )
+        };
+        // The descriptor budget is derived from this, so it has to track the
+        // fan-out the forwarder actually performs.
+        assert_eq!(
+            fwd(0).sockets_per_query(),
+            1,
+            "an empty forwarder holds one"
+        );
+        assert_eq!(fwd(1).sockets_per_query(), 1);
+        assert_eq!(fwd(2).sockets_per_query(), 2);
+        assert_eq!(fwd(3).sockets_per_query(), MAX_CONCURRENT_QUERIES);
+        assert_eq!(fwd(9).sockets_per_query(), MAX_CONCURRENT_QUERIES);
+    }
 
     #[test]
     fn parse_schemes() {
@@ -839,6 +905,170 @@ mod tests {
             }
         });
         (format!("udp://{addr}"), alive)
+    }
+
+    #[test]
+    fn the_breaker_cooldown_does_not_end_early_in_the_second_it_trips() {
+        let b = Breaker::new();
+        // Trip as late in a whole second as possible: a deadline rounded down
+        // to whole seconds would then expire within milliseconds.
+        while b.now_ds() % 10 != 9 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for _ in 0..BREAKER_FAILS {
+            b.record(false);
+        }
+        assert!(matches!(b.admit(), Admit::Open), "must be tripped");
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            matches!(b.admit(), Admit::Open),
+            "a probe was let through inside the cooldown"
+        );
+        std::thread::sleep(Duration::from_millis(900));
+        assert!(
+            matches!(b.admit(), Admit::Probe(_)),
+            "the cooldown must end about a second after it trips"
+        );
+    }
+
+    /// A TCP mock that counts how many connections it accepts.
+    async fn mock_tcp_counting() -> (String, Arc<AtomicU32>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conns = Arc::new(AtomicU32::new(0));
+        let seen = conns.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                seen.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 2];
+                        if s.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let n = u16::from_be_bytes(len) as usize;
+                        let mut q = vec![0u8; n];
+                        if s.read_exact(&mut q).await.is_err() {
+                            return;
+                        }
+                        q[2] |= 0x80; // QR, echoing the question back
+                        let _ = s.write_all(&(q.len() as u16).to_be_bytes()).await;
+                        let _ = s.write_all(&q).await;
+                    }
+                });
+            }
+        });
+        (format!("tcp://{addr}"), conns)
+    }
+
+    #[tokio::test]
+    async fn a_pooled_connection_past_its_idle_limit_is_not_reused() {
+        let (url, conns) = mock_tcp_counting().await;
+        let up = Arc::new(Upstream::parse(&url).unwrap());
+        let f = Forwarder::new(vec![up.clone()], Duration::from_millis(500));
+
+        assert!(!f.exec(&mut query()).await.had_error);
+        assert_eq!(conns.load(Ordering::Relaxed), 1);
+        // Straight away the pooled connection is reused.
+        assert!(!f.exec(&mut query()).await.had_error);
+        assert_eq!(conns.load(Ordering::Relaxed), 1, "pool must be reused");
+
+        // Age it past the limit: such a connection may have been blackholed by
+        // a NAT that will never answer, so it has to be dropped, not reused.
+        {
+            let mut idle = up.idle_tcp.lock().unwrap();
+            assert_eq!(idle.len(), 1, "one connection pooled");
+            idle[0].1 = Instant::now() - MAX_IDLE_AGE - Duration::from_secs(1);
+        }
+        assert!(!f.exec(&mut query()).await.had_error);
+        assert_eq!(
+            conns.load(Ordering::Relaxed),
+            2,
+            "an over-idle connection must be replaced, not reused"
+        );
+    }
+
+    /// A UDP mock that answers with a datagram larger than the receive buffer,
+    /// plus a TCP side on the same port that answers properly.
+    async fn mock_oversized_udp() -> (String, Arc<AtomicU32>) {
+        use domain::base::iana::Class;
+        use domain::base::name::ToName;
+        use domain::base::Ttl;
+        use domain::rdata::A;
+
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let tcp_hits = Arc::new(AtomicU32::new(0));
+
+        fn answer(q: &[u8], records: usize) -> Option<Vec<u8>> {
+            let msg = dns::parse(q.to_vec())?;
+            let mut b = MessageBuilder::new_vec()
+                .start_answer(&msg, Rcode::NOERROR)
+                .ok()?;
+            let owner = Name::<Vec<u8>>::from_str("example.com.").unwrap();
+            for i in 0..records {
+                b.push((
+                    owner.to_name::<Vec<u8>>(),
+                    Class::IN,
+                    Ttl::from_secs(300),
+                    A::from_octets(10, 0, (i / 256) as u8, i as u8),
+                ))
+                .ok()?;
+            }
+            Some(b.finish())
+        }
+
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                // ~300 A records: over the 4096-byte receive buffer, which the
+                // kernel silently cuts short.
+                if let Some(resp) = answer(&buf[..n], 300) {
+                    let _ = sock.send_to(&resp, peer).await;
+                }
+            }
+        });
+        let hits = tcp_hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                hits.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut len = [0u8; 2];
+                    if s.read_exact(&mut len).await.is_err() {
+                        return;
+                    }
+                    let n = u16::from_be_bytes(len) as usize;
+                    let mut q = vec![0u8; n];
+                    if s.read_exact(&mut q).await.is_err() {
+                        return;
+                    }
+                    if let Some(resp) = answer(&q, 3) {
+                        let _ = s.write_all(&(resp.len() as u16).to_be_bytes()).await;
+                        let _ = s.write_all(&resp).await;
+                    }
+                });
+            }
+        });
+        (format!("udp://{addr}"), tcp_hits)
+    }
+
+    #[tokio::test]
+    async fn a_datagram_that_fills_the_buffer_is_re_asked_over_tcp() {
+        let (url, tcp_hits) = mock_oversized_udp().await;
+        let f = fwd(&[url], 800);
+        let r = f.exec(&mut query()).await;
+        let resp = r.response.expect("an answer");
+        assert!(!r.had_error);
+        assert_eq!(
+            tcp_hits.load(Ordering::Relaxed),
+            1,
+            "a buffer-filling datagram must be re-asked over TCP"
+        );
+        // The TCP answer is the complete one, and complete means parseable to
+        // its last record.
+        let count = resp.answer().unwrap().count();
+        assert_eq!(count, 3, "the TCP answer is what gets returned");
     }
 
     #[tokio::test]

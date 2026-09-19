@@ -11,6 +11,7 @@ mod hook;
 mod local_resolver;
 mod log;
 mod pplog;
+mod ready;
 mod rng;
 mod server;
 mod sysinfo;
@@ -30,13 +31,18 @@ const VERSION: &str = match option_env!("MINI_PPDNS_VERSION") {
 };
 
 fn main() -> ExitCode {
+    // A `-d` child inherits a pipe its parent is waiting on; everything below
+    // that can fail fatally has to be able to say so through it.
+    ready::adopt_from_env();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(Fatal::Usage(msg)) => {
+            ready::failed(&msg);
             eprintln!("{msg}");
             ExitCode::from(2)
         }
         Err(Fatal::Config(msg)) => {
+            ready::failed(&msg);
             eprintln!("{msg}");
             ExitCode::from(1)
         }
@@ -108,8 +114,20 @@ fn run() -> Result<(), Fatal> {
     app::run(&cfg, listen, matcher, dns_upstreams, fall_upstreams).map_err(Fatal::Config)
 }
 
-/// Re-exec this binary in a new session (setsid) without the `-d` flag, print
-/// the child PID, and exit the parent. Never returns.
+/// How long the parent waits for the child's startup report before assuming
+/// it is simply slow. Binding is the last step before the report and takes
+/// milliseconds; a child still silent after this is reported as started, since
+/// there is nothing better to say about it.
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Re-exec this binary in a new session (setsid) without the `-d` flag, wait
+/// for it to report that it is serving, and exit with that verdict. Never
+/// returns.
+///
+/// The child binds its listen addresses only after this fork, with its stdio
+/// already pointed at /dev/null, so without the report the parent would print
+/// "started" and exit 0 even when the child dies on `EADDRINUSE` — which is
+/// what watchdog scripts then retry forever, silently.
 fn daemonize() -> ! {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -125,28 +143,84 @@ fn daemonize() -> ! {
         .skip(1)
         .filter(|a| !is_daemon_flag_arg(a))
         .collect();
+
+    let mut fds = [0i32; 2];
+    // SAFETY: `pipe2` writes exactly two descriptors into the array.
+    let piped = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0;
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+
     let mut cmd = Command::new(exe);
     cmd.args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // SAFETY: setsid is async-signal-safe and the only work done in the child
-    // between fork and exec.
+    if piped {
+        cmd.env(ready::READY_FD_VAR, write_fd.to_string());
+    }
+    // SAFETY: setsid and fcntl are async-signal-safe and the only work done in
+    // the child between fork and exec.
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             libc::setsid();
+            if piped {
+                // The pipe was created close-on-exec so no other child can
+                // inherit it; this one must, so clear the flag.
+                libc::fcntl(write_fd, libc::F_SETFD, 0);
+            }
             Ok(())
         });
     }
-    match cmd.spawn() {
-        Ok(child) => {
-            println!("Started in background with PID {}", child.id());
-            std::process::exit(0);
-        }
+    let child = match cmd.spawn() {
+        Ok(child) => child,
         Err(e) => {
             eprintln!("Failed to start daemon: {e}");
             std::process::exit(1);
         }
+    };
+    if !piped {
+        println!("Started in background with PID {}", child.id());
+        std::process::exit(0);
+    }
+    // The parent's copy of the write end has to go, or the read below never
+    // reaches EOF when the child exits without reporting.
+    // SAFETY: this descriptor is the parent's own and is not used again.
+    unsafe { libc::close(write_fd) };
+    match child_report(read_fd) {
+        Ok(()) => {
+            println!("Started in background with PID {}", child.id());
+            std::process::exit(0);
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Wait for the child's startup report on `read_fd`. `Ok` means it is serving
+/// (or stayed silent long enough that we stop waiting); `Err` carries what to
+/// print.
+fn child_report(read_fd: i32) -> Result<(), String> {
+    use std::io::Read;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // SAFETY: the read end belongs to this process and is used only here;
+        // the `File` closes it on drop.
+        let mut pipe = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(read_fd) };
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    match rx.recv_timeout(READY_TIMEOUT) {
+        Ok(buf) if buf == ready::OK => Ok(()),
+        // Still starting after the timeout: report it as started, which is the
+        // best that can be said.
+        Err(_) => Ok(()),
+        Ok(buf) if buf.is_empty() => {
+            Err("Failed to start in background: it exited during startup".to_string())
+        }
+        Ok(buf) => Err(String::from_utf8_lossy(&buf).into_owned()),
     }
 }
 
