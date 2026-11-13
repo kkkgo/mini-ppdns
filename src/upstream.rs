@@ -11,8 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use domain::base::iana::Rcode;
+use domain::base::iana::{OptRcode, Rcode};
 use domain::base::Message;
+use domain::rdata::AllRecordData;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinSet;
@@ -161,7 +162,12 @@ impl Upstream {
             // Anything else is skipped and we keep waiting, bounded by the
             // caller's deadline — no fixed round cap, which could otherwise drop
             // a valid late answer that trailed a few stale datagrams.
-            if n >= 2 && buf[0..2] == query[0..2] && reply_matches(&buf[..n], query, qend) {
+            if reply_matches(&buf[..n], query, qend)
+                && ((buf[2] & 0x02) != 0 || n == UDP_RECV_BUF || response_is_complete(&buf[..n]))
+            {
+                // TC and buffer-filling replies may end halfway through an
+                // RR. Validate only their header/question here: `query` will
+                // retry them over TCP before anything reaches the forwarder.
                 // Copy out the exact response bytes and return the (still
                 // full-size) scratch buffer to the pool with its socket. Only
                 // `buf[..n]` is ever read, so bytes left over from an earlier,
@@ -226,12 +232,14 @@ impl Upstream {
             .read_exact(&mut resp)
             .await
             .map_err(|e| e.to_string())?;
-        // The transport is connection-oriented, so spoofing isn't a concern;
-        // this guards against a protocol-violating server desyncing the
-        // stream. A wrong id means the reply belongs to some other exchange —
-        // fail (the caller redials) and don't pool the stream.
-        if resp.len() < 2 || resp[0..2] != query[0..2] {
-            return Err("tcp reply id mismatch".to_string());
+        // A protocol-violating peer can send a stale or malformed response on
+        // a connected stream too. Validate it before returning the connection
+        // to the pool (the caller can redial after a failed pooled exchange).
+        if !reply_matches(&resp, query, question_end(query)) {
+            return Err("tcp reply header/question mismatch".to_string());
+        }
+        if !response_is_complete(&resp) {
+            return Err("malformed tcp reply".to_string());
         }
         let mut idle = self.idle_tcp.lock().unwrap();
         if idle.len() < MAX_IDLE_CONNS {
@@ -276,24 +284,69 @@ fn question_end(query: &[u8]) -> Option<usize> {
     }
 }
 
-/// Whether `reply` echoes `query`'s question verbatim. The question sits at the
-/// same offset (12) in query and reply, uncompressed, so a byte compare is both
-/// sufficient and stricter than a parse (it also pins QTYPE/QCLASS). A reply
+/// Whether `reply` has the matching response header and question. The question
+/// sits at the same offset (12) in query and reply, uncompressed, so a byte
+/// compare is sufficient and stricter than a parse (it also pins QTYPE/QCLASS). A reply
 /// carrying no question (QDCOUNT==0, as some servers' error replies do) is
-/// accepted on the transaction-ID match alone, preserving forwarding behavior.
+/// accepted only for an error rcode, preserving those servers' error replies.
 fn reply_matches(reply: &[u8], query: &[u8], qend: Option<usize>) -> bool {
-    if reply.len() < 6 {
+    if reply.len() < 12
+        || query.len() < 12
+        || reply[0..2] != query[0..2]
+        || reply[2] & 0x80 == 0
+        || reply[2] & 0x78 != query[2] & 0x78
+    {
         return false;
     }
     let qdcount = u16::from_be_bytes([reply[4], reply[5]]);
     if qdcount == 0 {
-        return true;
+        if reply[3] & 0x0f != 0 {
+            return true;
+        }
+        // EDNS errors such as BADVERS have zero in the header's rcode bits.
+        // Only this questionless case needs the extra OPT lookup. Parsing the
+        // OPT also rejects a cut-off record or malformed option lengths;
+        // complete replies still undergo the full record validation below.
+        return Message::from_octets(reply).ok().is_some_and(|msg| {
+            msg.opt()
+                .is_some_and(|opt| opt.rcode(msg.header()) != OptRcode::NOERROR)
+        });
+    }
+    if qdcount != 1 || query[4..6] != [0, 1] {
+        return false;
     }
     match qend {
         Some(end) => reply.len() >= end && reply[12..end] == query[12..end],
-        // Query question length unknown (never happens for our queries): don't
-        // reject on that basis.
-        None => true,
+        None => false,
+    }
+}
+
+/// `Message::from_octets` only checks the header length. Walk every question
+/// and every record, including its typed RDATA, before accepting a complete
+/// response. Otherwise a valid first RR can hide a malformed later RR and be
+/// forwarded/cached as a successful partial answer. AllRecordData also keeps
+/// unknown record types as opaque data, as DNS requires.
+fn response_is_complete(reply: &[u8]) -> bool {
+    let Ok(msg) = Message::from_octets(reply) else {
+        return false;
+    };
+    let mut questions = msg.question();
+    if questions.by_ref().any(|question| question.is_err()) {
+        return false;
+    }
+    let Ok(mut section) = questions.next_section() else {
+        return false;
+    };
+    loop {
+        let mut records = section.into_records::<AllRecordData<_, _>>();
+        if records.by_ref().any(|record| record.is_err()) {
+            return false;
+        }
+        match records.next_section() {
+            Ok(Some(next)) => section = next,
+            Ok(None) => return true,
+            Err(_) => return false,
+        }
     }
 }
 
@@ -720,25 +773,303 @@ mod tests {
         let qend = question_end(&q);
         assert_eq!(qend, Some(29)); // 12 header + 13 qname + 4 (qtype+qclass)
 
-        // Verbatim echo (id changed, QR set) matches.
+        // Verbatim echo with matching id and QR set matches.
         let mut good = q.clone();
-        good[0] ^= 0xAB; // different id
         good[2] |= 0x80; // QR
         assert!(reply_matches(&good, &q, qend));
 
         // A different question is rejected.
-        let mut bad = q.clone();
+        let mut bad = good.clone();
         bad[13] ^= 0xFF; // corrupt a QNAME byte
         assert!(!reply_matches(&bad, &q, qend));
 
-        // A reply that carries no question (QDCOUNT==0) is accepted on id alone.
-        let mut noq = q.clone();
+        // A valid error reply may omit its question.
+        let mut noq = good.clone();
+        noq[3] = 2; // SERVFAIL
         noq[4] = 0;
         noq[5] = 0;
+        noq.truncate(12);
         assert!(reply_matches(&noq, &q, qend));
 
         // Too-short datagram is rejected.
         assert!(!reply_matches(&q[..4], &q, qend));
+    }
+
+    fn response(query: &[u8]) -> Vec<u8> {
+        let mut response = query.to_vec();
+        response[2] |= 0x80;
+        response
+    }
+
+    #[test]
+    fn response_validation_requires_qr() {
+        let q = query();
+        assert!(!reply_matches(&q, &q, question_end(&q)));
+    }
+
+    #[test]
+    fn response_validation_requires_matching_opcode() {
+        let q = query();
+        let mut reply = response(&q);
+        reply[2] |= 0x08;
+        assert!(!reply_matches(&reply, &q, question_end(&q)));
+    }
+
+    #[test]
+    fn response_validation_requires_matching_id() {
+        let q = query();
+        let mut reply = response(&q);
+        reply[0] ^= 0xff;
+        assert!(!reply_matches(&reply, &q, question_end(&q)));
+    }
+
+    #[test]
+    fn response_validation_requires_exact_question_count() {
+        let q = query();
+        let mut reply = response(&q);
+        reply[5] = 2;
+        reply.extend_from_slice(&q[12..]);
+        assert!(!reply_matches(&reply, &q, question_end(&q)));
+    }
+
+    #[test]
+    fn response_validation_rejects_success_without_question() {
+        let q = query();
+        let mut reply = response(&q);
+        reply[5] = 0;
+        reply.truncate(12);
+        assert!(!reply_matches(&reply, &q, question_end(&q)));
+    }
+
+    #[test]
+    fn response_validation_accepts_error_without_question() {
+        let q = query();
+        let mut reply = response(&q);
+        reply[3] = 2; // SERVFAIL
+        reply[5] = 0;
+        reply.truncate(12);
+        assert!(reply_matches(&reply, &q, question_end(&q)));
+    }
+
+    fn questionless_edns_reply(query: &[u8], extended_rcode: u8) -> Vec<u8> {
+        let mut reply = response(query);
+        reply[3] &= 0xf0;
+        reply[5] = 0;
+        reply[11] = 1;
+        reply.truncate(12);
+        // Root OPT, UDP payload 1232, version 0, no flags or options.
+        reply.extend_from_slice(&[0, 0, 41, 4, 208, extended_rcode, 0, 0, 0, 0, 0]);
+        reply
+    }
+
+    #[test]
+    fn response_validation_accepts_questionless_edns_error() {
+        let q = query();
+        // BADVERS = 16 has a zero header rcode and a nonzero OPT rcode.
+        let mut reply = questionless_edns_reply(&q, 1);
+        assert!(reply_matches(&reply, &q, question_end(&q)));
+        // Unknown but well-formed EDNS options must remain acceptable.
+        reply[22] = 5;
+        reply.extend_from_slice(&[0xfd, 0xe8, 0, 1, 42]);
+        assert!(reply_matches(&reply, &q, question_end(&q)));
+    }
+
+    #[tokio::test]
+    async fn response_validation_rejects_questionless_success_and_malformed_edns() {
+        let q = query();
+        let badvers = questionless_edns_reply(&q, 1);
+        let mut replies = vec![questionless_edns_reply(&q, 0)];
+        // No complete OPT exists at any truncation point.
+        replies.extend((12..badvers.len()).map(|end| badvers[..end].to_vec()));
+        let mut missing_opt = badvers.clone();
+        missing_opt[11] = 0;
+        replies.push(missing_opt);
+        let mut short_option = badvers;
+        short_option[22] = 5;
+        short_option.extend_from_slice(&[0xfd, 0xe8, 0, 2, 42]);
+        replies.push(short_option);
+        for reply in replies {
+            assert!(!reply_matches(&reply, &q, question_end(&q)));
+            assert_eq!(tcp_response_result(reply.clone(), &q).await, (false, 0));
+            udp_ignores_invalid_reply(reply, &q).await;
+        }
+    }
+
+    /// A valid first A RR followed by one of three malformed records: a
+    /// complete but wrongly sized A RDATA, a cut-off RDATA, or a CNAME whose
+    /// target pointer leaves the message. A record-header-only scan would
+    /// miss the first and third cases.
+    fn malformed_records(query: &[u8], count_offset: usize) -> [Vec<u8>; 3] {
+        [
+            (1u16, 3u16, &[192, 0, 2][..]),
+            (1, 3, &[192, 0][..]),
+            (5, 2, &[0xc0, 0xff][..]),
+        ]
+        .map(|(rtype, rdlength, data)| {
+            let mut reply = response(query);
+            reply[count_offset + 1] = 2;
+            reply.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1]);
+            reply.extend_from_slice(&[0xc0, 0x0c]);
+            reply.extend_from_slice(&rtype.to_be_bytes());
+            reply.extend_from_slice(&[0, 1, 0, 0, 0, 60]);
+            reply.extend_from_slice(&rdlength.to_be_bytes());
+            reply.extend_from_slice(data);
+            reply
+        })
+    }
+
+    async fn tcp_response_result(reply: Vec<u8>, query: &[u8]) -> (bool, usize) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up = Upstream::parse(&format!("tcp://{}", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let len = stream.read_u16().await.unwrap() as usize;
+            let mut request = vec![0; len];
+            stream.read_exact(&mut request).await.unwrap();
+            stream.write_u16(reply.len() as u16).await.unwrap();
+            stream.write_all(&reply).await.unwrap();
+        });
+        let result = up.query(query, Duration::from_secs(1)).await;
+        server.await.unwrap();
+        let pooled = up.idle_tcp.lock().unwrap().len();
+        (result.is_ok(), pooled)
+    }
+
+    #[tokio::test]
+    async fn response_validation_tcp_rejects_wrong_question_without_pooling() {
+        let q = query();
+        let mut reply = response(&q);
+        reply[13] = b'X';
+        assert_eq!(tcp_response_result(reply, &q).await, (false, 0));
+    }
+
+    #[tokio::test]
+    async fn response_validation_tcp_rejects_invalid_headers_without_pooling() {
+        let q = query();
+        for (offset, value) in [(2, q[2]), (2, 0x88), (5, 0), (5, 2)] {
+            let mut reply = response(&q);
+            reply[offset] = value;
+            assert_eq!(
+                tcp_response_result(reply, &q).await,
+                (false, 0),
+                "invalid header at byte {offset}: {value}"
+            );
+        }
+    }
+
+    /// The valid SERVFAIL arrives after the invalid NOERROR. Checking the
+    /// returned rcode proves the first datagram was ignored, without relying
+    /// on an absence-of-response timeout.
+    async fn udp_ignores_invalid_reply(reply: Vec<u8>, query: &[u8]) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let up = Upstream::parse(&format!("udp://{}", socket.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let mut buf = [0; 512];
+            let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
+            socket.send_to(&reply, peer).await.unwrap();
+            let mut good = response(&buf[..n]);
+            good[3] = 2;
+            socket.send_to(&good, peer).await.unwrap();
+        });
+        let reply = up.query(query, Duration::from_secs(1)).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(reply[3] & 0x0f, 2, "must skip the invalid NOERROR");
+    }
+
+    #[tokio::test]
+    async fn response_validation_udp_ignores_invalid_headers() {
+        let q = query();
+        for (offset, value) in [(2, q[2]), (2, 0x88), (5, 0), (5, 2)] {
+            let mut reply = response(&q);
+            reply[offset] = value;
+            udp_ignores_invalid_reply(reply, &q).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn response_validation_udp_ignores_malformed_record_in_every_section() {
+        let q = query();
+        for offset in [6, 8, 10] {
+            for reply in malformed_records(&q, offset) {
+                udp_ignores_invalid_reply(reply, &q).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_validation_tcp_rejects_malformed_record_in_every_section() {
+        let q = query();
+        for offset in [6, 8, 10] {
+            for reply in malformed_records(&q, offset) {
+                assert_eq!(
+                    tcp_response_result(reply, &q).await,
+                    (false, 0),
+                    "malformed record in section with count at {offset}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_validation_accepts_unknown_records_and_questionless_errors() {
+        let q = query();
+        let mut unknown = response(&q);
+        unknown[7] = 1;
+        // Private-use TYPE65280 with opaque RDATA, including pointer-like bytes.
+        unknown.extend_from_slice(&[0xc0, 0x0c, 0xff, 0, 0, 1, 0, 0, 0, 60, 0, 3, 0xc0, 0xff, 0]);
+        let mut error = response(&q);
+        error[3] = 2;
+        error[5] = 0;
+        error.truncate(12);
+        for expected in [unknown, error, questionless_edns_reply(&q, 1)] {
+            assert_eq!(tcp_response_result(expected.clone(), &q).await, (true, 1));
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let up = Upstream::parse(&format!("udp://{}", socket.local_addr().unwrap())).unwrap();
+            let reply = expected.clone();
+            let server = tokio::spawn(async move {
+                let mut buf = [0; 512];
+                let (_, peer) = socket.recv_from(&mut buf).await.unwrap();
+                socket.send_to(&reply, peer).await.unwrap();
+            });
+            assert_eq!(
+                up.query(&q, Duration::from_secs(1)).await.unwrap(),
+                expected
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn response_validation_truncated_partial_record_retries_over_tcp() {
+        let q = query();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let up = Upstream::parse(&format!("udp://{addr}")).unwrap();
+        let udp = tokio::spawn(async move {
+            let mut buf = [0; 512];
+            let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
+            let mut reply = response(&buf[..n]);
+            reply[2] |= 0x02;
+            reply[7] = 1;
+            reply.push(0xc0); // RR cut in the middle of its owner pointer.
+            socket.send_to(&reply, peer).await.unwrap();
+        });
+        let tcp = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let n = stream.read_u16().await.unwrap() as usize;
+            let mut query = vec![0; n];
+            stream.read_exact(&mut query).await.unwrap();
+            let reply = response(&query);
+            stream.write_u16(reply.len() as u16).await.unwrap();
+            stream.write_all(&reply).await.unwrap();
+        });
+        assert_eq!(
+            up.query(&q, Duration::from_secs(1)).await.unwrap(),
+            response(&q)
+        );
+        udp.await.unwrap();
+        tcp.await.unwrap();
     }
 
     /// UDP mock that always replies with a well-formed answer for the WRONG

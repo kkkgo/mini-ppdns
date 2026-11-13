@@ -204,6 +204,9 @@ struct Entry {
     /// no longer served, it only remembers that this name keeps coming back
     /// negative, which is what makes the next one cache for longer.
     strikes: u8,
+    /// Whether this live cache period has already contributed a strike. An
+    /// unconfirmed period can still carry strikes from earlier periods.
+    confirmed: bool,
 }
 
 /// Where a negative answer starts: short enough that a name which only looks
@@ -307,6 +310,7 @@ impl Cache {
                 msg,
                 expires: Instant::now() + Duration::from_secs(ttl as u64),
                 strikes: 0,
+                confirmed: false,
             },
         );
     }
@@ -314,8 +318,8 @@ impl Cache {
     /// Store a negative answer (NXDOMAIN or NODATA) under the escalating
     /// policy, returning the TTL it was cached for.
     ///
-    /// The first one lives [`NEG_TTL_FLOOR`]; each further answer that
-    /// confirms it, while the name is still remembered, doubles that, up to
+    /// The first one lives [`NEG_TTL_FLOOR`]; each confirmation after expiry,
+    /// while the name is still remembered, doubles that, up to
     /// `cap` — the RFC 2308 §5 ceiling of the SOA (the smaller of its record
     /// TTL and its MINIMUM field). So a name that genuinely does not exist is
     /// asked about a handful of times and then left alone, while one that is
@@ -324,6 +328,9 @@ impl Cache {
     /// `confirmed` is false for an answer no second opinion backs — the main
     /// DNS said "no" and the fallback was unreachable. Those pin the floor and
     /// never escalate, so an upstream outage cannot make a negative stick.
+    /// Replies arriving in the same live cache period may shorten its lifetime,
+    /// but never extend it or count as another round of confirmation. In that
+    /// case the return value is the remaining TTL, as with [`Self::get`].
     pub fn store_negative(
         &self,
         key: CacheKey,
@@ -331,11 +338,40 @@ impl Cache {
         cap: u32,
         confirmed: bool,
     ) -> u32 {
-        let now = Instant::now();
         let mut shard = self.shard(&key).lock().unwrap();
+        let now = Instant::now();
+        if let Some(entry) = shard.get_mut(&key).filter(|e| {
+            e.expires > now
+                && (e.msg.rcode == Rcode::NXDOMAIN
+                    || (e.msg.rcode == Rcode::NOERROR && e.msg.answers.is_empty()))
+        }) {
+            // Several cold misses can finish together. They all belong to the
+            // existing cache period, even if their SOA ceilings differ. Keep
+            // the earlier deadline, respecting a newly shorter ceiling or an
+            // unconfirmed answer's floor without restarting the clock.
+            let ceiling = if confirmed {
+                cap
+            } else {
+                cap.min(NEG_TTL_FLOOR)
+            }
+            .clamp(1, MAX_TTL_SECS);
+            entry.expires = entry
+                .expires
+                .min(now + Duration::from_secs(u64::from(ceiling)));
+            if confirmed && !entry.confirmed {
+                entry.strikes = entry.strikes.saturating_add(1).min(NEG_MAX_STRIKES);
+                entry.confirmed = true;
+            }
+            entry.msg = msg;
+            return (entry.expires - now).as_secs().max(1) as u32;
+        }
         // A remembered entry (expired but inside its grace window) counts: the
-        // name is still being asked for and still coming back negative.
-        let seen = shard.get(&key).map_or(0, |e| e.strikes);
+        // name is still being asked for and still coming back negative. Check
+        // the window here too: a store need not be preceded by get or sweep.
+        let seen = shard
+            .get(&key)
+            .filter(|e| e.expires + NEG_GRACE > now)
+            .map_or(0, |e| e.strikes);
         let ttl = if confirmed {
             NEG_TTL_FLOOR.saturating_mul(1u32 << seen.min(NEG_MAX_STRIKES))
         } else {
@@ -355,6 +391,7 @@ impl Cache {
                 msg,
                 expires: now + Duration::from_secs(ttl as u64),
                 strikes,
+                confirmed,
             },
         );
         ttl
@@ -502,6 +539,157 @@ mod tests {
             c.store_negative(key.clone(), negative_msg(), 86_400, true),
             NEG_TTL_FLOOR
         );
+    }
+
+    #[test]
+    fn concurrent_negative_replies_only_confirm_one_cache_period() {
+        let cache = Arc::new(Cache::new(1024));
+        let key = neg_key("burst.example");
+        let barrier = Arc::new(std::sync::Barrier::new(12));
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..12 {
+                let cache = cache.clone();
+                let key = key.clone();
+                let barrier = barrier.clone();
+                workers.push(scope.spawn(move || {
+                    barrier.wait();
+                    cache.store_negative(key, negative_msg(), 86_400, true)
+                }));
+            }
+            for worker in workers {
+                assert!(worker.join().unwrap() <= NEG_TTL_FLOOR);
+            }
+        });
+        let (expires, strikes) = {
+            let shard = cache.shard(&key).lock().unwrap();
+            let entry = shard.get(&key).unwrap();
+            (entry.expires, entry.strikes)
+        };
+        assert_eq!(strikes, 1, "one burst is only one confirmation period");
+
+        // A late reply must not restart that period's clock, either.
+        cache.store_negative(key.clone(), negative_msg(), 86_400, true);
+        assert_eq!(cache.shard(&key).lock().unwrap()[&key].expires, expires);
+        cache.age_entry(&key, Duration::from_secs(u64::from(NEG_TTL_FLOOR)));
+        assert_eq!(
+            cache.store_negative(key, negative_msg(), 86_400, true),
+            NEG_TTL_FLOOR * 2,
+            "a new confirmation after expiry still advances the policy"
+        );
+    }
+
+    #[test]
+    fn negative_history_expires_even_without_a_lookup_or_sweep() {
+        let cache = Cache::new(1024);
+        let key = neg_key("forgotten.example");
+        cache.store_negative(key.clone(), negative_msg(), 86_400, true);
+        cache.age_entry(
+            &key,
+            Duration::from_secs(u64::from(NEG_TTL_FLOOR)) + NEG_GRACE + Duration::from_secs(1),
+        );
+        assert_eq!(
+            cache.store_negative(key, negative_msg(), 86_400, true),
+            NEG_TTL_FLOOR
+        );
+    }
+
+    #[test]
+    fn live_negative_replies_can_shorten_but_never_extend_the_deadline() {
+        let cache = Cache::new(1024);
+        let key = neg_key("shortened.example");
+        cache.store_negative(key.clone(), negative_msg(), 86_400, true);
+        cache.age_entry(&key, Duration::from_secs(u64::from(NEG_TTL_FLOOR)));
+        assert_eq!(
+            cache.store_negative(key.clone(), negative_msg(), 86_400, true),
+            NEG_TTL_FLOOR * 2
+        );
+        assert!(cache.store_negative(key.clone(), negative_msg(), 86_400, false) <= NEG_TTL_FLOOR);
+        assert!(cache.store_negative(key.clone(), negative_msg(), 5, true) <= 5);
+        let expires = cache.shard(&key).lock().unwrap()[&key].expires;
+        cache.store_negative(key.clone(), negative_msg(), 86_400, true);
+        let shard = cache.shard(&key).lock().unwrap();
+        assert_eq!(shard[&key].expires, expires);
+        assert_eq!(shard[&key].strikes, 2);
+    }
+
+    #[test]
+    fn confirming_a_live_unconfirmed_negative_counts_once() {
+        let cache = Cache::new(1024);
+        let key = neg_key("first-confirmation.example");
+        cache.store_negative(key.clone(), negative_msg(), 86_400, false);
+        let expires = cache.shard(&key).lock().unwrap()[&key].expires;
+        for _ in 0..3 {
+            assert!(
+                cache.store_negative(key.clone(), negative_msg(), 86_400, true) <= NEG_TTL_FLOOR
+            );
+        }
+        let shard = cache.shard(&key).lock().unwrap();
+        assert_eq!(shard[&key].expires, expires);
+        assert_eq!(shard[&key].strikes, 1);
+    }
+
+    #[test]
+    fn a_new_period_can_be_confirmed_after_an_unconfirmed_reply() {
+        let cache = Cache::new(1024);
+        let key = neg_key("late-confirmation.example");
+        cache.store_negative(key.clone(), negative_msg(), 86_400, true);
+        cache.age_entry(&key, Duration::from_secs(u64::from(NEG_TTL_FLOOR)));
+        cache.store_negative(key.clone(), negative_msg(), 86_400, false);
+        for _ in 0..3 {
+            assert!(
+                cache.store_negative(key.clone(), negative_msg(), 86_400, true) <= NEG_TTL_FLOOR
+            );
+        }
+        cache.age_entry(&key, Duration::from_secs(u64::from(NEG_TTL_FLOOR)));
+        assert_eq!(
+            cache.store_negative(key, negative_msg(), 86_400, true),
+            NEG_TTL_FLOOR * 4,
+            "each of the two prior periods was confirmed exactly once"
+        );
+    }
+
+    #[test]
+    fn a_positive_answer_resets_history_before_a_nodata_burst() {
+        use domain::base::{Name, Ttl};
+        use domain::rdata::{AllRecordData, A};
+        let cache = Cache::new(1024);
+        let key = neg_key("published.example");
+        cache.store_negative(key.clone(), negative_msg(), 86_400, true);
+        cache.age_entry(&key, Duration::from_secs(u64::from(NEG_TTL_FLOOR)));
+        cache.store_negative(key.clone(), negative_msg(), 86_400, true);
+        cache.store(
+            key.clone(),
+            Arc::new(CachedMsg {
+                rcode: Rcode::NOERROR,
+                answers: vec![OwnedRecord::new(
+                    Name::from_octets(b"\x09published\x07example\x00".to_vec()).unwrap(),
+                    domain::base::iana::Class::IN,
+                    Ttl::from_secs(10),
+                    AllRecordData::A(A::from_octets(1, 2, 3, 4)),
+                )],
+                authority: vec![],
+                additional: vec![],
+            }),
+            10,
+        );
+        assert_eq!(cache.shard(&key).lock().unwrap()[&key].strikes, 0);
+        let nodata = msg();
+        // The live positive answer must not be mistaken for a live negative.
+        assert_eq!(
+            cache.store_negative(key.clone(), nodata.clone(), 86_400, true),
+            NEG_TTL_FLOOR
+        );
+        let expires = cache.shard(&key).lock().unwrap()[&key].expires;
+        for _ in 0..12 {
+            assert!(
+                cache.store_negative(key.clone(), nodata.clone(), 86_400, true) <= NEG_TTL_FLOOR
+            );
+        }
+        let shard = cache.shard(&key).lock().unwrap();
+        assert_eq!(shard[&key].expires, expires);
+        assert_eq!(shard[&key].strikes, 1);
+        assert!(shard[&key].msg.answers.is_empty());
     }
 
     #[test]

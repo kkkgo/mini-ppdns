@@ -53,3 +53,4 @@ git/
 /target
 .c*
 r*.md
+/evaluation

@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::SystemTime;
 
 use domain::base::Name;
@@ -204,46 +204,96 @@ struct Maps {
     /// is the table that can get large, so it is never rebuilt for a lease
     /// change.
     fwd: HashMap<Vec<u8>, Vec<IpAddr>>, // wire-lower(name) -> ips
+}
+
+/// Only the background reloader uses this state. Retaining each file's last
+/// readable text lets a failed source keep its records while another source
+/// changes, without duplicating the potentially large parsed forward table.
+#[derive(Default)]
+struct ReloadState {
+    leases: HashMap<String, FileSnapshot>,
+    hosts: HashMap<String, FileSnapshot>,
     /// Each source's own contribution to `ptr`, so either can be rebuilt
     /// without re-reading the other. Both are keyed by address rather than by
     /// name, so they stay small even when a hosts file holds a million names.
     lease_ptr: HashMap<Vec<u8>, String>,
     hosts_ptr: HashMap<Vec<u8>, String>,
-    lease_times: HashMap<String, SystemTime>, // watched path -> mtime
-    hosts_times: HashMap<String, SystemTime>,
 }
 
-/// Which group of files a poll found changed.
-#[derive(Clone, Copy)]
-struct Changed {
-    lease: bool,
-    hosts: bool,
+#[derive(Default)]
+struct FileSnapshot {
+    text: Option<String>,
+    mtime: Option<SystemTime>,
+    retry: bool,
 }
 
-impl Changed {
-    fn all() -> Self {
-        Changed {
-            lease: true,
-            hosts: true,
+impl FileSnapshot {
+    /// Only NotFound confirms removal. Permission, metadata, read and UTF-8
+    /// errors retain the last readable contents and retry on the next tick.
+    fn failed(&mut self, error: std::io::Error) -> bool {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            self.mtime = None;
+            self.retry = false;
+            self.text.take().is_some()
+        } else {
+            self.retry = true;
+            false
         }
     }
 
-    fn any(&self) -> bool {
-        self.lease || self.hosts
+    fn refresh(&mut self, path: &str, force: bool) -> bool {
+        let mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
+            Ok(mtime) => mtime,
+            Err(error) => return self.failed(error),
+        };
+        if !force && !self.retry && self.mtime == Some(mtime) {
+            return false;
+        }
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                self.mtime = Some(mtime);
+                self.retry = false;
+                if self.text.as_ref() == Some(&text) {
+                    return false;
+                }
+                self.text = Some(text);
+                true
+            }
+            Err(error) => self.failed(error),
+        }
     }
 }
 
-/// Whether any watched path's modification time differs from what was recorded
-/// when it was last read.
-fn group_changed(files: &[&String], recorded: &HashMap<String, SystemTime>) -> bool {
+/// Refresh only changed or previously unreadable files. A failed retry alone
+/// never rebuilds the group's maps, even when a sibling is an enormous file.
+fn refresh_group(
+    files: &[&String],
+    snapshots: &mut HashMap<String, FileSnapshot>,
+    force: bool,
+) -> bool {
+    let mut changed = false;
+    for path in files {
+        changed |= snapshots
+            .entry((*path).clone())
+            .or_default()
+            .refresh(path, force);
+    }
+    changed
+}
+
+#[cfg(test)]
+fn group_changed(files: &[&String], snapshots: &HashMap<String, FileSnapshot>) -> bool {
     files.iter().any(|f| {
-        // Stat outside the lock so disk I/O never blocks readers.
-        let cur = std::fs::metadata(f).and_then(|m| m.modified()).ok();
-        match (cur, recorded.get(*f).copied()) {
-            (None, Some(_)) => true,      // disappeared
-            (Some(_), None) => true,      // appeared
-            (Some(c), Some(p)) => c != p, // changed
-            (None, None) => false,
+        let Some(previous) = snapshots.get(*f) else {
+            return true;
+        };
+        if previous.retry {
+            return true;
+        }
+        match std::fs::metadata(f).and_then(|m| m.modified()) {
+            Ok(mtime) => previous.mtime != Some(mtime),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => previous.text.is_some(),
+            Err(_) => true,
         }
     })
 }
@@ -479,6 +529,9 @@ pub struct PtrResolver {
     static_ptr: HashMap<Vec<u8>, String>,
     static_fwd: HashMap<Vec<u8>, Vec<IpAddr>>,
     maps: RwLock<Maps>,
+    /// Serializes reloads only; queries never acquire this lock. All file IO,
+    /// parsing and old snapshot destruction happen outside the maps lock.
+    reload_state: Mutex<ReloadState>,
     /// Lock-free negative filter over `maps.fwd` keys (see [`NameFilter`]).
     fwd_filter: FilterSet,
 }
@@ -536,9 +589,10 @@ impl PtrResolver {
             static_ptr,
             static_fwd,
             maps: RwLock::new(Maps::default()),
+            reload_state: Mutex::new(ReloadState::default()),
             fwd_filter: FilterSet::new(),
         };
-        r.reload(Changed::all());
+        r.reload(true);
         Some(r)
     }
 
@@ -593,10 +647,7 @@ impl PtrResolver {
     /// Reload if any watched file changed. Runs blocking file IO — call it
     /// from the background watcher task, never from the query path.
     pub fn check_reload(&self) {
-        let what = self.changed();
-        if what.any() {
-            self.reload(what);
-        }
+        self.reload(false);
     }
 
     /// The hosts files this resolver reads: the configured ones plus anything
@@ -610,45 +661,44 @@ impl PtrResolver {
             .collect()
     }
 
-    /// Which group of watched files changed since it was last read.
-    fn changed(&self) -> Changed {
-        let lease: Vec<&String> = self.lease_files.iter().collect();
-        let hosts = self.hosts_group();
-        let m = self.maps.read().unwrap();
-        Changed {
-            lease: group_changed(&lease, &m.lease_times),
-            hosts: group_changed(&hosts, &m.hosts_times),
-        }
-    }
-
     #[cfg(test)]
     fn files_changed(&self) -> bool {
-        self.changed().any()
+        let lease: Vec<&String> = self.lease_files.iter().collect();
+        let hosts = self.hosts_group();
+        let state = self.reload_state.lock().unwrap();
+        group_changed(&lease, &state.leases) || group_changed(&hosts, &state.hosts)
     }
 
-    /// Rebuild the tables fed by the groups named in `what`, leaving the other
-    /// group's as they are. A DHCP server rewrites its lease file constantly,
-    /// and re-parsing a large hosts table on every one of those is the cost this
-    /// split avoids.
-    fn reload(&self, what: Changed) {
-        let mut lease_times = None;
-        let lease_ptr = if what.lease {
-            let (mut p, mut t) = (HashMap::new(), HashMap::new());
-            for f in &self.lease_files {
-                load_lease(f, &mut p, &mut t);
-            }
-            lease_times = Some(t);
-            p
-        } else {
-            self.maps.read().unwrap().lease_ptr.clone()
-        };
+    /// Read changed files, retaining each failed file's last readable snapshot.
+    /// Rebuild only groups whose contents changed: frequent lease rewrites and
+    /// persistent read failures must not repeatedly parse a large hosts table.
+    fn reload(&self, force: bool) {
+        let lease: Vec<&String> = self.lease_files.iter().collect();
+        let hosts = self.hosts_group();
+        let mut state = self.reload_state.lock().unwrap();
+        let lease_changed = refresh_group(&lease, &mut state.leases, force) || force;
+        let hosts_changed = refresh_group(&hosts, &mut state.hosts, force) || force;
+        if !lease_changed && !hosts_changed {
+            return;
+        }
 
-        let mut hosts_times = None;
+        if lease_changed {
+            let mut ptr = HashMap::new();
+            for path in &lease {
+                if let Some(text) = state.leases.get(*path).and_then(|f| f.text.as_deref()) {
+                    parse_lease(text, &mut ptr);
+                }
+            }
+            state.lease_ptr = ptr;
+        }
+
         let mut new_fwd = None;
-        let hosts_ptr = if what.hosts {
-            let (mut p, mut fwd, mut t) = (HashMap::new(), HashMap::new(), HashMap::new());
-            for f in self.hosts_files.iter().chain(self.auto_hosts_files.iter()) {
-                load_hosts(f, &mut p, &mut fwd, Some(&mut t));
+        if hosts_changed {
+            let (mut ptr, mut fwd) = (HashMap::new(), HashMap::new());
+            for path in &hosts {
+                if let Some(text) = state.hosts.get(*path).and_then(|f| f.text.as_deref()) {
+                    parse_hosts(text, &mut ptr, &mut fwd);
+                }
             }
             // Static [hosts] entries always overlay file entries.
             for (k, v) in &self.static_fwd {
@@ -658,17 +708,15 @@ impl PtrResolver {
             // the table in, so a lookup that sees the table also sees the bits.
             self.fwd_filter
                 .refill(fwd.keys().map(Vec::as_slice), fwd.len());
-            hosts_times = Some(t);
+            state.hosts_ptr = ptr;
             new_fwd = Some(fwd);
-            p
-        } else {
-            self.maps.read().unwrap().hosts_ptr.clone()
-        };
+        }
 
         // Merge the reverse view in priority order, off the lock.
-        let mut ptr =
-            HashMap::with_capacity(lease_ptr.len() + hosts_ptr.len() + self.static_ptr.len());
-        for src in [&lease_ptr, &hosts_ptr, &self.static_ptr] {
+        let mut ptr = HashMap::with_capacity(
+            state.lease_ptr.len() + state.hosts_ptr.len() + self.static_ptr.len(),
+        );
+        for src in [&state.lease_ptr, &state.hosts_ptr, &self.static_ptr] {
             ptr.extend(src.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
 
@@ -678,14 +726,6 @@ impl PtrResolver {
         // would stall intake.
         let old = {
             let mut m = self.maps.write().unwrap();
-            m.lease_ptr = lease_ptr;
-            m.hosts_ptr = hosts_ptr;
-            if let Some(t) = lease_times {
-                m.lease_times = t;
-            }
-            if let Some(t) = hosts_times {
-                m.hosts_times = t;
-            }
             let old_fwd = new_fwd.map(|f| std::mem::replace(&mut m.fwd, f));
             (std::mem::replace(&mut m.ptr, ptr), old_fwd)
         };
@@ -693,25 +733,7 @@ impl PtrResolver {
     }
 }
 
-fn load_lease(
-    path: &str,
-    ptr: &mut HashMap<Vec<u8>, String>,
-    mod_times: &mut HashMap<String, SystemTime>,
-) {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return;
-    };
-    // The mtime is recorded the moment the path is statable, *before* the read
-    // is attempted. Every statable path must get an entry in `mod_times`, or
-    // `files_changed` scores it as newly appeared on every poll and reloads
-    // every watched file on every tick — which is what a path that stats but
-    // cannot be read (a directory, a permission or I/O error) would do. The
-    // trade is that a transient read failure is retried when the file's mtime
-    // next changes, not on the next tick.
-    record_mtime(&meta, path, Some(mod_times));
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return;
-    };
+fn parse_lease(text: &str, ptr: &mut HashMap<Vec<u8>, String>) {
     for line in text.lines() {
         // dnsmasq lease: timestamp mac ip hostname client-id
         let line = strip_comment(line);
@@ -733,20 +755,11 @@ fn load_lease(
     }
 }
 
-fn load_hosts(
-    path: &str,
+fn parse_hosts(
+    text: &str,
     ptr: &mut HashMap<Vec<u8>, String>,
     fwd: &mut HashMap<Vec<u8>, Vec<IpAddr>>,
-    mod_times: Option<&mut HashMap<String, SystemTime>>,
 ) {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return;
-    };
-    // See `load_lease`: the mtime is recorded on stat, not on a successful read.
-    record_mtime(&meta, path, mod_times);
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return;
-    };
     for line in text.lines() {
         let line = strip_comment(line.trim());
         let fields: Vec<&str> = line.split_whitespace().collect();
@@ -778,18 +791,6 @@ fn load_hosts(
                 }
             }
         }
-    }
-}
-
-/// Note `path`'s modification time in the watch table, if it has one and the
-/// caller is tracking this file (auto-detected files are not watched).
-fn record_mtime(
-    meta: &std::fs::Metadata,
-    path: &str,
-    mod_times: Option<&mut HashMap<String, SystemTime>>,
-) {
-    if let (Some(table), Ok(mt)) = (mod_times, meta.modified()) {
-        table.insert(path.to_string(), mt);
     }
 }
 
@@ -1406,7 +1407,7 @@ mod tests {
         // Hot reload: rewrite hosts, force a reload, old entry gone / new present,
         // and the [hosts] static overlay survives.
         std::fs::write(&hosts, "10.0.0.6 newhost.lan\n").unwrap();
-        r.reload(Changed::all());
+        r.reload(true);
         assert_eq!(fwd("newhost.lan"), vec![ip("10.0.0.6")]);
         assert!(fwd("myhost.lan").is_empty());
         assert_eq!(fwd("static.lan"), vec![ip("172.16.0.9")]);
@@ -1415,12 +1416,10 @@ mod tests {
         let _ = std::fs::remove_file(&hosts);
     }
 
-    /// A watched path that can be stat'ed but never read (a directory here, in
-    /// practice also a permission or I/O error) must not be scored as "changed"
-    /// on every poll — that would re-parse every watched file on every tick,
-    /// forever. Change detection for the readable files must still work.
+    /// A failed read is retried every poll, without re-reading or rebuilding
+    /// the unchanged sibling's potentially large hosts table.
     #[test]
-    fn unreadable_watched_file_does_not_force_endless_reloads() {
+    fn unreadable_watched_file_retries_without_reloading_unchanged_siblings() {
         let dir = std::env::temp_dir();
         let uniq = format!(
             "mppdns-unread-{}-{:p}",
@@ -1454,10 +1453,20 @@ mod tests {
             "the readable sibling is still loaded"
         );
 
+        let original_mtime = std::fs::metadata(&good).unwrap().modified().unwrap();
+        std::fs::write(&good, "10.0.0.6 hidden-change.lan\n").unwrap();
+        set_mtime(&good, original_mtime);
+        let wire = name_to_wire("myhost.lan", true).unwrap();
+        let original_ips = r.maps.read().unwrap().fwd.get(&wire).unwrap().as_ptr();
         for i in 0..5 {
-            assert!(
-                !r.files_changed(),
-                "quiet poll {i} reported a spurious change"
+            assert!(r.files_changed(), "poll {i} must retry the failed read");
+            r.check_reload();
+            assert_eq!(fwd("myhost.lan"), vec![ip("10.0.0.5")]);
+            assert!(fwd("hidden-change.lan").is_empty());
+            assert_eq!(
+                r.maps.read().unwrap().fwd.get(&wire).unwrap().as_ptr(),
+                original_ips,
+                "a failed retry must not rebuild the unchanged forward table"
             );
         }
 
@@ -1477,7 +1486,7 @@ mod tests {
         r.check_reload();
         assert_eq!(fwd("newhost.lan"), vec![ip("10.0.0.6")]);
         assert!(fwd("myhost.lan").is_empty(), "old entry dropped");
-        assert!(!r.files_changed(), "settles again after the reload");
+        assert!(r.files_changed(), "the failed file still needs retrying");
 
         let _ = std::fs::remove_file(&good);
         let _ = std::fs::remove_dir(&bad);
@@ -1507,11 +1516,14 @@ mod tests {
             "auto-detected hosts file must be in the watch set"
         );
         assert!(
-            r.maps
-                .read()
+            r.reload_state
+                .lock()
                 .unwrap()
-                .hosts_times
-                .contains_key("/etc/hosts"),
+                .hosts
+                .get("/etc/hosts")
+                .unwrap()
+                .mtime
+                .is_some(),
             "and must have an mtime recorded, or every poll reports a change"
         );
         assert!(!r.files_changed(), "so a quiet poll settles");
@@ -1523,6 +1535,272 @@ mod tests {
         let f = std::fs::File::options().write(true).open(path).unwrap();
         f.set_times(std::fs::FileTimes::new().set_modified(t))
             .unwrap();
+    }
+
+    struct ReloadFixture(std::path::PathBuf);
+
+    impl ReloadFixture {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "mppdns-retry-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn write(&self, name: &str, contents: impl AsRef<[u8]>, stamp: u64) -> String {
+            let path = self.0.join(name);
+            std::fs::write(&path, contents).unwrap();
+            set_mtime(
+                &path,
+                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(stamp),
+            );
+            path.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for ReloadFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn lookup_forward(r: &PtrResolver, name: &str) -> Vec<IpAddr> {
+        let wire = name_to_wire(name, true).unwrap();
+        r.lookup_ip(&wire, crate::util::hash(&wire))
+            .as_slice()
+            .to_vec()
+    }
+
+    fn lookup_reverse(r: &PtrResolver, addr: &str) -> Option<String> {
+        r.lookup(&name_to_wire(&ip_to_ptr_name_str(addr), true).unwrap())
+    }
+
+    #[test]
+    fn failed_hosts_reload_preserves_records_and_retries_same_mtime() {
+        let files = ReloadFixture::new();
+        let path = files.write("hosts", "10.0.0.1 original alias\n", 10);
+        let r = PtrResolver::new(vec![], vec![path], AutoDetect::none(), &HashMap::new()).unwrap();
+        files.write("hosts", [0xff], 20);
+        r.check_reload();
+        assert_eq!(lookup_forward(&r, "original"), [ip("10.0.0.1")]);
+        assert_eq!(lookup_forward(&r, "alias"), [ip("10.0.0.1")]);
+        assert_eq!(lookup_reverse(&r, "10.0.0.1").as_deref(), Some("original"));
+        assert!(r.files_changed(), "failed read must remain pending");
+
+        // Recovery changes only bytes, not mtime; this must still be retried.
+        files.write("hosts", "10.0.0.2 recovered\n", 20);
+        r.check_reload();
+        assert_eq!(lookup_forward(&r, "recovered"), [ip("10.0.0.2")]);
+        assert!(lookup_forward(&r, "original").is_empty());
+        assert!(lookup_reverse(&r, "10.0.0.1").is_none());
+        assert!(!r.files_changed());
+    }
+
+    #[test]
+    fn failed_lease_reload_preserves_records_and_retries_same_mtime() {
+        let files = ReloadFixture::new();
+        let path = files.write("leases", "0 mac 10.0.0.1 original *\n", 10);
+        let r = PtrResolver::new(vec![path], vec![], AutoDetect::none(), &HashMap::new()).unwrap();
+        files.write("leases", [0xff], 20);
+        r.check_reload();
+        assert_eq!(lookup_reverse(&r, "10.0.0.1").as_deref(), Some("original"));
+        assert!(r.files_changed());
+        files.write("leases", "0 mac 10.0.0.2 recovered *\n", 20);
+        r.check_reload();
+        assert_eq!(lookup_reverse(&r, "10.0.0.2").as_deref(), Some("recovered"));
+        assert!(lookup_reverse(&r, "10.0.0.1").is_none());
+        assert!(!r.files_changed());
+    }
+
+    #[test]
+    fn initial_failed_hosts_and_lease_reads_retry_without_mtime_changes() {
+        let files = ReloadFixture::new();
+        let hosts = files.write("hosts", [0xff], 10);
+        let leases = files.write("leases", [0xff], 10);
+        let r = PtrResolver::new(
+            vec![leases],
+            vec![hosts],
+            AutoDetect::none(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert!(r.files_changed());
+        files.write("hosts", "10.0.0.1 recovered-host\n", 10);
+        files.write("leases", "0 mac 10.0.0.2 recovered-lease *\n", 10);
+        r.check_reload();
+        assert_eq!(lookup_forward(&r, "recovered-host"), [ip("10.0.0.1")]);
+        assert_eq!(
+            lookup_reverse(&r, "10.0.0.2").as_deref(),
+            Some("recovered-lease")
+        );
+        assert!(!r.files_changed());
+    }
+
+    #[test]
+    fn failed_hosts_file_preserves_order_while_other_sources_update() {
+        let files = ReloadFixture::new();
+        let first = files.write(
+            "first",
+            "10.0.0.1 shared\n10.0.0.9 first\n10.0.0.7 override\n",
+            10,
+        );
+        let second = files.write(
+            "second",
+            "10.0.0.2 shared\n10.0.0.9 second\n10.0.0.8 shadow\n",
+            10,
+        );
+        let third = files.write("third", "10.0.0.3 shared\n", 10);
+        let leases = files.write("leases", "0 mac 10.0.0.20 old-lease *\n", 10);
+        let statics = HashMap::from([("override".into(), vec![ip("10.0.0.8")])]);
+        let r = PtrResolver::new(
+            vec![leases],
+            vec![first, second, third],
+            AutoDetect::none(),
+            &statics,
+        )
+        .unwrap();
+        files.write("second", [0xff], 20);
+        files.write(
+            "first",
+            "10.0.0.4 shared\n10.0.0.9 first-updated\n10.0.0.7 override\n",
+            20,
+        );
+        files.write("leases", "0 mac 10.0.0.21 new-lease *\n", 20);
+        r.check_reload();
+        assert_eq!(
+            lookup_forward(&r, "shared"),
+            [ip("10.0.0.4"), ip("10.0.0.2"), ip("10.0.0.3")]
+        );
+        assert_eq!(lookup_reverse(&r, "10.0.0.9").as_deref(), Some("second"));
+        assert_eq!(lookup_forward(&r, "override"), [ip("10.0.0.8")]);
+        assert_eq!(lookup_reverse(&r, "10.0.0.8").as_deref(), Some("override"));
+        assert_eq!(
+            lookup_reverse(&r, "10.0.0.21").as_deref(),
+            Some("new-lease")
+        );
+        assert!(lookup_reverse(&r, "10.0.0.20").is_none());
+    }
+
+    #[test]
+    fn failed_lease_file_preserves_order_while_other_sources_update() {
+        let files = ReloadFixture::new();
+        let first = files.write("first", "0 mac 10.0.0.1 first *\n", 10);
+        let second = files.write("second", "0 mac 10.0.0.1 second *\n", 10);
+        let hosts = files.write("hosts", "10.0.0.2 old-host\n", 10);
+        let r = PtrResolver::new(
+            vec![first, second],
+            vec![hosts],
+            AutoDetect::none(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        files.write("second", [0xff], 20);
+        files.write(
+            "first",
+            "0 mac 10.0.0.1 first-updated *\n0 mac 10.0.0.3 new-lease *\n",
+            20,
+        );
+        files.write("hosts", "10.0.0.4 new-host\n", 20);
+        r.check_reload();
+        assert_eq!(lookup_reverse(&r, "10.0.0.1").as_deref(), Some("second"));
+        assert_eq!(lookup_reverse(&r, "10.0.0.3").as_deref(), Some("new-lease"));
+        assert_eq!(lookup_forward(&r, "new-host"), [ip("10.0.0.4")]);
+        assert!(lookup_forward(&r, "old-host").is_empty());
+    }
+
+    #[test]
+    fn deleted_or_valid_empty_files_remove_records_after_a_failed_read() {
+        for hosts in [true, false] {
+            for delete in [true, false] {
+                let files = ReloadFixture::new();
+                let contents = if hosts {
+                    "10.0.0.1 original\n"
+                } else {
+                    "0 mac 10.0.0.1 original *\n"
+                };
+                let path = files.write("source", contents, 10);
+                let (lease_files, hosts_files) = if hosts {
+                    (vec![], vec![path.clone()])
+                } else {
+                    (vec![path.clone()], vec![])
+                };
+                let r = PtrResolver::new(
+                    lease_files,
+                    hosts_files,
+                    AutoDetect::none(),
+                    &HashMap::new(),
+                )
+                .unwrap();
+                files.write("source", [0xff], 20);
+                r.check_reload();
+                assert_eq!(lookup_reverse(&r, "10.0.0.1").as_deref(), Some("original"));
+                if delete {
+                    std::fs::remove_file(&path).unwrap();
+                } else {
+                    files.write("source", "", 20);
+                }
+                r.check_reload();
+                assert!(lookup_reverse(&r, "10.0.0.1").is_none());
+                assert!(lookup_forward(&r, "original").is_empty());
+                assert!(!r.files_changed());
+
+                // A previously absent or empty source is still watched.
+                files.write("source", contents, 30);
+                r.check_reload();
+                assert_eq!(lookup_reverse(&r, "10.0.0.1").as_deref(), Some("original"));
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_errors_preserve_both_sources_and_retry_after_recovery() {
+        for hosts in [true, false] {
+            let files = ReloadFixture::new();
+            std::fs::create_dir(files.0.join("parent")).unwrap();
+            let contents = if hosts {
+                "10.0.0.1 original\n"
+            } else {
+                "0 mac 10.0.0.1 original *\n"
+            };
+            let path = files.write("parent/source", contents, 10);
+            let (lease_files, hosts_files) = if hosts {
+                (vec![], vec![path.clone()])
+            } else {
+                (vec![path.clone()], vec![])
+            };
+            let r = PtrResolver::new(
+                lease_files,
+                hosts_files,
+                AutoDetect::none(),
+                &HashMap::new(),
+            )
+            .unwrap();
+            std::fs::rename(files.0.join("parent"), files.0.join("saved")).unwrap();
+            files.write("parent", "not a directory", 20);
+            assert_ne!(
+                std::fs::metadata(&path).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+            r.check_reload();
+            assert_eq!(lookup_reverse(&r, "10.0.0.1").as_deref(), Some("original"));
+            assert!(r.files_changed());
+            std::fs::remove_file(files.0.join("parent")).unwrap();
+            std::fs::rename(files.0.join("saved"), files.0.join("parent")).unwrap();
+            let contents = if hosts {
+                "10.0.0.2 recovered\n"
+            } else {
+                "0 mac 10.0.0.2 recovered *\n"
+            };
+            files.write("parent/source", contents, 10);
+            r.check_reload();
+            assert_eq!(lookup_reverse(&r, "10.0.0.2").as_deref(), Some("recovered"));
+            assert!(lookup_reverse(&r, "10.0.0.1").is_none());
+            assert!(!r.files_changed());
+        }
     }
 
     /// A DHCP server rewrites its lease file constantly. Those reloads must not

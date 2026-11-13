@@ -69,8 +69,18 @@ start() {
 		exit 1
 	fi
 
-	"$PROG" -config "$CONF" -d
+	if "$PROG" -config "$CONF" -d; then
+		:
+	else
+		_status=$?
+		echo "Error: mini-ppdns failed to start (exit $_status)." >&2
+		return "$_status"
+	fi
 	sleep 1
+	if ! is_running; then
+		echo "Error: mini-ppdns exited after startup." >&2
+		return 1
+	fi
 	write_pidfile
 	echo "mini-ppdns started."
 }

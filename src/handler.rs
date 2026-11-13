@@ -112,8 +112,9 @@ impl Parts {
     fn is_nodata(&self) -> bool {
         self.rcode == Rcode::NOERROR && self.answers.is_empty()
     }
-    /// A definite "no": NXDOMAIN, or NOERROR with nothing in the answer
-    /// section. These are the answers the negative-cache policy governs.
+    /// The main/fallback selection policy's definite "no": NXDOMAIN or
+    /// NOERROR with no answers. Cache lifetime is handled by `store_answer`,
+    /// which also recognizes NXDOMAIN with CNAMEs.
     fn is_negative(&self) -> bool {
         self.answers.is_empty() && matches!(self.rcode, Rcode::NOERROR | Rcode::NXDOMAIN)
     }
@@ -1320,7 +1321,7 @@ impl Handler {
             return;
         }
 
-        let final_name = resolve_cname_chain(&parts.answers, qname_lower);
+        let (final_name, cname_ttl) = resolve_cname_chain(&parts.answers, qname_lower);
         let has_chain = final_name != qname_lower;
         if has_chain {
             let ok = parts
@@ -1345,7 +1346,9 @@ impl Handler {
                 out.push(OwnedRecord::new(
                     info.qname_owned(),
                     r.class(),
-                    r.ttl(),
+                    // The synthesized mapping depends on every alias followed,
+                    // so it must expire when either a link or this record does.
+                    cname_ttl.map_or(r.ttl(), |ttl| r.ttl().min(ttl)),
                     r.data().clone(),
                 ));
             } else {
@@ -1368,15 +1371,23 @@ impl Handler {
     /// nothing contradicted it — or one it is only holding because the other
     /// upstream had nothing to say (see [`Cache::store_negative`]).
     fn store_answer(&self, cache: &Cache, info: &QueryInfo<'_>, parts: Parts, confirmed: bool) {
-        // A negative with no SOA has no cacheable lifetime of its own
-        // (RFC 2308 §5); it falls through to the record TTLs, which leaves it
-        // at the cache's 1s floor.
-        if parts.is_negative() {
+        // NXDOMAIN can carry CNAMEs leading to the absent target. Its cache
+        // lifetime is still negative, regardless of the answer count. This
+        // is deliberately separate from the main/fallback selection policy.
+        if parts.rcode == Rcode::NXDOMAIN || parts.is_nodata() {
             if let Some(cap) = dns::negative_ttl_cap(&parts.authority) {
+                // A cached alias + negative result depends on both lifetimes.
+                let cap = dns::min_ttl(&parts.answers).map_or(cap, |ttl| cap.min(ttl));
                 let (key, cached) = seal(info, parts);
                 cache.store_negative(key, cached, cap, confirmed);
-                return;
+            } else {
+                // A CNAME alone cannot supply a negative lifetime (RFC 2308
+                // §5), so it gets the cache's one-second floor. With no
+                // answers at all, the other sections' TTLs decide.
+                let ttl = (!parts.answers.is_empty()).then_some(0);
+                self.store(cache, info, parts, ttl);
             }
+            return;
         }
         self.store(cache, info, parts, None);
     }
@@ -1480,12 +1491,13 @@ impl Parts {
 }
 
 /// Follow the CNAME chain from `start_lower` (lower-cased wire name), returning
-/// the final target as lower-cased wire bytes. One pass builds an owner→target
+/// the final target as lower-cased wire bytes and the lowest TTL of the links
+/// actually followed (`None` for no links). One pass builds an owner→target/TTL
 /// map so long chains stay O(n) — rescanning the answers per hop is O(n²),
 /// measurable on a hostile 64 KiB TCP response. The hop count is bounded by
 /// the link count, which also terminates cycles.
-fn resolve_cname_chain(answers: &[OwnedRecord], start_lower: &[u8]) -> Vec<u8> {
-    let mut links: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+fn resolve_cname_chain(answers: &[OwnedRecord], start_lower: &[u8]) -> (Vec<u8>, Option<Ttl>) {
+    let mut links: HashMap<Vec<u8>, (Vec<u8>, Ttl)> = HashMap::new();
     for r in answers {
         if r.rtype() != Rtype::CNAME {
             continue;
@@ -1494,17 +1506,21 @@ fn resolve_cname_chain(answers: &[OwnedRecord], start_lower: &[u8]) -> Vec<u8> {
             // First record wins on a duplicate owner, like the scan it replaces.
             links
                 .entry(lower_wire(r.owner().as_slice()))
-                .or_insert_with(|| lower_wire(c.cname().as_slice()));
+                .or_insert_with(|| (lower_wire(c.cname().as_slice()), r.ttl()));
         }
     }
     let mut current = start_lower.to_vec();
+    let mut min_ttl = None;
     for _ in 0..links.len() {
         match links.get(&current) {
-            Some(next) => current = next.clone(),
+            Some((next, ttl)) => {
+                min_ttl = Some(min_ttl.map_or(*ttl, |min: Ttl| min.min(*ttl)));
+                current = next.clone();
+            }
             None => break,
         }
     }
-    current
+    (current, min_ttl)
 }
 
 /// Case-insensitive comparison of an owner name against lower-cased wire bytes.
@@ -1670,10 +1686,14 @@ mod tests {
     }
 
     fn cname_rec(owner: &str, target: &str) -> OwnedRecord {
+        cname_rec_with_ttl(owner, target, 300)
+    }
+
+    fn cname_rec_with_ttl(owner: &str, target: &str, ttl: u32) -> OwnedRecord {
         OwnedRecord::new(
             Name::<Vec<u8>>::from_str(owner).unwrap(),
             Class::IN,
-            Ttl::from_secs(300),
+            Ttl::from_secs(ttl),
             AllRecordData::Cname(Cname::new(Name::<Vec<u8>>::from_str(target).unwrap())),
         )
     }
@@ -1773,18 +1793,146 @@ mod tests {
         cache.get(&cache_key(name, qtype)).map(|(_, ttl)| ttl)
     }
 
-    /// What the *next* confirmation of this negative would cache for. Reads
-    /// back whether the answer already banked a confirmation, which is the
-    /// difference between "both upstreams said no" and "the other one was
-    /// unreachable".
+    /// What the next confirmation would cache for after this negative expires.
+    /// Advance to a new cycle before probing whether the answer already banked
+    /// a confirmation: "both upstreams said no" versus "the other one was
+    /// unreachable". Concurrent responses in one live cycle must not count as
+    /// further confirmations.
     fn next_negative_ttl(cache: &Cache, name: &str, qtype: Rtype) -> u32 {
+        let key = cache_key(name, qtype);
+        let (_, ttl) = cache.get(&key).expect("negative entry cached");
+        cache.age_entry(&key, Duration::from_secs(u64::from(ttl) + 1));
         let msg = Arc::new(CachedMsg {
             rcode: Rcode::NXDOMAIN,
             answers: vec![],
             authority: vec![],
             additional: vec![],
         });
-        cache.store_negative(cache_key(name, qtype), msg, 86_400, true)
+        cache.store_negative(key, msg, 86_400, true)
+    }
+
+    fn cname_negative_parts(alias_ttl: u32, soa: Option<(u32, u32)>) -> Parts {
+        let query = parse_resp(&client_query("alias.example.", Rtype::A));
+        let mut parts = match soa {
+            Some((ttl, minimum)) => Parts::from_msg(&parse_resp(&negative(
+                &query,
+                Rcode::NXDOMAIN,
+                ttl,
+                minimum,
+            ))),
+            None => Parts {
+                rcode: Rcode::NXDOMAIN,
+                ..Parts::empty()
+            },
+        };
+        parts.answers.push(cname_rec_with_ttl(
+            "alias.example.",
+            "missing.example.",
+            alias_ttl,
+        ));
+        parts
+    }
+
+    #[test]
+    fn cname_nxdomain_cache_respects_soa_and_alias_lifetimes() {
+        for lite in [false, true] {
+            for (alias_ttl, soa, expected) in [
+                (300, Some((900, 5)), 5),
+                (300, Some((5, 900)), 5),
+                (7, Some((900, 900)), 7),
+                (300, Some((900, 900)), crate::cache::NEG_TTL_FLOOR),
+                (300, Some((0, 900)), 1),
+                (0, Some((900, 900)), 1),
+                // A negative without SOA stays at the 1s floor.
+                (300, None, 1),
+            ] {
+                for confirmed in [false, true] {
+                    let mut h = mk(dead(), dead());
+                    h.lite = lite;
+                    let owned = info_for("alias.example.", Rtype::A);
+                    let info = owned.info();
+                    let mut parts = cname_negative_parts(alias_ttl, soa);
+                    if lite {
+                        h.apply_lite(&mut parts, &info);
+                    }
+                    h.store_answer(&h.cache, &info, parts, confirmed);
+                    let key = cache_key("alias.example.", Rtype::A);
+                    let (cached, ttl) = h.cache.get(&key).expect("negative cached");
+                    assert!(
+                        (expected.saturating_sub(1).max(1)..=expected).contains(&ttl),
+                        "lite={lite} confirmed={confirmed} alias={alias_ttl} soa={soa:?}: expected about {expected}s, got {ttl}s"
+                    );
+                    assert_eq!(cached.rcode, Rcode::NXDOMAIN);
+                    assert_eq!(cached.answers.len(), 1, "keep the alias in the answer");
+                    assert_eq!(cached.answers[0].ttl().as_secs(), alias_ttl);
+
+                    let mut out = Vec::new();
+                    assert!(matches!(
+                        h.process_fast(
+                            &client_query("alias.example.", Rtype::A),
+                            "127.0.0.1".parse().unwrap(),
+                            true,
+                            &mut out,
+                        ),
+                        FastOutcome::Reply
+                    ));
+                    assert_eq!(parse_resp(&out).header().rcode(), Rcode::NXDOMAIN);
+                    assert!(first_ttl(&out).unwrap() <= expected);
+                    h.cache
+                        .age_entry(&key, Duration::from_secs(u64::from(expected)));
+                    assert!(h.cache.get(&key).is_none(), "not served past its cap");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cname_nxdomain_bursts_only_confirm_one_period() {
+        let h = mk(dead(), dead());
+        let owned = info_for("alias.example.", Rtype::A);
+        let key = cache_key("alias.example.", Rtype::A);
+        for _ in 0..12 {
+            h.store_answer(
+                &h.fall_cache,
+                &owned.info(),
+                cname_negative_parts(86_400, Some((86_400, 86_400))),
+                true,
+            );
+            assert!(h.fall_cache.get(&key).unwrap().1 <= crate::cache::NEG_TTL_FLOOR);
+        }
+        assert_eq!(
+            next_negative_ttl(&h.fall_cache, "alias.example.", Rtype::A),
+            crate::cache::NEG_TTL_FLOOR * 2
+        );
+    }
+
+    #[test]
+    fn empty_negative_without_soa_preserves_existing_section_lifetime() {
+        for rcode in [Rcode::NXDOMAIN, Rcode::NOERROR] {
+            for authority in [false, true] {
+                let h = mk(dead(), dead());
+                let owned = info_for("alias.example.", Rtype::A);
+                let mut parts = Parts {
+                    rcode,
+                    ..Parts::empty()
+                };
+                let record = OwnedRecord::new(
+                    Name::from_str("example.").unwrap(),
+                    Class::IN,
+                    Ttl::from_secs(90),
+                    domain::rdata::Ns::new(Name::from_str("ns.example.").unwrap()).into(),
+                );
+                if authority {
+                    parts.authority.push(record);
+                } else {
+                    parts.additional.push(record);
+                }
+                h.store_answer(&h.cache, &owned.info(), parts, true);
+                let (cached, ttl) = h.cache.get(&cache_key("alias.example.", Rtype::A)).unwrap();
+                assert_eq!(cached.rcode, rcode);
+                assert!((89..=90).contains(&ttl), "existing lifetime was {ttl}s");
+            }
+        }
     }
 
     #[tokio::test]
@@ -2434,7 +2582,7 @@ mod tests {
             cname_rec("cdn.example.net.", "edge.example.org."),
             a_rec("edge.example.org.", [5, 6, 7, 8], 60),
         ];
-        let end = resolve_cname_chain(&answers, b"\x03www\x07example\x03com\x00");
+        let (end, _) = resolve_cname_chain(&answers, b"\x03www\x07example\x03com\x00");
         assert_eq!(end, b"\x04edge\x07example\x03org\x00".to_vec());
     }
 
@@ -2445,7 +2593,7 @@ mod tests {
             cname_rec("b.example.", "a.example."),
         ];
         // Hop count is bounded by the link count (2): a → b → a, then stop.
-        let end = resolve_cname_chain(&answers, b"\x01a\x07example\x00");
+        let (end, _) = resolve_cname_chain(&answers, b"\x01a\x07example\x00");
         assert_eq!(end, b"\x01a\x07example\x00".to_vec());
     }
 
@@ -2477,19 +2625,94 @@ mod tests {
     }
 
     #[test]
+    fn lite_collapsed_ttls_respect_every_link_and_each_terminal_record() {
+        let h = mk(dead(), dead());
+        let owned = info_for("WWW.Example.COM.", Rtype::A);
+        // Each case has two terminal A records, deliberately unordered links,
+        // mixed-case names, and an unrelated zero-TTL alias. Only links reached
+        // from the question may limit either synthesized answer's lifetime.
+        for (case, first, middle, terminal, expected) in [
+            ("short terminal", 300, 450, 60, [60, 300]),
+            ("short first alias", 7, 450, 60, [7, 7]),
+            ("short middle alias", 300, 11, 60, [11, 11]),
+            ("zero alias", 0, 450, 60, [0, 0]),
+            ("zero terminal", 300, 450, 0, [0, 300]),
+        ] {
+            let mut parts = Parts {
+                rcode: Rcode::NOERROR,
+                answers: vec![
+                    cname_rec_with_ttl("unrelated.example.", "elsewhere.example.", 0),
+                    a_rec("EDGE.Example.ORG.", [5, 6, 7, 8], terminal),
+                    cname_rec_with_ttl("CDN.Example.NET.", "edge.example.org.", middle),
+                    cname_rec_with_ttl("www.example.com.", "cdn.example.net.", first),
+                    // Preserve the existing first-record-wins duplicate policy.
+                    cname_rec_with_ttl("www.example.com.", "unused.example.", 0),
+                    a_rec("edge.example.org.", [5, 6, 7, 9], 600),
+                ],
+                authority: vec![],
+                additional: vec![],
+            };
+            h.apply_lite(&mut parts, &owned.info());
+            assert_eq!(
+                parts.answers,
+                vec![
+                    a_rec("WWW.Example.COM.", [5, 6, 7, 8], expected[0]),
+                    a_rec("WWW.Example.COM.", [5, 6, 7, 9], expected[1]),
+                ],
+                "{case}"
+            );
+            // DNS record equality deliberately ignores the TTL.
+            let ttls: Vec<_> = parts.answers.iter().map(|r| r.ttl().as_secs()).collect();
+            assert_eq!(ttls, expected, "{case}");
+            assert_eq!(parts.min_ttl(), expected[0], "cache lifetime: {case}");
+        }
+    }
+
+    #[test]
+    fn lite_cname_query_preserves_each_alias_ttl() {
+        let h = mk(dead(), dead());
+        let owned = info_for("www.example.com.", Rtype::CNAME);
+        let aliases = vec![
+            cname_rec_with_ttl("www.example.com.", "cdn.example.net.", 7),
+            cname_rec_with_ttl("cdn.example.net.", "edge.example.org.", 300),
+        ];
+        let mut parts = Parts {
+            rcode: Rcode::NOERROR,
+            answers: aliases.clone(),
+            authority: vec![],
+            additional: vec![a_rec("edge.example.org.", [5, 6, 7, 8], 60)],
+        };
+        parts
+            .answers
+            .push(a_rec("edge.example.org.", [5, 6, 7, 8], 60));
+        h.apply_lite(&mut parts, &owned.info());
+        assert_eq!(parts.answers, aliases);
+        let ttls: Vec<_> = parts.answers.iter().map(|r| r.ttl().as_secs()).collect();
+        assert_eq!(ttls, [7, 300]);
+        assert!(parts.additional.is_empty());
+    }
+
+    #[test]
     fn lite_keeps_all_when_chain_unresolvable() {
         // Final A missing → chain can't validate → no filtering (compat).
         let h = mk(dead(), dead());
         let mut parts = Parts {
             rcode: Rcode::NOERROR,
-            answers: vec![cname_rec("www.example.com.", "edge.example.org.")],
-            authority: vec![],
-            additional: vec![],
+            answers: vec![cname_rec_with_ttl(
+                "www.example.com.",
+                "edge.example.org.",
+                7,
+            )],
+            authority: vec![a_rec("authority.example.", [1, 2, 3, 4], 40)],
+            additional: vec![a_rec("additional.example.", [1, 2, 3, 5], 50)],
         };
         let owned = info_for("www.example.com.", Rtype::A);
         h.apply_lite(&mut parts, &owned.info());
         assert_eq!(parts.answers.len(), 1);
         assert_eq!(parts.answers[0].rtype(), Rtype::CNAME);
+        assert_eq!(parts.answers[0].ttl().as_secs(), 7);
+        assert_eq!(parts.authority.len(), 1);
+        assert_eq!(parts.additional.len(), 1);
     }
 
     #[test]
@@ -2586,7 +2809,7 @@ mod tests {
             b.push((
                 &name,
                 Class::IN,
-                Ttl::from_secs(60),
+                Ttl::from_secs(7),
                 Cname::new(target.clone()),
             ))
             .unwrap();
@@ -2603,6 +2826,14 @@ mod tests {
         let h = mk(vec![main], dead()); // mk() enables lite
         let out = ask(&h, "WWW.Example.COM.", Rtype::A, "127.0.0.1").await;
         assert_eq!(answer_count(&out), 1, "lite keeps only the qtype record");
+        assert_eq!(first_ttl(&out), Some(7), "wire TTL respects the alias");
+        let key = CacheKey::new(
+            b"\x03www\x07example\x03com\x00".to_vec(),
+            u16::from(Rtype::A),
+            u16::from(Class::IN),
+        );
+        let (cached, _) = h.cache.get(&key).expect("collapsed answer cached");
+        assert_eq!(cached.answers[0].ttl().as_secs(), 7);
         let msg = parse_resp(&out);
         let rec = msg
             .answer()

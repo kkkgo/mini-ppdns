@@ -241,10 +241,10 @@ impl Reporter {
         }
         // Query entries max out at level 4 even when configured level is 5.
         let level = self.level.min(4);
-        let payload = if level >= 3 {
+        let (level, payload) = if level >= 3 {
             encode::fit_payload(entry, level, ts)
         } else {
-            encode::encode_query(entry, level, ts)
+            (level, encode::encode_query(entry, level, ts))
         };
         self.queue(level, payload);
     }
@@ -424,11 +424,12 @@ mod encode {
     }
 
     /// Re-encode with RR trimming so the payload fits `MAX_INNER_PAYLOAD`,
-    /// using a priority order.
-    pub fn fit_payload(e: &QueryEntry, level: u8, ts: u32) -> Vec<u8> {
+    /// using a priority order. Return the actual level with its payload so the
+    /// packet header always describes the encoded RR sections.
+    pub fn fit_payload(e: &QueryEntry, level: u8, ts: u32) -> (u8, Vec<u8>) {
         let full = encode_query(e, level, ts);
         if full.len() <= MAX_INNER_PAYLOAD || level < 3 {
-            return full;
+            return (level, full);
         }
         let qtype = Rtype::from_int(e.qtype);
         let same: Vec<&OwnedRecord> = e
@@ -454,7 +455,7 @@ mod encode {
                 a.extend_from_slice(&diff);
                 let n = encode_query_with(e, &a, &extras, level, ts);
                 if n.len() <= MAX_INNER_PAYLOAD {
-                    return n;
+                    return (level, n);
                 }
             }
         }
@@ -464,23 +465,23 @@ mod encode {
             a.extend_from_slice(&diff);
             let n = encode_query_with(e, &a, &[], 3, ts);
             if n.len() <= MAX_INNER_PAYLOAD {
-                return n;
+                return (3, n);
             }
         }
         // 3) same-type answers only.
         let n = encode_query_with(e, &same, &[], 3, ts);
         if n.len() <= MAX_INNER_PAYLOAD {
-            return n;
+            return (3, n);
         }
         // 4) a single same-type answer.
         if same.len() > 1 {
             let n = encode_query_with(e, &same[..1], &[], 3, ts);
             if n.len() <= MAX_INNER_PAYLOAD {
-                return n;
+                return (3, n);
             }
         }
         // Fallback: level 2 (no RR sections at all).
-        encode_query(e, 2, ts)
+        (2, encode_query(e, 2, ts))
     }
 
     /// Level-5 event: ts(4) + severity(1) + message (capped).
@@ -500,6 +501,168 @@ mod encode {
 mod tests {
     use super::*;
     use chacha20poly1305::aead::{Aead, Payload};
+    use domain::base::iana::Class;
+    use domain::base::{Name, Ttl};
+    use domain::rdata::{AllRecordData, Txt, A};
+    use std::str::FromStr;
+
+    fn a_record() -> OwnedRecord {
+        OwnedRecord::new(
+            Name::<Vec<u8>>::from_str("example.com.").unwrap(),
+            Class::IN,
+            Ttl::from_secs(300),
+            AllRecordData::A(A::from_octets(10, 0, 0, 1)),
+        )
+    }
+
+    fn large_txt_record() -> OwnedRecord {
+        let mut bytes = Vec::new();
+        for _ in 0..6 {
+            bytes.push(255);
+            bytes.extend(std::iter::repeat_n(b'x', 255));
+        }
+        OwnedRecord::new(
+            Name::<Vec<u8>>::from_str("example.com.").unwrap(),
+            Class::IN,
+            Ttl::from_secs(300),
+            AllRecordData::Txt(Txt::from_octets(bytes).unwrap()),
+        )
+    }
+
+    // Parse according to the advertised level, including every length field
+    // and RR section. Missing section counts and trailing data both fail.
+    fn query_section_counts(mut payload: &[u8], level: u8) -> [usize; 2] {
+        fn take<'a>(payload: &mut &'a [u8], len: usize) -> &'a [u8] {
+            let (head, tail) = payload.split_at_checked(len).expect("truncated payload");
+            *payload = tail;
+            head
+        }
+
+        take(&mut payload, 4); // timestamp
+        let flags = take(&mut payload, 1)[0];
+        take(&mut payload, if flags & FLAG_IPV6 != 0 { 16 } else { 4 });
+        take(&mut payload, 6); // qtype, rcode, route, duration
+        let name_len = usize::from(take(&mut payload, 1)[0]);
+        take(&mut payload, name_len);
+        if level >= 2 {
+            let upstream_len = usize::from(take(&mut payload, 1)[0]);
+            take(&mut payload, upstream_len);
+        }
+        let mut counts = [0; 2];
+        for (i, count) in counts.iter_mut().enumerate() {
+            if level >= 3 + i as u8 {
+                *count = usize::from(take(&mut payload, 1)[0]);
+                for _ in 0..*count {
+                    let rr_header = take(&mut payload, 8);
+                    let rdlen = usize::from(u16::from_be_bytes([rr_header[6], rr_header[7]]));
+                    take(&mut payload, rdlen);
+                }
+            }
+        }
+        assert!(payload.is_empty(), "trailing payload bytes");
+        counts
+    }
+
+    fn verify_reported_query(
+        configured_level: u8,
+        expected_level: u8,
+        qtype: u16,
+        answers: &[OwnedRecord],
+        additional: &[OwnedRecord],
+        expected_counts: [usize; 2],
+    ) {
+        let entry = QueryEntry {
+            client: "127.0.0.1".parse().unwrap(),
+            qtype,
+            rcode: 0,
+            route: ROUTE_LOCAL,
+            duration_ms: 5,
+            qname_wire: b"\x07example\x03com\x00",
+            upstream: "127.0.0.1:53",
+            answers,
+            additional,
+        };
+        let (tx, mut rx) = mpsc::channel(1);
+        let reporter = Reporter {
+            level: configured_level,
+            tx,
+            last_report: AtomicU32::new(0),
+            heartbeat_secs: 0,
+        };
+        reporter.report(&entry);
+        let outgoing = rx.try_recv().expect("query queued");
+        assert_eq!(reporter.level(), configured_level);
+        let key = Sha256::digest([0x12u8; 16]);
+        let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
+        let mut sealer = Sealer::new(cipher.clone(), key[..4].try_into().unwrap());
+        let packet = sealer.seal(outgoing.level, &outgoing.payload).unwrap();
+        assert!(packet.len() <= MAX_PACKET_SIZE);
+        let nonce: [u8; 12] = packet[6..18].try_into().unwrap();
+        let plaintext = cipher
+            .decrypt(
+                &Nonce::from(nonce),
+                Payload {
+                    msg: &packet[HEADER_SIZE..],
+                    aad: &packet[..HEADER_SIZE],
+                },
+            )
+            .expect("collector decrypts query");
+        let payload = &plaintext[INNER_HEADER_SIZE..];
+        assert_eq!(
+            usize::from(u16::from_be_bytes([plaintext[5], plaintext[6]])),
+            payload.len(),
+            "declared payload length"
+        );
+        assert_eq!(plaintext[4], expected_level, "advertised query level");
+        assert_eq!(query_section_counts(payload, plaintext[4]), expected_counts);
+    }
+
+    #[test]
+    fn reported_query_drops_additional_and_advertises_level3() {
+        verify_reported_query(4, 3, 1, &[a_record()], &vec![a_record(); 120], [1, 0]);
+    }
+
+    #[test]
+    fn reported_query_level3_falls_back_to_level2() {
+        verify_reported_query(3, 2, 16, &[large_txt_record()], &[], [0, 0]);
+    }
+
+    #[test]
+    fn reported_query_level4_falls_back_to_level2() {
+        verify_reported_query(4, 2, 16, &[large_txt_record()], &[], [0, 0]);
+    }
+
+    #[test]
+    fn reported_query_keeps_level_when_payload_fits() {
+        for configured in 1..=5 {
+            let counts = [usize::from(configured >= 3), usize::from(configured >= 4)];
+            verify_reported_query(
+                configured,
+                configured.min(4),
+                1,
+                &[a_record()],
+                &[a_record()],
+                counts,
+            );
+        }
+    }
+
+    #[test]
+    fn reported_query_trims_answers_before_downgrading_level() {
+        verify_reported_query(4, 4, 1, &vec![a_record(); 120], &[a_record()], [20, 1]);
+    }
+
+    #[test]
+    fn reported_query_drops_other_types_and_advertises_level3() {
+        verify_reported_query(4, 3, 1, &[a_record(), large_txt_record()], &[], [1, 0]);
+    }
+
+    #[test]
+    fn reported_query_keeps_single_answer_and_advertises_level3() {
+        let mut answers = vec![a_record(); 120];
+        answers.push(large_txt_record());
+        verify_reported_query(4, 3, 1, &answers, &[], [1, 0]);
+    }
 
     #[test]
     fn uuid_parsing() {

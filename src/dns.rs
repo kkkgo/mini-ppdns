@@ -810,7 +810,7 @@ fn assemble_packed<Octs: domain::dep::octseq::Octets + ?Sized>(
 /// Size-bounded build: emit as many records as fit within `limit` (in section
 /// order, so the shuffle's CNAME→qtype priority keeps the most relevant answers)
 /// and set TC. Only ever reached when even the compressed build overflowed, so
-/// at least one record is dropped and TC always applies.
+/// at least one question or record is dropped and TC always applies.
 fn assemble_fitted<Octs: domain::dep::octseq::Octets + ?Sized>(
     req: &Message<Octs>,
     data: &ResponseData<'_>,
@@ -821,6 +821,24 @@ fn assemble_fitted<Octs: domain::dep::octseq::Octets + ?Sized>(
 
     let mut ans = start(new_packed(), req, data.rcode);
     ans.header_mut().set_tc(true);
+
+    // Error responses can echo multiple questions, whose combined size can
+    // exceed the budget even before any records are added. Return a minimal
+    // response in that case; copying the header keeps ID/opcode/rcode and the
+    // response flags, while clearing every count avoids dangling questions.
+    // Production budgets are at least 512 bytes, so this always fits a header
+    // and OPT and never affects a valid single-question request.
+    if ans.as_slice().len() + opt_reserve > limit {
+        let mut out = ans.as_slice()[..12].to_vec();
+        out[4..12].fill(0);
+        if let Some(edns) = data.edns {
+            if out.len() + OPT_WIRE_LEN <= limit {
+                write_opt(&mut out, edns);
+                out[10..12].copy_from_slice(&1u16.to_be_bytes());
+            }
+        }
+        return out;
+    }
 
     let order: Vec<usize> = match data.shuffle_qtype {
         Some(qtype) if data.answers.len() > 1 => {
@@ -1162,6 +1180,109 @@ mod tests {
             .count();
         // Fill-to-limit: some answers fit, but not all 100.
         assert!(n > 0 && n < 100, "should keep a partial set, got {n}");
+    }
+
+    fn multi_question_query(count: usize, edns: Option<ClientEdns>) -> Vec<u8> {
+        let mut b = MessageBuilder::new_vec();
+        b.header_mut().set_id(0xa35c);
+        b.header_mut().set_rd(true);
+        let mut q = b.question();
+        for _ in 0..count {
+            q.push((Name::<Vec<u8>>::from_str(".").unwrap(), Rtype::A))
+                .unwrap();
+        }
+        let mut add = q.additional();
+        if let Some(edns) = edns {
+            push_opt(&mut add, edns);
+        }
+        add.finish()
+    }
+
+    #[test]
+    fn oversized_questions_error_responses_fit_udp_budget() {
+        for (count, advertised) in [
+            (200, None),
+            // The questions alone exactly fill 512 bytes; OPT needs 11 more.
+            (100, Some(512)),
+            (250, Some(200)),
+            (250, Some(MAX_UDP_RESPONSE)),
+            (250, Some(u16::MAX)),
+        ] {
+            let edns = advertised.map(|udp_size| ClientEdns { udp_size });
+            let limit = udp_response_limit(edns);
+            let mut req_bytes = multi_question_query(count, edns);
+            // Non-query opcode, RD, and flags that a response must clear.
+            req_bytes[2] = 0x2d;
+            req_bytes[3] = 0x70;
+            let req = Message::from_octets(req_bytes).unwrap();
+            for rcode in [Rcode::FORMERR, Rcode::NOTIMP] {
+                let data = ResponseData {
+                    rcode,
+                    answers: &[],
+                    authority: &[],
+                    additional: &[],
+                    ttl_override: None,
+                    edns,
+                    shuffle_qtype: None,
+                };
+                let out = build_response(&req, &data, Some(limit));
+                assert!(
+                    out.len() <= usize::from(limit),
+                    "len {} > {limit}",
+                    out.len()
+                );
+                assert_eq!(out.len(), 12 + usize::from(edns.is_some()) * OPT_WIRE_LEN);
+                let msg = parse(out).unwrap();
+                assert_eq!(msg.header().id(), req.header().id());
+                assert_eq!(msg.header().opcode(), req.header().opcode());
+                assert_eq!(msg.header().rcode(), rcode);
+                assert!(msg.header().qr());
+                assert!(msg.header().rd());
+                assert!(msg.header().ra());
+                assert!(msg.header().tc());
+                assert!(!msg.header().aa());
+                assert!(!msg.header().ad());
+                assert!(!msg.header().cd());
+                assert_eq!(msg.header_counts().qdcount(), 0);
+                assert_eq!(msg.header_counts().ancount(), 0);
+                assert_eq!(msg.header_counts().nscount(), 0);
+                assert_eq!(msg.header_counts().arcount(), u16::from(edns.is_some()));
+                assert_eq!(msg.question().count(), 0);
+                assert_eq!(
+                    msg.additional().unwrap().count(),
+                    usize::from(edns.is_some())
+                );
+                assert_eq!(
+                    msg.opt().map(|opt| opt.udp_payload_size()),
+                    edns.map(|_| limit)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn error_responses_retain_questions_that_fit_udp_budget() {
+        for (count, advertised) in [(100, None), (97, Some(512)), (200, Some(1200))] {
+            let edns = advertised.map(|udp_size| ClientEdns { udp_size });
+            let req_bytes = multi_question_query(count, edns);
+            let req = Message::from_octets(req_bytes.clone()).unwrap();
+            let data = ResponseData {
+                rcode: Rcode::FORMERR,
+                answers: &[],
+                authority: &[],
+                additional: &[],
+                ttl_override: None,
+                edns,
+                shuffle_qtype: None,
+            };
+            let out = build_response(&req, &data, Some(udp_response_limit(edns)));
+            assert_eq!(&out[12..], &req_bytes[12..]);
+            let msg = parse(out).unwrap();
+            assert_eq!(usize::from(msg.header_counts().qdcount()), count);
+            assert_eq!(msg.question().count(), count);
+            assert_eq!(msg.header().rcode(), Rcode::FORMERR);
+            assert!(!msg.header().tc());
+        }
     }
 
     #[test]
