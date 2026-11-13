@@ -25,6 +25,7 @@ const FLAGS: &[(&str, FlagKind)] = &[
     ("aaaa", FlagKind::Str),
     ("trust_rcode", FlagKind::Str),
     ("lite", FlagKind::Str),
+    ("out", FlagKind::Str),
     ("d", FlagKind::Bool),
     ("debug", FlagKind::Bool),
     ("config", FlagKind::Str),

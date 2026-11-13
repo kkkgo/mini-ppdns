@@ -15,10 +15,15 @@ mini-ppdns -dns 10.10.10.8 -fall 223.5.5.5
 ```bash
 mini-ppdns -dns 10.10.10.8:53,10.10.10.9:53 -fall 223.5.5.5:53,119.29.29.29:53
 ```
+备用DNS也可以直接用网卡获取到的DNS（比如PPPoE拨号拿到的运营商DNS），见下文[从网卡获取DNS](#从网卡获取dnsdns)：
+```bash
+mini-ppdns -dns 10.10.10.8 -fall dns://%
+```
 #### 参数详解
 
-- `-dns`：本地自建主 DNS 上游（必填），支持多个地址以逗号分隔，如 `10.10.10.8,10.10.10.9`。  
-- `-fall`：备用/运营商 DNS 上游（必填），支持多个地址以逗号分隔。  
+- `-dns`：本地自建主 DNS 上游，支持多个地址以逗号分隔，如 `10.10.10.8,10.10.10.9`；也可以写 `dns://%` 或 `dns://eth0` 从网卡获取。不填时默认为 `dns://%`。  
+- `-fall`：备用/运营商 DNS 上游，支持多个地址以逗号分隔，写法同 `-dns`。不填时默认为 `dns://%`。  
+- `-out`：指定 DNS 上游流量从哪个网卡出去，如 `-out pppoe-wan`；也可以只对单个上游指定，写成 `网卡名@上游`，如 `-dns br-lan@10.10.10.8`，见下文[指定出口网卡](#指定出口网卡out-和-网卡上游)。  
 - `-listen`：可以指定监听地址和端口，默认是监听所有可监听的私有地址（跳过公网地址）。  
   - `mini-ppdns -dns 10.10.10.8 -fall 223.5.5.5 -listen 127.0.0.1:53`  
 - `-aaaa`：可以指定 AAAA 记录的处理模式（默认为 no，屏蔽 AAAA 查询）：  
@@ -35,6 +40,8 @@ mini-ppdns -dns 10.10.10.8:53,10.10.10.9:53 -fall 223.5.5.5:53,119.29.29.29:53
 - `-config`：可以指定加载配置文件，可以配置 `mini-ppdns.ini` 如下：
 ```ini
 # 本地搭建的主DNS
+# [dns] 和 [fall] 都支持 dns://% 和 dns://网卡名，从网卡获取DNS（见下文）
+# 未配置任何值的时候，自动兜底为 dns://%
 [dns]
 10.10.10.8:53
 10.10.10.9:53
@@ -43,6 +50,11 @@ mini-ppdns -dns 10.10.10.8:53,10.10.10.9:53 -fall 223.5.5.5:53,119.29.29.29:53
 [fall]
 223.5.5.5:53
 119.29.29.29:53
+# dns://% 表示自动选择流量出口网卡的DNS，OpenWrt 上优先使用 PPPoE 接口
+# dns://%
+# dns://eth0 表示使用 eth0 接口的DNS
+# dns://eth0
+# 条目前加 网卡名@ 可以指定这个上游从哪个网卡出去，比如 pppoe-wan@223.5.5.5、pppoe-wan@dns://%
 
 # 监听地址端口
 # 若未指定listen，或者指定为通配地址 `0.0.0.0:<port>` 或 `[::]:<port>`，
@@ -76,6 +88,10 @@ qtime=250
 aaaa=no
 # 是否开启精简响应模式，去掉无关记录（yes/no）
 lite=yes
+# 指定DNS上游流量从哪个网卡出去（默认为空，跟随系统路由）
+# 主DNS和备用DNS都会走这个网卡（127.0.0.1 这类回环地址除外）
+# 单个上游可以在条目前加 网卡名@ 另行指定并优先于 out，比如局域网主DNS写成 br-lan@10.10.10.8
+# out=pppoe-wan
 # 信任主DNS返回的指定rcode，直接采信不再请求备用DNS（默认为空，不信任）
 # 例如：trust_rcode=0,3 表示信任NOERROR(0)和NXDOMAIN(3)
 # 适用于某些信任"屏蔽记录"的场景，比如主DNS返回了空记录的noerror，但实际上备用DNS可以正常解析出记录。
@@ -122,6 +138,41 @@ switch_fall_exec="curl -sk -o /dev/null --data 'Main DNS is DOWN!' --retry 3 htt
 # 当因为hook功能切换回主DNS后，执行的命令（如发送通知）
 switch_main_exec="curl -sk -o /dev/null --data 'Main DNS is UP!' --retry 3 https://ntfy.sh/mydns_status"
 ```
+
+#### 从网卡获取DNS（dns://）
+`[dns]` 和 `[fall]`（以及 `-dns`、`-fall` 参数）里除了写IP地址，还可以写：
+- `dns://%`：自动选择流量出口网卡的DNS。指定了出口网卡时（`out`，或写成 `pppoe-wan@dns://%`）就是该网卡的DNS；否则在 OpenWrt 上优先使用 PPPoE 接口拿到的DNS，再看默认路由所在的网卡。
+- `dns://eth0`：使用 eth0 接口的DNS。网卡名用 `ip addr` 或 `ifconfig` 里看到的名字；OpenWrt 上也可以写逻辑接口名（如 `dns://wan`），或者 PPPoE 下面的物理网口（如 `dns://eth1`）。
+
+`[dns]` 或 `[fall]` 没有配置任何值的时候，自动兜底为 `dns://%`。所以在路由器上什么都不配置直接运行 `mini-ppdns`，就是转发到运营商下发的DNS。
+
+注意事项：
+- 从网卡获取DNS会因为系统差异可能获取失败。目前会依次尝试：OpenWrt 的 netifd（`ubus` 和 `/tmp/resolv.conf.d/resolv.conf.auto`）、NetworkManager、systemd-networkd 按网卡记录的DNS；`dns://%` 还会再尝试 `/tmp/resolv.conf.ppp`、`/run/systemd/resolve/resolv.conf`、`/etc/resolv.conf` 等系统文件。获取失败的时候，用默认的 `223.5.5.5` 和 `119.29.29.29` 兜底。
+- 启动的时候会打印获取到了什么，比如 `dns://% -> 192.0.2.1, 192.0.2.2 (from netifd wan)`，或者获取失败时的 `dns://eth0: no DNS server found on this system, using 223.5.5.5, 119.29.29.29`。
+- 获取结果每60秒刷新一次；当某组上游全部没有响应时也会立即刷新（最快每10秒一次），比如 PPPoE 重新拨号换了DNS。刷新时如果暂时获取不到（比如正在拨号），会继续沿用上一次的结果，结果有变化时会打印日志。
+- 回环地址和本机自己的地址（比如 `/etc/resolv.conf` 里指向本机的 `127.0.0.1`）会被过滤掉，避免转发给自己形成循环。同时有 IPv4 和 IPv6 DNS 时只使用 IPv4 的。
+
+#### 指定出口网卡（out 和 网卡@上游）
+可以把上游DNS的流量绑定到指定网卡发出（`SO_BINDTODEVICE`），不管系统路由表怎么走。适用于默认路由指向旁路由/代理，但希望运营商DNS直接从 PPPoE 出去的场景。有两种写法：
+- 全局：`[adv]` 里的 `out=pppoe-wan`（或参数 `-out pppoe-wan`），所有上游（主DNS和备用DNS）都从这个网卡出去。
+- 单个上游：在 `[dns]`、`[fall]` 的条目前面加 `网卡名@`，只对这一条生效，并且优先于 `out`：
+```ini
+[dns]
+# 局域网的主DNS走 br-lan
+br-lan@10.10.10.8:53
+[fall]
+# 运营商DNS从 PPPoE 出去
+pppoe-wan@dns://%
+pppoe-wan@223.5.5.5
+# 也支持 tcp:// 和 IPv6，比如 eth0@tcp://1.1.1.1、eth0@[2400:3200::1]:53
+```
+`网卡名@dns://%` 表示使用这个网卡的DNS并从这个网卡发出，等价于对 `dns://%` 设置了 `out`。命令行同样可用：`-dns br-lan@10.10.10.8 -fall pppoe-wan@dns://%`。
+
+注意事项：
+- 设置了全局 `out` 时，主DNS如果在局域网里（比如 `10.10.10.8`），绑定到 WAN 口后就访问不到了，可以写成 `br-lan@10.10.10.8` 让它单独走局域网口。
+- `127.0.0.1` 这类回环地址永远不绑定网卡。
+- 网卡名用 `ip addr` 或 `ifconfig` 里看到的内核网卡名（不能用 OpenWrt 的逻辑接口名 `wan`），格式写错的条目会被跳过并警告。
+- 需要 root 权限（Linux 5.7 以下的内核需要 `CAP_NET_RAW`），权限不足时启动会报错退出。网卡暂时不存在（比如 PPPoE 还没拨上）只会警告，等网卡出现后自动恢复。
 
 ---
 # 在openwrt路由器上部署

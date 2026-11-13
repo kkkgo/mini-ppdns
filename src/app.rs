@@ -3,23 +3,26 @@
 //! Runtime assembly and lifecycle: build the forwarders/cache/handler, bind
 //! every listen address, run until a signal, then drain.
 
+use std::fmt;
+use std::net::IpAddr;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{watch, Notify, Semaphore};
 
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::forcefall::ForceFallMatcher;
 use crate::handler::{AaaaMode, Handler};
 use crate::hook::HookMonitor;
+use crate::ifdns::{self, Found, Lookup, Selector, DEFAULT_SERVERS};
 use crate::local_resolver::{AutoDetect, PtrResolver};
 use crate::log;
 use crate::server::{serve_tcp, serve_udp};
 use crate::sysinfo::{calculate_cache_size, calculate_fallback_cache_size, get_available_memory};
-use crate::upstream::{Forwarder, Upstream};
+use crate::upstream::{merge_upstreams, Forwarder, LiveUpstreams, Upstream};
 
 // Concurrency caps are per-protocol so a TCP connection flood cannot starve
 // UDP query handling (and vice versa): the two share no permits. Each is a
@@ -40,6 +43,286 @@ const MIN_TCP_CONNS: usize = 32;
 // (`MAX_IDLE_CONNS` per upstream) and whatever else the process holds open.
 const FD_RESERVE: usize = 320;
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+/// How often the servers behind `dns://` entries are looked up again.
+const REDISCOVER_EVERY: Duration = Duration::from_secs(60);
+/// Least spacing between lookups set off by queries no upstream answered, so
+/// an outage that fails every query does not re-read the system for each one.
+const REDISCOVER_GAP: Duration = Duration::from_secs(10);
+
+/// One `[dns]` / `[fall]` entry: `[<interface>@]<target>`.
+#[derive(Clone, Debug)]
+pub struct UpstreamSpec {
+    /// Interface this entry's sockets are bound to; in its place the global
+    /// `out` applies.
+    pub device: Option<Arc<str>>,
+    pub target: Target,
+}
+
+#[derive(Clone, Debug)]
+pub enum Target {
+    /// A normalized `scheme://ip:port` address.
+    Addr(String),
+    /// A `dns://` entry: whatever servers the host's configuration names.
+    Iface(Selector),
+}
+
+impl UpstreamSpec {
+    pub fn new(device: Option<Arc<str>>, target: Target) -> Self {
+        UpstreamSpec { device, target }
+    }
+}
+
+impl fmt::Display for UpstreamSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(dev) = &self.device {
+            write!(f, "{dev}@")?;
+        }
+        match &self.target {
+            Target::Addr(a) => f.write_str(a),
+            Target::Iface(s) => s.fmt(f),
+        }
+    }
+}
+
+fn show_specs(specs: &[UpstreamSpec]) -> String {
+    let names: Vec<String> = specs.iter().map(|s| s.to_string()).collect();
+    format!("[{}]", names.join(", "))
+}
+
+fn show_ips(ips: &[IpAddr]) -> String {
+    let names: Vec<String> = ips.iter().map(|i| i.to_string()).collect();
+    names.join(", ")
+}
+
+/// The `dns://` lookups in use, the servers each currently stands for, and
+/// the forwarders built from them.
+struct Discovery {
+    lookups: Vec<Lookup>,
+    servers: Vec<Vec<IpAddr>>,
+    /// Whether the latest lookup for each entry found anything. When it did
+    /// not, `servers` keeps the previous answer, or the defaults at startup.
+    found: Vec<bool>,
+    out: Option<Arc<str>>,
+    live: Vec<(Vec<UpstreamSpec>, Arc<LiveUpstreams>)>,
+}
+
+impl Discovery {
+    fn new(specs: &[&[UpstreamSpec]], out: Option<Arc<str>>) -> Self {
+        let mut disc = Discovery {
+            lookups: Vec::new(),
+            servers: Vec::new(),
+            found: Vec::new(),
+            out,
+            live: Vec::new(),
+        };
+        for spec in specs.iter().flat_map(|s| s.iter()) {
+            if let Some(l) = disc.lookup_of(spec) {
+                if !disc.lookups.contains(&l) {
+                    disc.lookups.push(l);
+                }
+            }
+        }
+        disc.servers = vec![DEFAULT_SERVERS.to_vec(); disc.lookups.len()];
+        disc.found = vec![false; disc.lookups.len()];
+        disc
+    }
+
+    /// The interface `spec`'s sockets are bound to: its own, else `out`.
+    fn device_of<'a>(&'a self, spec: &'a UpstreamSpec) -> Option<&'a Arc<str>> {
+        spec.device.as_ref().or(self.out.as_ref())
+    }
+
+    fn lookup_of(&self, spec: &UpstreamSpec) -> Option<Lookup> {
+        match &spec.target {
+            Target::Iface(sel) => Some(Lookup::new(sel.clone(), self.device_of(spec).cloned())),
+            Target::Addr(_) => None,
+        }
+    }
+
+    /// The first lookup, logged in full: what each `dns://` entry stands for
+    /// is the first thing to check when forwarding goes wrong.
+    async fn start(&mut self) {
+        if self.lookups.is_empty() {
+            return;
+        }
+        let found = ifdns::detect(&self.lookups).await;
+        for (i, f) in found.into_iter().enumerate() {
+            let lookup = &self.lookups[i];
+            match f {
+                Some(Found { servers, source }) => {
+                    log::info(&format!(
+                        "{lookup} -> {} (from {source})",
+                        log::hl_value(show_ips(&servers))
+                    ));
+                    self.servers[i] = servers;
+                    self.found[i] = true;
+                }
+                None => log::warn(&format!(
+                    "{lookup}: no DNS server found on this system, using {}",
+                    show_ips(&self.servers[i])
+                )),
+            }
+        }
+    }
+
+    /// Take in a later lookup. An entry that finds nothing keeps what it had:
+    /// losing the uplink's servers for a moment (a PPP redial) is no reason to
+    /// drop servers that may still answer.
+    fn update(&mut self, found: Vec<Option<Found>>) {
+        let mut changed = false;
+        for (i, f) in found.into_iter().enumerate() {
+            let lookup = &self.lookups[i];
+            match f {
+                Some(Found { servers, source }) => {
+                    if servers != self.servers[i] {
+                        log::info(&format!(
+                            "{lookup} -> {} (from {source}), was {}",
+                            log::hl_value(show_ips(&servers)),
+                            show_ips(&self.servers[i])
+                        ));
+                        self.servers[i] = servers;
+                        changed = true;
+                    }
+                    self.found[i] = true;
+                }
+                None if self.found[i] => {
+                    log::warn(&format!(
+                        "{lookup}: no DNS server found any more, keeping {}",
+                        show_ips(&self.servers[i])
+                    ));
+                    self.found[i] = false;
+                }
+                None => {}
+            }
+        }
+        if changed {
+            for (specs, live) in &self.live {
+                live.replace(self.upstreams(specs, false));
+            }
+        }
+    }
+
+    /// The upstreams `specs` currently stand for, in order and without
+    /// repeats. `warn` reports entries that do not parse (once, at startup).
+    fn upstreams(&self, specs: &[UpstreamSpec], warn: bool) -> Vec<Upstream> {
+        let mut list = Vec::new();
+        for spec in specs {
+            let device = self.device_of(spec);
+            match &spec.target {
+                Target::Addr(url) => match Upstream::parse(url) {
+                    Ok(u) => merge_upstreams(&mut list, [u.bound_to(device)]),
+                    Err(e) if warn => log::warn(&format!("skipping invalid upstream {url}: {e}")),
+                    Err(_) => {}
+                },
+                Target::Iface(_) => {
+                    let Some(i) = self
+                        .lookup_of(spec)
+                        .and_then(|l| self.lookups.iter().position(|x| *x == l))
+                    else {
+                        continue;
+                    };
+                    let found = self.servers[i].iter();
+                    merge_upstreams(
+                        &mut list,
+                        found.map(|ip| Upstream::udp53(*ip).bound_to(device)),
+                    );
+                }
+            }
+        }
+        list
+    }
+
+    /// The forwarder for `specs`: a live one, kept current by [`rediscover`],
+    /// when any entry is `dns://`.
+    fn forwarder(
+        &mut self,
+        specs: &[UpstreamSpec],
+        list: Vec<Upstream>,
+        timeout: Duration,
+        breaker: bool,
+        stale: &Arc<Notify>,
+    ) -> Forwarder {
+        let list: Vec<Arc<Upstream>> = list.into_iter().map(Arc::new).collect();
+        if !specs.iter().any(|s| matches!(s.target, Target::Iface(_))) {
+            return if breaker {
+                Forwarder::with_breaker(list, timeout)
+            } else {
+                Forwarder::new(list, timeout)
+            };
+        }
+        let live = Arc::new(LiveUpstreams::new(list, stale.clone()));
+        self.live.push((specs.to_vec(), live.clone()));
+        Forwarder::live(live, timeout, breaker)
+    }
+}
+
+/// Look the `dns://` servers up again every [`REDISCOVER_EVERY`], and sooner
+/// when a query found every upstream of a live forwarder silent.
+async fn rediscover(mut disc: Discovery, stale: Arc<Notify>, mut shutdown: watch::Receiver<bool>) {
+    let mut tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + REDISCOVER_EVERY,
+        REDISCOVER_EVERY,
+    );
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last = Instant::now();
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+                continue;
+            }
+            _ = tick.tick() => {}
+            _ = stale.notified() => {
+                if last.elapsed() < REDISCOVER_GAP { continue; }
+            }
+        }
+        last = Instant::now();
+        let found = ifdns::detect(&disc.lookups).await;
+        disc.update(found);
+    }
+}
+
+/// Every interface upstream sockets get bound to: `out` and each entry's own.
+fn bound_devices(out: Option<&Arc<str>>, specs: &[&[UpstreamSpec]]) -> Vec<Arc<str>> {
+    let mut devs: Vec<Arc<str>> = out.into_iter().cloned().collect();
+    for dev in specs
+        .iter()
+        .flat_map(|s| s.iter())
+        .filter_map(|s| s.device.as_ref())
+    {
+        if !devs.contains(dev) {
+            devs.push(dev.clone());
+        }
+    }
+    devs
+}
+
+/// Make sure sockets can be bound to `dev` before serving: without that right
+/// every query to an upstream bound there would fail. An interface that does
+/// not exist yet (a PPP link still dialing) is only warned about.
+async fn check_bind_device(dev: &str) -> Result<(), String> {
+    let sock = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .map_err(|e| format!("Error: interface {dev}: {e}"))?;
+    match sock.bind_device(Some(dev.as_bytes())) {
+        Ok(()) => {
+            log::info(&format!(
+                "upstream sockets can bind to {}",
+                log::hl_value(dev)
+            ));
+            Ok(())
+        }
+        Err(e) if e.raw_os_error() == Some(libc::ENODEV) => {
+            log::warn(&format!(
+                "interface {dev} does not exist yet; upstreams bound to it fail until it appears"
+            ));
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "Error: interface {dev}: cannot bind sockets to it: {e}"
+        )),
+    }
+}
 
 /// The three concurrency ceilings, after the file-descriptor limit is taken
 /// into account.
@@ -162,8 +445,8 @@ pub fn run(
     cfg: &Config,
     listen: Vec<String>,
     matcher: ForceFallMatcher,
-    dns_upstreams: Vec<String>,
-    fall_upstreams: Vec<String>,
+    dns_upstreams: Vec<UpstreamSpec>,
+    fall_upstreams: Vec<UpstreamSpec>,
 ) -> Result<(), String> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -205,26 +488,29 @@ pub fn run(
     result
 }
 
-fn build_upstreams(list: &[String]) -> Vec<Arc<Upstream>> {
-    let mut out = Vec::new();
-    for url in list {
-        match Upstream::parse(url) {
-            Ok(u) => out.push(Arc::new(u)),
-            Err(e) => log::warn(&format!("skipping invalid upstream {url}: {e}")),
-        }
-    }
-    out
-}
-
 async fn serve(
     cfg: &Config,
     listen: Vec<String>,
     matcher: ForceFallMatcher,
-    dns_upstreams: Vec<String>,
-    fall_upstreams: Vec<String>,
+    dns_upstreams: Vec<UpstreamSpec>,
+    fall_upstreams: Vec<UpstreamSpec>,
 ) -> Result<(), String> {
-    let main = build_upstreams(&dns_upstreams);
-    let fall = build_upstreams(&fall_upstreams);
+    let avail = get_available_memory();
+    log::info(&format!("mini-ppdns {}", crate::VERSION));
+    log::info(&format!(
+        "available memory {} {}",
+        log::hl_value(avail / 1024 / 1024),
+        log::hl_unit("MB")
+    ));
+
+    let out: Option<Arc<str>> = (!cfg.out.is_empty()).then(|| Arc::from(cfg.out.as_str()));
+    for dev in bound_devices(out.as_ref(), &[&dns_upstreams, &fall_upstreams]) {
+        check_bind_device(&dev).await?;
+    }
+    let mut disc = Discovery::new(&[&dns_upstreams, &fall_upstreams], out);
+    disc.start().await;
+    let main = disc.upstreams(&dns_upstreams, true);
+    let fall = disc.upstreams(&fall_upstreams, true);
     if main.is_empty() {
         return Err("Error: No valid DNS upstream (-dns)".into());
     }
@@ -248,11 +534,11 @@ async fn serve(
     }
 
     let timings = Timings::from_qtime(Duration::from_millis(cfg.qtime as u64));
+    let stale = Arc::new(Notify::new());
     // Only the main forwarder gets the fail-fast breaker (see `Breaker`).
-    let main_fwd = Forwarder::with_breaker(main, timings.main);
-    let fall_fwd = Forwarder::new(fall, timings.fall);
+    let main_fwd = disc.forwarder(&dns_upstreams, main, timings.main, true, &stale);
+    let fall_fwd = disc.forwarder(&fall_upstreams, fall, timings.fall, false, &stale);
 
-    let avail = get_available_memory();
     let cache_cap = calculate_cache_size(avail);
     let cache = Arc::new(Cache::new(cache_cap));
     // Answers from the fallback upstream live in their own cache (see the
@@ -261,15 +547,10 @@ async fn serve(
     let fall_cache_cap = calculate_fallback_cache_size(cache_cap);
     let fall_cache = Arc::new(Cache::new(fall_cache_cap));
 
-    // Startup banner (timestamped, highlighted).
-    log::info(&format!("mini-ppdns {}", crate::VERSION));
     log::info(&format!(
-        "available memory {} {}",
-        log::hl_value(avail / 1024 / 1024),
-        log::hl_unit("MB")
-    ));
-    log::info(&format!(
-        "upstreams dns={dns_upstreams:?} fall={fall_upstreams:?}"
+        "upstreams dns={} fall={}",
+        show_specs(&dns_upstreams),
+        show_specs(&fall_upstreams)
     ));
     log::info(&format!(
         "cache capacity {} entries (fallback {} entries)",
@@ -278,6 +559,10 @@ async fn serve(
     ));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    if !disc.live.is_empty() {
+        tokio::spawn(rediscover(disc, stale, shutdown_rx.clone()));
+    }
 
     // Local resolver (lease/hosts files + [hosts] statics) — None if nothing
     // to resolve.
@@ -710,5 +995,211 @@ mod tests {
             assert!(c.udp >= prev.udp && c.tcp >= prev.tcp && c.tcp_conns >= prev.tcp_conns);
             prev = c;
         }
+    }
+
+    fn ips(list: &[&str]) -> Vec<IpAddr> {
+        list.iter().map(|s| s.parse().unwrap()).collect()
+    }
+
+    fn labels(list: &[Upstream]) -> Vec<String> {
+        list.iter().map(|u| u.label.to_string()).collect()
+    }
+
+    fn found(servers: &[&str]) -> Option<Found> {
+        Some(Found {
+            servers: ips(servers),
+            source: "test".into(),
+        })
+    }
+
+    fn addr(url: &str) -> UpstreamSpec {
+        UpstreamSpec::new(None, Target::Addr(url.into()))
+    }
+
+    fn auto() -> UpstreamSpec {
+        UpstreamSpec::new(None, Target::Iface(Selector::Auto))
+    }
+
+    fn iface(name: &str) -> UpstreamSpec {
+        UpstreamSpec::new(None, Target::Iface(Selector::Iface(name.into())))
+    }
+
+    fn on(dev: &str, spec: UpstreamSpec) -> UpstreamSpec {
+        UpstreamSpec::new(Some(Arc::from(dev)), spec.target)
+    }
+
+    fn devices(list: &[Upstream]) -> Vec<Option<&str>> {
+        list.iter().map(Upstream::device).collect()
+    }
+
+    #[test]
+    fn dns_entries_expand_in_place_without_repeats() {
+        let main = vec![addr("udp://10.0.0.8:53"), auto(), iface("eth0")];
+        let fall = vec![auto(), addr("udp://223.5.5.5:53")];
+        let mut disc = Discovery::new(&[&main, &fall], None);
+        assert_eq!(
+            disc.lookups,
+            [
+                Lookup::new(Selector::Auto, None),
+                Lookup::new(Selector::Iface("eth0".into()), None)
+            ],
+            "each lookup is done once however often it appears"
+        );
+        assert_eq!(
+            labels(&disc.upstreams(&fall, false)),
+            ["udp://223.5.5.5:53", "udp://119.29.29.29:53"],
+            "before anything is found the defaults stand in, and are not repeated"
+        );
+        disc.servers = vec![
+            ips(&["192.0.2.1", "192.0.2.2"]),
+            ips(&["192.0.2.2", "192.0.2.3"]),
+        ];
+        assert_eq!(
+            labels(&disc.upstreams(&main, false)),
+            [
+                "udp://10.0.0.8:53",
+                "udp://192.0.2.1:53",
+                "udp://192.0.2.2:53",
+                "udp://192.0.2.3:53"
+            ]
+        );
+        assert_eq!(
+            show_specs(&main),
+            "[udp://10.0.0.8:53, dns://%, dns://eth0]"
+        );
+    }
+
+    #[test]
+    fn a_lookup_that_finds_nothing_keeps_the_servers_in_force() {
+        let specs = vec![auto()];
+        let mut disc = Discovery::new(&[&specs], None);
+        let stale = Arc::new(Notify::new());
+        let initial = disc.upstreams(&specs, false);
+        let fwd = disc.forwarder(&specs, initial, Duration::from_secs(1), false, &stale);
+        let (_, live) = disc.live[0].clone();
+        let now = |live: &LiveUpstreams| -> Vec<String> {
+            live.current().iter().map(|u| u.label.to_string()).collect()
+        };
+        assert_eq!(fwd.sockets_per_query(), 2);
+
+        disc.update(vec![found(&["192.0.2.1"])]);
+        assert_eq!(now(&live), ["udp://192.0.2.1:53"]);
+        assert!(disc.found[0]);
+
+        disc.update(vec![None]);
+        assert_eq!(
+            now(&live),
+            ["udp://192.0.2.1:53"],
+            "a lost answer (a PPP redial in progress) does not drop the servers"
+        );
+        assert!(!disc.found[0]);
+
+        disc.update(vec![found(&["192.0.2.9", "192.0.2.1"])]);
+        assert_eq!(now(&live), ["udp://192.0.2.9:53", "udp://192.0.2.1:53"]);
+    }
+
+    #[test]
+    fn plain_addresses_build_a_fixed_forwarder() {
+        let specs = vec![on("br-lan", addr("udp://10.0.0.8:53"))];
+        let mut disc = Discovery::new(&[&specs], None);
+        assert!(disc.lookups.is_empty());
+        let list = disc.upstreams(&specs, false);
+        let stale = Arc::new(Notify::new());
+        disc.forwarder(&specs, list, Duration::from_secs(1), true, &stale);
+        assert!(disc.live.is_empty(), "nothing to keep current");
+    }
+
+    #[test]
+    fn out_binds_every_upstream_it_can() {
+        let specs = vec![
+            addr("udp://127.0.0.1:5353"),
+            addr("tcp://10.0.0.8:53"),
+            addr("not-an-address"),
+            auto(),
+        ];
+        let disc = Discovery::new(&[&specs], Some(Arc::from("pppoe-wan")));
+        let list = disc.upstreams(&specs, false);
+        assert_eq!(list.len(), 4, "the unparsable entry is skipped");
+        assert_eq!(
+            devices(&list),
+            [
+                None,
+                Some("pppoe-wan"),
+                Some("pppoe-wan"),
+                Some("pppoe-wan")
+            ],
+            "loopback stays unbound"
+        );
+    }
+
+    #[test]
+    fn an_entrys_own_interface_wins_over_out() {
+        let main = vec![on("br-lan", addr("udp://10.10.10.8:53"))];
+        let fall = vec![auto(), addr("udp://223.5.5.5:53")];
+        let disc = Discovery::new(&[&main, &fall], Some(Arc::from("pppoe-wan")));
+        assert_eq!(
+            devices(&disc.upstreams(&main, false)),
+            [Some("br-lan")],
+            "the LAN main DNS stays on the LAN while out sends the rest to the WAN"
+        );
+        // The defaults already include 223.5.5.5, so it is listed once.
+        assert_eq!(
+            devices(&disc.upstreams(&fall, false)),
+            [Some("pppoe-wan"), Some("pppoe-wan")]
+        );
+        let none = Discovery::new(&[&main], None);
+        assert_eq!(devices(&none.upstreams(&main, false)), [Some("br-lan")]);
+    }
+
+    #[test]
+    fn a_bound_automatic_entry_means_that_interfaces_dns() {
+        let main = vec![on("eth1", auto())];
+        let fall = vec![auto(), iface("wan"), on("eth1", iface("wan"))];
+        let mut disc = Discovery::new(&[&main, &fall], Some(Arc::from("pppoe-wan")));
+        assert_eq!(
+            disc.lookups,
+            [
+                Lookup::new(Selector::Auto, Some(Arc::from("eth1"))),
+                Lookup::new(Selector::Auto, Some(Arc::from("pppoe-wan"))),
+                Lookup::new(Selector::Iface("wan".into()), None),
+            ],
+            "dns://% is looked up per egress; a named interface once"
+        );
+        disc.servers = vec![
+            ips(&["192.0.2.1"]),
+            ips(&["192.0.2.2"]),
+            ips(&["192.0.2.3"]),
+        ];
+        let main_list = disc.upstreams(&main, false);
+        assert_eq!(labels(&main_list), ["udp://192.0.2.1:53"]);
+        assert_eq!(devices(&main_list), [Some("eth1")]);
+        let fall_list = disc.upstreams(&fall, false);
+        assert_eq!(
+            labels(&fall_list),
+            [
+                "udp://192.0.2.2:53",
+                "udp://192.0.2.3:53",
+                "udp://192.0.2.3:53"
+            ]
+        );
+        assert_eq!(
+            devices(&fall_list),
+            [Some("pppoe-wan"), Some("pppoe-wan"), Some("eth1")],
+            "the same server bound to two interfaces is two upstreams"
+        );
+    }
+
+    #[test]
+    fn every_bound_interface_is_checked_once() {
+        let main = vec![
+            on("br-lan", addr("udp://10.10.10.8:53")),
+            on("eth1", auto()),
+        ];
+        let fall = vec![on("br-lan", auto()), addr("udp://223.5.5.5:53")];
+        let out: Arc<str> = Arc::from("pppoe-wan");
+        let devs = bound_devices(Some(&out), &[&main, &fall]);
+        let names: Vec<&str> = devs.iter().map(|d| &**d).collect();
+        assert_eq!(names, ["pppoe-wan", "br-lan", "eth1"]);
+        assert!(bound_devices(None, &[&fall[1..]]).is_empty());
     }
 }

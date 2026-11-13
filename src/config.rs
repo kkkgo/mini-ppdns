@@ -23,6 +23,8 @@ pub struct Config {
     pub aaaa: String,
     pub lite: String,
     pub trust_rcode: Vec<i32>,
+    /// Interface every upstream socket is bound to; empty for none.
+    pub out: String,
     pub daemon: bool,
     pub debug: bool,
 
@@ -53,6 +55,7 @@ impl Default for Config {
             aaaa: "no".to_string(),
             lite: "yes".to_string(),
             trust_rcode: Vec::new(),
+            out: String::new(),
             daemon: false,
             debug: false,
             lease_file: Vec::new(),
@@ -173,6 +176,7 @@ fn parse_adv(line: &str, cfg: &mut Config, warnings: &mut Vec<String>) {
             cfg.block_svcb = parse_bool_word(v);
             cfg.block_svcb_set = true;
         }
+        "out" => cfg.out = v.to_string(),
         "lease_file" => append_csv(&mut cfg.lease_file, v),
         "hosts_file" => append_csv(&mut cfg.hosts_file, v),
         _ => warnings.push(format!("unknown config key in [adv], ignored: {k}")),
@@ -321,7 +325,7 @@ mod tests {
             [fall]\n223.5.5.5:53\n\
             [listen]\n127.0.0.1:53\n\
             [force_fall]\n192.168.1.10\n^192.168.10.0/24\n\
-            [adv]\nqtime=300\naaaa=noerror\nlite=no\ntrust_rcode=0,3\nboguspriv=0\nblock_svcb=no\nlease_file=/tmp/a.leases,/tmp/b.leases\n\
+            [adv]\nqtime=300\naaaa=noerror\nlite=no\ntrust_rcode=0,3\nboguspriv=0\nblock_svcb=no\nlease_file=/tmp/a.leases,/tmp/b.leases\nout=pppoe-wan\n\
             [hosts]\n1.2.3.4 example.com ALIAS.example.com # inline\n\
             [pplog]\nuuid=abc\nserver=192.168.1.100:9999\nlevel=3\nheart_beat=60\n\
             [hook]\nexec=\"curl -s http://x/\"\nexit_code=0\nkeyword=\"204\"\nsleep_time=30\ncount=5\n";
@@ -338,6 +342,7 @@ mod tests {
         assert!(!cfg.boguspriv && cfg.boguspriv_set);
         assert!(!cfg.block_svcb && cfg.block_svcb_set);
         assert_eq!(cfg.lease_file, ["/tmp/a.leases", "/tmp/b.leases"]);
+        assert_eq!(cfg.out, "pppoe-wan");
 
         // hosts: inline comment stripped; both aliases mapped, lower-cased + fqdn.
         assert_eq!(cfg.hosts.get("example.com.").map(|v| v.len()), Some(1),);
@@ -357,6 +362,16 @@ mod tests {
         assert_eq!(hook.retry_time, 5); // default preserved
 
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn dns_entries_are_kept_verbatim() {
+        let (cfg, warnings) =
+            parse_str("[dns]\ndns://%\n10.0.0.1\n[fall]\ndns://pppoe-wan\n[adv]\nout = eth0\n");
+        assert_eq!(cfg.dns, ["dns://%", "10.0.0.1"]);
+        assert_eq!(cfg.fall, ["dns://pppoe-wan"]);
+        assert_eq!(cfg.out, "eth0");
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]

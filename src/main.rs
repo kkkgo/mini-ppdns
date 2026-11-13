@@ -8,6 +8,7 @@ mod dns;
 mod forcefall;
 mod handler;
 mod hook;
+mod ifdns;
 mod local_resolver;
 mod log;
 mod pplog;
@@ -70,28 +71,9 @@ fn run() -> Result<(), Fatal> {
         log::warn(w);
     }
 
-    // Resolve upstreams (normalize addresses; full validation lands with the
-    // upstream layer in P2).
-    let dns_upstreams: Vec<String> = cfg
-        .dns
-        .iter()
-        .map(|a| util::format_upstream_addr(a))
-        .collect();
-    let fall_upstreams: Vec<String> = cfg
-        .fall
-        .iter()
-        .map(|a| util::format_upstream_addr(a))
-        .collect();
-    if dns_upstreams.is_empty() {
-        return Err(Fatal::Config(
-            "Error: No DNS upstream provided (-dns)".into(),
-        ));
-    }
-    if fall_upstreams.is_empty() {
-        return Err(Fatal::Config(
-            "Error: No fallback DNS provided (-fall)".into(),
-        ));
-    }
+    let dns_upstreams = upstream_specs(&cfg.dns);
+    let fall_upstreams = upstream_specs(&cfg.fall);
+    check_out(&cfg.out)?;
     if cfg.qtime <= 0 {
         return Err(Fatal::Config(format!(
             "Error: qtime must be positive (got {})",
@@ -257,6 +239,10 @@ fn build_config(raw: &cli::RawArgs, warnings: &mut Vec<String>) -> Result<Config
     if let Some(v) = nonempty(raw.get_str("lite")) {
         cfg.lite = v.to_string();
     }
+    if let Some(v) = nonempty(raw.get_str("out")) {
+        cfg.out = v.to_string();
+    }
+    cfg.out = cfg.out.trim().to_string();
 
     // Collection flags: config entries first, then CLI entries appended.
     if let Some(v) = nonempty(raw.get_str("dns")) {
@@ -331,6 +317,62 @@ fn build_config(raw: &cli::RawArgs, warnings: &mut Vec<String>) -> Result<Config
     }
 
     Ok(cfg)
+}
+
+/// Turn `[dns]`/`[fall]` entries into upstream specs. An empty list means the
+/// host's own DNS (`dns://%`). Malformed entries are skipped with a warning,
+/// like any other invalid upstream.
+fn upstream_specs(entries: &[String]) -> Vec<app::UpstreamSpec> {
+    if entries.is_empty() {
+        let auto = app::Target::Iface(ifdns::Selector::Auto);
+        return vec![app::UpstreamSpec::new(None, auto)];
+    }
+    entries
+        .iter()
+        .filter_map(|e| match parse_spec(e) {
+            Ok(spec) => Some(spec),
+            Err(msg) => {
+                log::warn(&format!("skipping invalid upstream: {msg}"));
+                None
+            }
+        })
+        .collect()
+}
+
+/// One entry: `[<interface>@]<target>`, where the target is an address in any
+/// accepted form or a `dns://` entry. No target form contains `@`, so the
+/// first one always ends the interface name.
+fn parse_spec(entry: &str) -> Result<app::UpstreamSpec, String> {
+    let entry = entry.trim();
+    let (device, target) = match entry.split_once('@') {
+        None => (None, entry),
+        Some((dev, target)) => {
+            let dev = dev.trim();
+            if !ifdns::valid_ifname(dev) {
+                return Err(format!("{entry:?}: {dev:?} is not a valid interface name"));
+            }
+            let target = target.trim();
+            if target.is_empty() {
+                return Err(format!("{entry:?} names no upstream after the @"));
+            }
+            (Some(std::sync::Arc::from(dev)), target)
+        }
+    };
+    let target = match ifdns::Selector::parse(target) {
+        Some(sel) => app::Target::Iface(sel?),
+        None => app::Target::Addr(util::format_upstream_addr(target)),
+    };
+    Ok(app::UpstreamSpec::new(device, target))
+}
+
+/// `out` has to be a name `SO_BINDTODEVICE` can take (or empty, for unset).
+fn check_out(out: &str) -> Result<(), Fatal> {
+    if !out.is_empty() && !ifdns::valid_ifname(out) {
+        return Err(Fatal::Config(format!(
+            "Error: out={out:?} is not a valid interface name"
+        )));
+    }
+    Ok(())
 }
 
 fn resolve_listen(cfg: &Config) -> Vec<String> {
@@ -415,5 +457,90 @@ mod tests {
         assert_eq!(cfg.qtime, 100, "CLI qtime wins over file");
         assert_eq!(cfg.aaaa, "yes", "CLI aaaa wins over file");
         assert_eq!(cfg.lite, "no", "file value kept when CLI absent");
+    }
+
+    #[test]
+    fn unconfigured_upstreams_mean_the_hosts_own_dns() {
+        let shown = |entries: &[&str]| -> Vec<String> {
+            let given: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
+            upstream_specs(&given)
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        };
+        assert_eq!(shown(&[]), ["dns://%"]);
+        assert!(upstream_specs(&[])[0].device.is_none());
+        assert_eq!(
+            shown(&["10.0.0.8", "dns://eth0", "dns://", "dns://%"]),
+            ["udp://10.0.0.8:53", "dns://eth0", "dns://%"],
+            "a malformed dns:// entry is dropped, not defaulted"
+        );
+    }
+
+    #[test]
+    fn an_entry_may_name_the_interface_it_goes_out_of() {
+        let spec = parse_spec(" eth0@10.10.10.8:53 ").unwrap();
+        assert_eq!(spec.device.as_deref(), Some("eth0"));
+        assert!(matches!(&spec.target, app::Target::Addr(a) if a == "udp://10.10.10.8:53"));
+        for (entry, shown) in [
+            ("eth0@10.10.10.8", "eth0@udp://10.10.10.8:53"),
+            ("br-lan @ 10.10.10.8:5353", "br-lan@udp://10.10.10.8:5353"),
+            ("eth0@tcp://1.1.1.1", "eth0@tcp://1.1.1.1:53"),
+            ("eth0@::1", "eth0@udp://[::1]:53"),
+            (
+                "pppoe-wan@[2001:db8::1]:53",
+                "pppoe-wan@udp://[2001:db8::1]:53",
+            ),
+            ("pppoe-wan@dns://%", "pppoe-wan@dns://%"),
+            ("eth1@dns://wan", "eth1@dns://wan"),
+            ("10.10.10.8", "udp://10.10.10.8:53"),
+        ] {
+            assert_eq!(parse_spec(entry).unwrap().to_string(), shown, "{entry}");
+        }
+        for bad in [
+            "@10.10.10.8",
+            "eth0@",
+            "eth 0@10.10.10.8",
+            "eth0:1@10.10.10.8",
+            "udp://eth0@10.10.10.8",
+            "abcdefghijklmnop@10.10.10.8",
+            "eth0@dns://",
+        ] {
+            assert!(parse_spec(bad).is_err(), "{bad:?}");
+        }
+        let given: Vec<String> = ["@1.2.3.4", "eth0@1.2.3.4"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(upstream_specs(&given).len(), 1, "the bad entry is skipped");
+    }
+
+    #[test]
+    fn out_must_be_a_kernel_interface_name() {
+        assert!(check_out("").is_ok(), "unset");
+        assert!(check_out("pppoe-wan").is_ok());
+        assert!(check_out("abcdefghijklmno").is_ok(), "15 bytes fit");
+        assert!(check_out("abcdefghijklmnop").is_err(), "16 do not");
+        assert!(check_out("eth0 eth1").is_err());
+        assert!(check_out("../x").is_err());
+    }
+
+    #[test]
+    fn out_comes_from_the_cli_over_the_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("mini-ppdns-out-{}.ini", std::process::id()));
+        std::fs::write(&path, "[adv]\nout=eth0\n").unwrap();
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["-config".to_string(), path.to_str().unwrap().to_string()];
+            args.extend(extra.iter().map(|s| s.to_string()));
+            let raw = cli::parse(args).unwrap();
+            let Ok(cfg) = build_config(&raw, &mut Vec::new()) else {
+                panic!("build_config failed");
+            };
+            cfg.out
+        };
+        assert_eq!(parse(&[]), "eth0");
+        assert_eq!(parse(&["-out", "pppoe-wan"]), "pppoe-wan");
+        let _ = std::fs::remove_file(&path);
     }
 }

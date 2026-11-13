@@ -6,16 +6,17 @@
 //! takes the first NOERROR answer, cancelling the rest. UDP upstreams fall back
 //! to TCP when the answer is truncated (RFC 1035).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use domain::base::iana::{OptRcode, Rcode};
 use domain::base::Message;
 use domain::rdata::AllRecordData;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
@@ -66,6 +67,9 @@ pub struct Upstream {
     /// `Arc<str>` rather than `String`: every forwarded query hands this label
     /// to the logger/telemetry, and a refcount bump beats a heap copy.
     pub label: Arc<str>,
+    /// Interface every socket to this upstream is bound to (`SO_BINDTODEVICE`),
+    /// so its traffic leaves there whatever the routing table prefers.
+    device: Option<Arc<str>>,
     /// Idle connected sockets, each carrying its own receive buffer so the hot
     /// path does not allocate (and zero) a fresh `UDP_RECV_BUF` per query.
     idle_udp: Mutex<Vec<(UdpSocket, Vec<u8>)>>,
@@ -95,9 +99,69 @@ impl Upstream {
             addr,
             kind,
             label: Arc::from(url),
+            device: None,
             idle_udp: Mutex::new(Vec::new()),
             idle_tcp: Mutex::new(Vec::new()),
         })
+    }
+
+    /// A plain-UDP upstream on port 53, as a `dns://` entry produces.
+    pub fn udp53(ip: IpAddr) -> Upstream {
+        let addr = SocketAddr::new(ip, 53);
+        Upstream {
+            addr,
+            kind: Kind::Udp,
+            label: Arc::from(format!("udp://{addr}")),
+            device: None,
+            idle_udp: Mutex::new(Vec::new()),
+            idle_tcp: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Bind this upstream's sockets to `device`. A loopback upstream stays
+    /// unbound: loopback addresses are only reachable through `lo`, so a socket
+    /// tied to any other interface could never reach it.
+    pub fn bound_to(mut self, device: Option<&Arc<str>>) -> Upstream {
+        if !self.addr.ip().is_loopback() {
+            self.device = device.cloned();
+        }
+        self
+    }
+
+    #[cfg(test)]
+    pub fn device(&self) -> Option<&str> {
+        self.device.as_deref()
+    }
+
+    fn same_endpoint(&self, other: &Upstream) -> bool {
+        self.addr == other.addr && self.kind == other.kind && self.device == other.device
+    }
+
+    async fn dial_udp(&self) -> std::io::Result<UdpSocket> {
+        let bind = if self.addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let s = UdpSocket::bind(bind).await?;
+        if let Some(dev) = &self.device {
+            s.bind_device(Some(dev.as_bytes()))?;
+        }
+        s.connect(self.addr).await?;
+        Ok(s)
+    }
+
+    async fn dial_tcp(&self) -> std::io::Result<TcpStream> {
+        let Some(dev) = &self.device else {
+            return TcpStream::connect(self.addr).await;
+        };
+        let s = if self.addr.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        s.bind_device(Some(dev.as_bytes()))?;
+        s.connect(self.addr).await
     }
 
     /// Send `query` and return the raw response bytes, honoring `deadline`
@@ -135,20 +199,26 @@ impl Upstream {
         // Reuse a pooled connected socket, or dial a fresh one. The pop is its
         // own statement so the mutex guard never spans the dial `.await`.
         let pooled = self.idle_udp.lock().unwrap().pop();
+        let pooled = match pooled {
+            // A pooled socket can outlive the path it was connected over: its
+            // bound interface was re-created, its source address went away
+            // with a PPP redial, or an ICMP error from an earlier exchange is
+            // pending on it. Each of those fails the send at once and says
+            // nothing about the upstream, so the query moves to a fresh socket.
+            Some((sock, buf)) => match sock.send(query).await {
+                Ok(_) => Some((sock, buf)),
+                Err(_) => None,
+            },
+            None => None,
+        };
         let (sock, mut buf) = match pooled {
             Some(pair) => pair,
             None => {
-                let bind = if self.addr.is_ipv4() {
-                    "0.0.0.0:0"
-                } else {
-                    "[::]:0"
-                };
-                let s = UdpSocket::bind(bind).await.map_err(|e| e.to_string())?;
-                s.connect(self.addr).await.map_err(|e| e.to_string())?;
+                let s = self.dial_udp().await.map_err(|e| e.to_string())?;
+                s.send(query).await.map_err(|e| e.to_string())?;
                 (s, vec![0u8; UDP_RECV_BUF])
             }
         };
-        sock.send(query).await.map_err(|e| e.to_string())?;
         // Byte offset just past our query's question section; a matching reply
         // must echo those bytes verbatim (see `reply_matches`).
         let qend = question_end(query);
@@ -203,9 +273,7 @@ impl Upstream {
                 return Ok(resp);
             }
         }
-        let stream = TcpStream::connect(self.addr)
-            .await
-            .map_err(|e| e.to_string())?;
+        let stream = self.dial_tcp().await.map_err(|e| e.to_string())?;
         self.tcp_exchange(stream, query).await
     }
 
@@ -454,9 +522,61 @@ impl Breaker {
     }
 }
 
+/// The upstream list of a forwarder fed by `dns://` discovery: replaced
+/// wholesale when the host's DNS servers change, read once per query.
+pub struct LiveUpstreams {
+    list: RwLock<Arc<[Arc<Upstream>]>>,
+    /// Woken when a query got no answer from any upstream, so the servers are
+    /// looked up again without waiting out the refresh period.
+    stale: Arc<Notify>,
+}
+
+impl LiveUpstreams {
+    pub fn new(list: Vec<Arc<Upstream>>, stale: Arc<Notify>) -> Self {
+        LiveUpstreams {
+            list: RwLock::new(list.into()),
+            stale,
+        }
+    }
+
+    pub fn current(&self) -> Arc<[Arc<Upstream>]> {
+        self.list.read().unwrap().clone()
+    }
+
+    /// Install `list`, keeping the `Upstream` already in force for any
+    /// endpoint it repeats so that endpoint's pooled sockets survive.
+    pub fn replace(&self, list: Vec<Upstream>) {
+        let old = self.current();
+        let next: Vec<Arc<Upstream>> = list
+            .into_iter()
+            .map(|u| {
+                old.iter()
+                    .find(|o| o.same_endpoint(&u))
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(u))
+            })
+            .collect();
+        *self.list.write().unwrap() = next.into();
+    }
+}
+
+/// Append `extra` to `list`, skipping endpoints it already holds.
+pub fn merge_upstreams(list: &mut Vec<Upstream>, extra: impl IntoIterator<Item = Upstream>) {
+    for u in extra {
+        if !list.iter().any(|x| x.same_endpoint(&u)) {
+            list.push(u);
+        }
+    }
+}
+
+enum UpstreamSet {
+    Fixed(Vec<Arc<Upstream>>),
+    Live(Arc<LiveUpstreams>),
+}
+
 /// A pool of upstreams queried concurrently with failover.
 pub struct Forwarder {
-    upstreams: Vec<Arc<Upstream>>,
+    upstreams: UpstreamSet,
     timeout: Duration,
     /// Only the main forwarder gets one: skipping the *fallback* would leave
     /// the query with nowhere to go.
@@ -484,12 +604,18 @@ impl Forwarder {
 
     /// Descriptors one in-flight query can hold here: the fan-out asks this
     /// many upstreams at once, each on its own socket.
+    /// A live list is measured as it stands now; a refresh that later grows
+    /// it is not reflected in budgets already derived from this.
     pub fn sockets_per_query(&self) -> usize {
-        MAX_CONCURRENT_QUERIES.min(self.upstreams.len()).max(1)
+        let n = match &self.upstreams {
+            UpstreamSet::Fixed(v) => v.len(),
+            UpstreamSet::Live(l) => l.current().len(),
+        };
+        MAX_CONCURRENT_QUERIES.min(n).max(1)
     }
     pub fn new(upstreams: Vec<Arc<Upstream>>, timeout: Duration) -> Self {
         Forwarder {
-            upstreams,
+            upstreams: UpstreamSet::Fixed(upstreams),
             timeout,
             breaker: None,
         }
@@ -498,9 +624,19 @@ impl Forwarder {
     /// The main forwarder: adds the fail-fast breaker (see [`Breaker`]).
     pub fn with_breaker(upstreams: Vec<Arc<Upstream>>, timeout: Duration) -> Self {
         Forwarder {
-            upstreams,
+            upstreams: UpstreamSet::Fixed(upstreams),
             timeout,
             breaker: Some(Breaker::new()),
+        }
+    }
+
+    /// A forwarder over a list the `dns://` refresher maintains; `breaker` as
+    /// for [`Forwarder::with_breaker`].
+    pub fn live(upstreams: Arc<LiveUpstreams>, timeout: Duration, breaker: bool) -> Self {
+        Forwarder {
+            upstreams: UpstreamSet::Live(upstreams),
+            timeout,
+            breaker: breaker.then(Breaker::new),
         }
     }
 
@@ -529,17 +665,30 @@ impl Forwarder {
             Some(Admit::Probe(guard)) => Some(guard),
             _ => None,
         };
-        let out = self.exec_inner(query).await;
+        let live;
+        let upstreams: &[Arc<Upstream>] = match &self.upstreams {
+            UpstreamSet::Fixed(v) => v,
+            UpstreamSet::Live(l) => {
+                live = l.current();
+                &live
+            }
+        };
+        let out = self.exec_inner(upstreams, query).await;
         if let Some(b) = &self.breaker {
             b.record(!out.had_error);
+        }
+        if out.had_error {
+            if let UpstreamSet::Live(l) = &self.upstreams {
+                l.stale.notify_one();
+            }
         }
         drop(probe);
         out
     }
 
-    async fn exec_inner(&self, query: &mut [u8]) -> ForwardResult {
+    async fn exec_inner(&self, upstreams: &[Arc<Upstream>], query: &mut [u8]) -> ForwardResult {
         let start = Instant::now();
-        let n = self.upstreams.len();
+        let n = upstreams.len();
         if n == 0 {
             return ForwardResult {
                 response: None,
@@ -553,7 +702,7 @@ impl Forwarder {
         // when there is no fan-out.
         if n == 1 {
             randomize_id(query);
-            let up = &self.upstreams[0];
+            let up = &upstreams[0];
             let parsed = match up.query(query, self.timeout).await {
                 Ok(bytes) => dns::parse(bytes).ok_or_else(|| "unpack failed".to_string()),
                 Err(e) => Err(e),
@@ -585,7 +734,7 @@ impl Forwarder {
 
         let mut set: JoinSet<QueryOutcome> = JoinSet::new();
         for &i in idx[..concurrent].iter() {
-            let up = self.upstreams[i].clone();
+            let up = upstreams[i].clone();
             // Each fan-out copy carries its own transaction ID.
             let mut q = query.to_vec();
             randomize_id(&mut q);
@@ -1459,5 +1608,128 @@ mod tests {
                 "attempt {i} must not short-circuit"
             );
         }
+    }
+
+    /// A connected UDP socket with an ECONNREFUSED pending on it, the way a
+    /// pooled socket looks after its path went away underneath it.
+    async fn poisoned_socket() -> UdpSocket {
+        let gone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead = gone.local_addr().unwrap();
+        drop(gone);
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.connect(dead).await.unwrap();
+        sock.send(b"x").await.unwrap();
+        // The port-unreachable comes back over loopback at once.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sock
+    }
+
+    #[tokio::test]
+    async fn a_pooled_socket_that_cannot_send_gives_way_to_a_fresh_one() {
+        let up = Upstream::parse(&mock(Rcode::NOERROR).await).unwrap();
+        let stale = poisoned_socket().await;
+        up.idle_udp
+            .lock()
+            .unwrap()
+            .push((stale, vec![0u8; UDP_RECV_BUF]));
+        let reply = up.query(&query(), Duration::from_millis(500)).await;
+        assert!(
+            reply.is_ok(),
+            "a stale pooled socket says nothing about the upstream: {reply:?}"
+        );
+        assert_eq!(
+            up.idle_udp.lock().unwrap().len(),
+            1,
+            "the fresh socket is pooled"
+        );
+    }
+
+    #[test]
+    fn a_loopback_upstream_is_never_bound_to_an_interface() {
+        let dev: Arc<str> = Arc::from("eth0");
+        let lo = Upstream::parse("udp://127.0.0.1:53")
+            .unwrap()
+            .bound_to(Some(&dev));
+        assert_eq!(lo.device, None);
+        let lo6 = Upstream::parse("udp://[::1]:53")
+            .unwrap()
+            .bound_to(Some(&dev));
+        assert_eq!(lo6.device, None);
+        let wan = Upstream::udp53("192.0.2.1".parse().unwrap()).bound_to(Some(&dev));
+        assert_eq!(wan.device.as_deref(), Some("eth0"));
+        assert_eq!(&*wan.label, "udp://192.0.2.1:53");
+        assert_eq!(
+            &*Upstream::udp53("2001:db8::1".parse().unwrap()).label,
+            "udp://[2001:db8::1]:53"
+        );
+    }
+
+    #[test]
+    fn merging_skips_endpoints_already_listed() {
+        let ip = "192.0.2.1".parse().unwrap();
+        let mut list = vec![Upstream::parse("udp://192.0.2.1:53").unwrap()];
+        merge_upstreams(
+            &mut list,
+            [
+                Upstream::udp53(ip),
+                Upstream::parse("tcp://192.0.2.1:53").unwrap(),
+                Upstream::udp53("192.0.2.2".parse().unwrap()),
+                Upstream::udp53("192.0.2.2".parse().unwrap()),
+            ],
+        );
+        let labels: Vec<&str> = list.iter().map(|u| &*u.label).collect();
+        assert_eq!(
+            labels,
+            [
+                "udp://192.0.2.1:53",
+                "tcp://192.0.2.1:53",
+                "udp://192.0.2.2:53"
+            ]
+        );
+    }
+
+    #[test]
+    fn replacing_a_live_list_keeps_the_upstreams_it_repeats() {
+        let a = Arc::new(Upstream::udp53("192.0.2.1".parse().unwrap()));
+        let live = LiveUpstreams::new(vec![a.clone()], Arc::new(Notify::new()));
+        live.replace(vec![
+            Upstream::udp53("192.0.2.2".parse().unwrap()),
+            Upstream::udp53("192.0.2.1".parse().unwrap()),
+        ]);
+        let now = live.current();
+        assert_eq!(now.len(), 2);
+        assert_eq!(&*now[0].label, "udp://192.0.2.2:53");
+        assert!(
+            Arc::ptr_eq(&now[1], &a),
+            "a repeated endpoint keeps its Upstream, and with it the pooled sockets"
+        );
+        live.replace(vec![]);
+        assert!(live.current().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_live_forwarder_follows_replacements_and_reports_silence() {
+        let stale = Arc::new(Notify::new());
+        let live = Arc::new(LiveUpstreams::new(
+            vec![Arc::new(Upstream::parse("udp://127.0.0.1:1").unwrap())],
+            stale.clone(),
+        ));
+        let f = Forwarder::live(live.clone(), Duration::from_millis(300), false);
+        assert!(f.exec(&mut query()).await.had_error);
+        tokio::time::timeout(Duration::from_millis(100), stale.notified())
+            .await
+            .expect("no upstream answered, so the list is reported stale");
+
+        let good = mock(Rcode::NOERROR).await;
+        live.replace(vec![Upstream::parse(&good).unwrap()]);
+        let r = f.exec(&mut query()).await;
+        assert!(!r.had_error, "the replacement is used by the next query");
+        assert_eq!(&*r.upstream, good.as_str());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stale.notified())
+                .await
+                .is_err(),
+            "an answered query reports nothing"
+        );
     }
 }
