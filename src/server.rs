@@ -31,6 +31,13 @@ const TCP_IDLE: Duration = Duration::from_secs(3);
 const TCP_MAX_QUERY: usize = 4096;
 /// Queries from one connection that may be in flight at once.
 const TCP_PIPELINE: usize = 16;
+/// The connection writer packs answers that are already waiting into one
+/// write until the batch reaches this size; a single answer of any length
+/// still goes out whole.
+const TCP_WRITE_BATCH: usize = 16 * 1024;
+/// A connection's frame buffer grown past this by a large answer is not kept
+/// for the rest of the connection: up to `MAX_TCP_CONNS` writers hold one.
+const TCP_FRAME_RETAIN: usize = 4096;
 /// How long the accept loop pauses after an accept failed for want of a
 /// resource. Such a failure leaves the connection queued and the listener
 /// readable, so retrying at once spins on the same error, burning the CPU the
@@ -157,35 +164,68 @@ pub async fn serve_tcp(
     }
 }
 
+/// Append `msg` to `frame` with its RFC 1035 §4.2.2 length prefix. Returns
+/// false, appending nothing, for a message the 2-byte prefix cannot carry.
+fn append_frame(frame: &mut Vec<u8>, msg: &[u8]) -> bool {
+    let Ok(len) = u16::try_from(msg.len()) else {
+        return false;
+    };
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(msg);
+    true
+}
+
+/// The single writer of one connection: pipelined queries finish out of order
+/// — that is the point (RFC 7766 §6.2.1.1) — and two of them must never
+/// interleave halves of a message on the wire.
+///
+/// Prefix and message leave in one write. Split, the prefix goes out alone
+/// and Nagle holds the message back until the peer acknowledges it, which a
+/// delayed-ACK peer does only after its timer fires. Answers already queued
+/// join the same write, so a pipelined burst costs one send.
+///
+/// Ends after a message that cannot be framed, a failed or stalled write, or
+/// once every sender has dropped its handle.
+async fn write_responses<W>(mut wr: W, mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut frame = Vec::new();
+    while let Some(first) = rx.recv().await {
+        frame.clear();
+        let mut framable = append_frame(&mut frame, &first);
+        while framable && frame.len() < TCP_WRITE_BATCH {
+            let Ok(next) = rx.try_recv() else { break };
+            framable = append_frame(&mut frame, &next);
+        }
+        // Bound the write like the reads: a client that stops reading would
+        // otherwise park this task — and its connection permit — forever once
+        // the socket send buffer fills.
+        let write = async {
+            wr.write_all(&frame).await?;
+            wr.flush().await
+        };
+        if !matches!(tokio::time::timeout(TCP_IDLE, write).await, Ok(Ok(()))) || !framable {
+            break;
+        }
+        if frame.capacity() > TCP_FRAME_RETAIN {
+            frame = Vec::new();
+        }
+    }
+}
+
 async fn handle_tcp_conn(
     stream: TcpStream,
     client: std::net::IpAddr,
     handler: Arc<Handler>,
     sem: Arc<Semaphore>,
 ) {
-    let (mut rd, mut wr) = stream.into_split();
-    // One writer for the connection: pipelined queries finish out of order —
-    // that is the point (RFC 7766 §6.2.1.1) — and two of them must never
-    // interleave halves of a message on the wire.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(TCP_PIPELINE);
-    let writer = tokio::spawn(async move {
-        while let Some(resp) = rx.recv().await {
-            let Ok(len) = u16::try_from(resp.len()) else {
-                break;
-            };
-            // Bound the write like the reads: a client that stops reading
-            // would otherwise park this task — and its connection permit —
-            // forever once the socket send buffer fills.
-            let write = async {
-                wr.write_all(&len.to_be_bytes()).await?;
-                wr.write_all(&resp).await?;
-                wr.flush().await
-            };
-            if !matches!(tokio::time::timeout(TCP_IDLE, write).await, Ok(Ok(()))) {
-                break;
-            }
-        }
-    });
+    // Answers that finish while an earlier one is still unacknowledged must
+    // not wait for the peer's delayed ACK.
+    let _ = stream.set_nodelay(true);
+    let (mut rd, wr) = stream.into_split();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(TCP_PIPELINE);
+    let writer = tokio::spawn(write_responses(wr, rx));
     // Queries from this connection that may be in flight at once. Reading
     // pauses while this many are outstanding: pipelining must not let one
     // connection spawn tasks without limit.
@@ -441,6 +481,167 @@ mod tests {
         for id in 0..COUNT {
             assert!(seen.contains(&(0x8000 + id)), "id {id} never answered");
         }
+    }
+
+    /// One query as a single write, so the client side cannot stall the
+    /// exchange on Nagle and hide what the server does.
+    async fn send_query_whole(s: &mut TcpStream, q: &[u8]) {
+        let mut frame = (q.len() as u16).to_be_bytes().to_vec();
+        frame.extend_from_slice(q);
+        s.write_all(&frame).await.unwrap();
+    }
+
+    /// Back-to-back exchanges on one connection must each take about a round
+    /// trip. A length prefix written apart from its message leaves the message
+    /// waiting for the client's delayed ACK of the prefix on every answer.
+    #[tokio::test]
+    async fn sequential_tcp_answers_do_not_wait_for_delayed_acks() {
+        let addr = serve_on(test_handler(vec!["udp://127.0.0.1:1".to_string()])).await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.set_nodelay(true).unwrap();
+        const ROUNDS: u16 = 40;
+        let started = std::time::Instant::now();
+        for id in 0..ROUNDS {
+            // AAAA is blocked locally: answered on the fast path, no upstream.
+            send_query_whole(&mut s, &query_bytes(0x4000 + id, 28)).await;
+            let m = read_msg(&mut s).await.expect("an answer");
+            assert_eq!(msg_id(&m), 0x4000 + id);
+        }
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(400),
+            "{ROUNDS} local answers took {took:?}: answers are waiting on delayed ACKs"
+        );
+    }
+
+    /// An upstream that answers a query for a name starting `b` `gap` after
+    /// one starting with any other letter, both `base` after asking.
+    async fn staggered_upstream(base: Duration, gap: Duration) -> String {
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        let listen = sock.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, peer)) = listen.recv_from(&mut buf).await {
+                let q = buf[..n].to_vec();
+                let sock = listen.clone();
+                tokio::spawn(async move {
+                    let delay = if q[13] == b'b' { base + gap } else { base };
+                    tokio::time::sleep(delay).await;
+                    let mut i = 12;
+                    while q[i] != 0 {
+                        i += 1 + usize::from(q[i]);
+                    }
+                    let mut r = q[..2].to_vec();
+                    r.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]);
+                    r.extend_from_slice(&q[12..i + 5]);
+                    r.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 44, 0, 4, 10, 0, 0, 7]);
+                    let _ = sock.send_to(&r, peer).await;
+                });
+            }
+        });
+        format!("udp://{addr}")
+    }
+
+    fn named_query(id: u16, name: &[u8]) -> Vec<u8> {
+        let mut q = id.to_be_bytes().to_vec();
+        q.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+        q.extend_from_slice(name);
+        q.extend_from_slice(&[0, 1, 0, 1]);
+        q
+    }
+
+    /// An answer finished while the previous one on the connection is still
+    /// unacknowledged goes out at once. With Nagle on, it waits for the
+    /// client's delayed ACK of the first.
+    #[tokio::test]
+    async fn a_second_answer_does_not_wait_for_the_first_to_be_acknowledged() {
+        let up = staggered_upstream(Duration::from_millis(60), Duration::from_millis(5)).await;
+        let addr = serve_on(test_handler(vec![up])).await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.set_nodelay(true).unwrap();
+        // Leave the connection's initial quick-ACK phase behind.
+        for id in 0..8u16 {
+            send_query_whole(&mut s, &query_bytes(0x6000 + id, 28)).await;
+            read_msg(&mut s).await.expect("warm-up answer");
+        }
+        let mut both = Vec::new();
+        for (id, name) in [
+            (0x7001u16, &b"\x01a\x03lan\x00"[..]),
+            (0x7002, b"\x01b\x03lan\x00"),
+        ] {
+            let q = named_query(id, name);
+            both.extend_from_slice(&(q.len() as u16).to_be_bytes());
+            both.extend_from_slice(&q);
+        }
+        s.write_all(&both).await.unwrap();
+        let first = read_msg(&mut s).await.expect("first answer");
+        let at = std::time::Instant::now();
+        let second = read_msg(&mut s).await.expect("second answer");
+        let gap = at.elapsed();
+        assert_eq!((msg_id(&first), msg_id(&second)), (0x7001, 0x7002));
+        assert!(
+            gap < Duration::from_millis(25),
+            "the second answer trailed the first by {gap:?}: it waited for an ACK"
+        );
+    }
+
+    /// Read every frame `wr`'s peer receives until EOF.
+    async fn frames_until_eof(mut rd: tokio::io::DuplexStream) -> Vec<Vec<u8>> {
+        let mut raw = Vec::new();
+        rd.read_to_end(&mut raw).await.unwrap();
+        let mut frames = Vec::new();
+        let mut i = 0;
+        while i < raw.len() {
+            let len = usize::from(u16::from_be_bytes([raw[i], raw[i + 1]]));
+            frames.push(raw[i + 2..i + 2 + len].to_vec());
+            i += 2 + len;
+        }
+        assert_eq!(i, raw.len(), "the stream ends on a frame boundary");
+        frames
+    }
+
+    /// Answers queued together share writes but keep their own frames, in
+    /// order, whatever their sizes relative to the batch limit.
+    #[tokio::test]
+    async fn queued_answers_are_framed_whole_and_in_order() {
+        let sizes = [12usize, 40, TCP_WRITE_BATCH + 100, 7, 65_535, 300, 1];
+        let msgs: Vec<Vec<u8>> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (0..n).map(|b| (b + i) as u8).collect())
+            .collect();
+        let (wr, rd) = tokio::io::duplex(1024);
+        let (tx, rx) = tokio::sync::mpsc::channel(msgs.len());
+        // Everything is queued before the writer first runs, so every batch
+        // decision is exercised.
+        for m in &msgs {
+            tx.send(m.clone()).await.unwrap();
+        }
+        drop(tx);
+        let writer = tokio::spawn(write_responses(wr, rx));
+        let got = frames_until_eof(rd).await;
+        writer.await.unwrap();
+        assert_eq!(got, msgs);
+    }
+
+    /// A message the length prefix cannot carry ends the connection; what was
+    /// queued before it is still delivered, nothing after it is.
+    #[tokio::test]
+    async fn an_unframable_answer_ends_the_connection_after_the_ones_before_it() {
+        let (wr, rd) = tokio::io::duplex(1024);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(vec![1u8; 30]).await.unwrap();
+        tx.send(vec![2u8; 65_536]).await.unwrap();
+        tx.send(vec![3u8; 30]).await.unwrap();
+        let writer = tokio::spawn(write_responses(wr, rx));
+        // `tx` stays open, so only the writer giving up ends the stream.
+        let got = tokio::time::timeout(Duration::from_secs(5), frames_until_eof(rd))
+            .await
+            .expect("the connection must end after an unframable answer");
+        writer.await.unwrap();
+        assert_eq!(got, vec![vec![1u8; 30]]);
+        drop(tx);
     }
 
     #[test]

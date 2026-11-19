@@ -15,7 +15,7 @@ use tokio::sync::{watch, Notify, Semaphore};
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::forcefall::ForceFallMatcher;
-use crate::handler::{AaaaMode, Handler};
+use crate::handler::{AaaaMode, Handler, MAX_LINGERING_MAIN};
 use crate::hook::HookMonitor;
 use crate::ifdns::{self, Found, Lookup, Selector, DEFAULT_SERVERS};
 use crate::local_resolver::{AutoDetect, PtrResolver};
@@ -42,6 +42,10 @@ const MIN_TCP_CONNS: usize = 32;
 // Descriptors set aside for the listen sockets, the upstream idle pools
 // (`MAX_IDLE_CONNS` per upstream) and whatever else the process holds open.
 const FD_RESERVE: usize = 320;
+// The soft descriptor limit is raised toward the hard one at startup, up to
+// this: enough for every ceiling above at the widest fan-out, without handing
+// child processes (the hook) a limit in the millions.
+const FD_WANT: u64 = 65_536;
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 /// How often the servers behind `dns://` entries are looked up again.
 const REDISCOVER_EVERY: Duration = Duration::from_secs(60);
@@ -336,14 +340,17 @@ struct Caps {
 /// Derive the ceilings from `fd_limit` (`None` when it cannot be read, which
 /// means "assume plenty").
 ///
-/// Every in-flight forwarded query holds `sockets_per_query` upstream sockets —
-/// the fan-out queries several upstreams at once — and every accepted TCP
-/// connection is a descriptor of its own. Ceilings above what the process may
-/// open turn overload into `EMFILE` — a SERVFAIL for the client — rather than
-/// the intended shed, which drops a datagram the client will retry. The
-/// connection ceiling is not divided: a connection costs one descriptor
-/// whether or not the query on it is being forwarded.
-fn caps_for(fd_limit: Option<usize>, sockets_per_query: usize) -> Caps {
+/// A forwarded query holds one socket per upstream its fan-out asks, and once
+/// the hedge starts the fallback alongside a slow main, both fan-outs are open
+/// at once: `main_sockets + fall_sockets`. A main query the fallback beat
+/// keeps its sockets after the query's permit is gone, up to
+/// [`MAX_LINGERING_MAIN`] of them, so those are reserved off the top. Every
+/// accepted TCP connection is a descriptor of its own. Ceilings above what the
+/// process may open turn overload into `EMFILE` — a SERVFAIL for the client —
+/// rather than the intended shed, which drops a datagram the client will
+/// retry. The connection ceiling is not divided: a connection costs one
+/// descriptor whether or not the query on it is being forwarded.
+fn caps_for(fd_limit: Option<usize>, main_sockets: usize, fall_sockets: usize) -> Caps {
     let Some(limit) = fd_limit else {
         return Caps {
             udp: MAX_CONCURRENT_UDP,
@@ -351,8 +358,10 @@ fn caps_for(fd_limit: Option<usize>, sockets_per_query: usize) -> Caps {
             tcp_conns: MAX_TCP_CONNS,
         };
     };
-    let budget = limit.saturating_sub(FD_RESERVE);
-    let per_query = sockets_per_query.max(1);
+    let main_sockets = main_sockets.max(1);
+    let reserve = FD_RESERVE + MAX_LINGERING_MAIN * main_sockets;
+    let budget = limit.saturating_sub(reserve);
+    let per_query = main_sockets + fall_sockets.max(1);
     Caps {
         udp: (budget / 2 / per_query).clamp(MIN_CONCURRENT_UDP, MAX_CONCURRENT_UDP),
         tcp_conns: (budget * 3 / 10).clamp(MIN_TCP_CONNS, MAX_TCP_CONNS),
@@ -390,6 +399,64 @@ fn auto_detect_for(cfg: &Config) -> AutoDetect {
     AutoDetect {
         lease: cfg.lease_file.is_empty(),
         hosts: cfg.hosts_file.is_empty(),
+    }
+}
+
+/// Raise the soft descriptor limit toward the hard one, to at most
+/// [`FD_WANT`]. The hard limit is the administrator's ceiling; the soft one
+/// is commonly left at 1024, too few for a forwarder whose every query holds
+/// several upstream sockets. Returns the limit before and after when it
+/// changed. The original is kept for child processes (see
+/// [`restore_child_fd_limit`]).
+fn raise_fd_limit() -> Option<(u64, u64)> {
+    // SAFETY: `getrlimit`/`setrlimit` only read and write the `rlimit` we hand
+    // them.
+    unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
+            return None;
+        }
+        // `rlim_t` is 32 bits wide on some of the targets released for.
+        #[allow(clippy::unnecessary_cast)]
+        let wide = |v: libc::rlim_t| {
+            if v == libc::RLIM_INFINITY {
+                u64::MAX
+            } else {
+                v as u64
+            }
+        };
+        let before = wide(rl.rlim_cur);
+        let want = raised_soft_limit(before, wide(rl.rlim_max))?;
+        let _ = ORIGINAL_FD_LIMIT.set(rl);
+        rl.rlim_cur = want as libc::rlim_t;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
+            return None;
+        }
+        Some((before, want))
+    }
+}
+
+/// The soft limit to raise `cur` to under hard limit `max` (`u64::MAX` for
+/// unlimited), or `None` to leave it alone.
+fn raised_soft_limit(cur: u64, max: u64) -> Option<u64> {
+    let want = max.min(FD_WANT);
+    (want > cur).then_some(want)
+}
+
+/// The descriptor limit the process started with, when [`raise_fd_limit`]
+/// changed it.
+static ORIGINAL_FD_LIMIT: std::sync::OnceLock<libc::rlimit> = std::sync::OnceLock::new();
+
+/// Put the starting descriptor limit back, for a child about to exec. Some
+/// programs walk every descriptor up to the soft limit closing each; the
+/// raised limit is this process's need, not theirs.
+///
+/// Only calls `setrlimit`, which is async-signal-safe, so this may run between
+/// fork and exec.
+pub fn restore_child_fd_limit() {
+    if let Some(rl) = ORIGINAL_FD_LIMIT.get() {
+        // SAFETY: `setrlimit` reads the `rlimit` it is given and nothing else.
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, rl) };
     }
 }
 
@@ -502,6 +569,12 @@ async fn serve(
         log::hl_value(avail / 1024 / 1024),
         log::hl_unit("MB")
     ));
+    if let Some((before, after)) = raise_fd_limit() {
+        log::info(&format!(
+            "fd limit raised from {before} to {}",
+            log::hl_value(after)
+        ));
+    }
 
     let out: Option<Arc<str>> = (!cfg.out.is_empty()).then(|| Arc::from(cfg.out.as_str()));
     for dev in bound_devices(out.as_ref(), &[&dns_upstreams, &fall_upstreams]) {
@@ -536,8 +609,14 @@ async fn serve(
     let timings = Timings::from_qtime(Duration::from_millis(cfg.qtime as u64));
     let stale = Arc::new(Notify::new());
     // Only the main forwarder gets the fail-fast breaker (see `Breaker`).
-    let main_fwd = disc.forwarder(&dns_upstreams, main, timings.main, true, &stale);
-    let fall_fwd = disc.forwarder(&fall_upstreams, fall, timings.fall, false, &stale);
+    // An NXDOMAIN waits up to `qtime` for a peer's NOERROR: the threshold
+    // already chosen for how long a slow upstream is waited on.
+    let main_fwd = disc
+        .forwarder(&dns_upstreams, main, timings.main, true, &stale)
+        .settle_after(timings.hedge_after);
+    let fall_fwd = disc
+        .forwarder(&fall_upstreams, fall, timings.fall, false, &stale)
+        .settle_after(timings.hedge_after);
 
     let cache_cap = calculate_cache_size(avail);
     let cache = Arc::new(Cache::new(cache_cap));
@@ -553,9 +632,13 @@ async fn serve(
         show_specs(&fall_upstreams)
     ));
     log::info(&format!(
-        "cache capacity {} entries (fallback {} entries)",
+        "cache capacity {} entries / {} {} (fallback {} entries / {} {})",
         log::hl_value(cache_cap),
-        log::hl_value(fall_cache_cap)
+        log::hl_value(cache.byte_budget() / 1024 / 1024),
+        log::hl_unit("MB"),
+        log::hl_value(fall_cache_cap),
+        log::hl_value(fall_cache.byte_budget() / 1024 / 1024),
+        log::hl_unit("MB")
     ));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -566,11 +649,12 @@ async fn serve(
 
     // Local resolver (lease/hosts files + [hosts] statics) — None if nothing
     // to resolve.
-    let resolver = PtrResolver::new(
+    let resolver = PtrResolver::with_static_ptr(
         cfg.lease_file.clone(),
         cfg.hosts_file.clone(),
         auto_detect_for(cfg),
         &cfg.hosts,
+        &cfg.hosts_ptr,
     )
     .map(Arc::new);
     if let Some(r) = &resolver {
@@ -671,14 +755,10 @@ async fn serve(
         pplog,
     });
 
-    // Main and fallback are queried in sequence, so a query's peak descriptor
-    // use is the wider of the two fan-outs, not their sum.
     let caps = caps_for(
         fd_limit(),
-        handler
-            .main
-            .sockets_per_query()
-            .max(handler.fallback.sockets_per_query()),
+        handler.main.sockets_per_query(),
+        handler.fallback.sockets_per_query(),
     );
     log::info(&format!(
         "concurrency udp {} tcp {} tcp-conns {} (fd limit {})",
@@ -852,7 +932,7 @@ mod tests {
 
     #[test]
     fn caps_stay_at_the_ceilings_when_descriptors_are_plentiful() {
-        let plenty = caps_for(Some(1_048_576), 1);
+        let plenty = caps_for(Some(1_048_576), 1, 1);
         assert_eq!(
             plenty,
             Caps {
@@ -863,48 +943,59 @@ mod tests {
         );
         // An unreadable or unlimited rlimit means "assume plenty", not "assume
         // nothing" — the floors would otherwise cripple a healthy machine.
-        assert_eq!(caps_for(None, 3), plenty);
+        assert_eq!(caps_for(None, 3, 3), plenty);
+    }
+
+    /// The most descriptors a forwarder running at its ceilings holds: every
+    /// in-flight query with both fan-outs open (the hedge runs the fallback
+    /// beside a slow main), every lingering main query the fallback beat,
+    /// every accepted connection, and the fixed reserve.
+    fn peak_descriptors(c: Caps, main: usize, fall: usize) -> usize {
+        (c.udp + c.tcp) * (main + fall) + MAX_LINGERING_MAIN * main + c.tcp_conns + FD_RESERVE
     }
 
     #[test]
     fn caps_fit_inside_a_small_descriptor_limit() {
-        // The default on the routers this targets.
+        // A common default soft limit, with one main and one fallback.
         let limit = 1024;
-        let c = caps_for(Some(limit), 1);
-        // Each in-flight query holds an upstream socket and each accepted
-        // connection is a descriptor, so the three together plus the reserve
-        // must stay inside the limit.
-        assert!(
-            c.udp + c.tcp + c.tcp_conns + FD_RESERVE <= limit,
-            "{c:?} + reserve overruns {limit}"
-        );
+        let c = caps_for(Some(limit), 1, 1);
+        assert!(peak_descriptors(c, 1, 1) <= limit, "{c:?} overruns {limit}");
         assert!(c.udp < MAX_CONCURRENT_UDP, "must actually scale down");
         assert!(c.udp >= MIN_CONCURRENT_UDP);
     }
+
     #[test]
-    fn caps_leave_room_for_every_socket_a_query_fans_out_to() {
-        for limit in [1024usize, 4096, 16_384] {
-            let single = caps_for(Some(limit), 1);
-            for per_query in 1..=3 {
-                let c = caps_for(Some(limit), per_query);
-                // The descriptors a saturated forwarder holds: one per socket
-                // of every in-flight query, plus one per accepted connection.
-                assert!(
-                    (c.udp + c.tcp) * per_query + c.tcp_conns + FD_RESERVE <= limit,
-                    "{c:?} x{per_query} + reserve overruns {limit}"
-                );
-                assert!(
-                    c.udp <= single.udp && c.tcp <= single.tcp,
-                    "fanning out cannot raise a ceiling"
-                );
-                assert_eq!(
-                    c.tcp_conns, single.tcp_conns,
-                    "a connection costs one descriptor whatever the fan-out"
-                );
+    fn caps_leave_room_for_both_fan_outs_of_a_hedged_query() {
+        for limit in [4096usize, 16_384, 65_536] {
+            let single = caps_for(Some(limit), 1, 1);
+            for main in 1..=3 {
+                for fall in 1..=3 {
+                    let c = caps_for(Some(limit), main, fall);
+                    assert!(
+                        peak_descriptors(c, main, fall) <= limit,
+                        "{c:?} with fan-outs {main}+{fall} overruns {limit}"
+                    );
+                    assert!(
+                        c.udp <= single.udp
+                            && c.tcp <= single.tcp
+                            && c.tcp_conns <= single.tcp_conns,
+                        "fanning out cannot raise a ceiling"
+                    );
+                }
             }
-            // A single upstream is the common config: its budget is unchanged.
-            assert_eq!(caps_for(Some(limit), 1), single);
         }
+    }
+
+    #[test]
+    fn the_soft_descriptor_limit_is_raised_within_the_hard_one() {
+        let inf = u64::MAX;
+        assert_eq!(raised_soft_limit(1024, 4096), Some(4096));
+        assert_eq!(raised_soft_limit(1024, 1 << 20), Some(FD_WANT));
+        assert_eq!(raised_soft_limit(1024, inf), Some(FD_WANT));
+        // Never lowered, and left alone when there is no room to raise it.
+        assert_eq!(raised_soft_limit(FD_WANT * 2, 1 << 20), None);
+        assert_eq!(raised_soft_limit(4096, 4096), None);
+        assert_eq!(raised_soft_limit(inf, inf), None);
     }
 
     #[test]
@@ -960,6 +1051,7 @@ mod tests {
             c.store(
                 CacheKey::new(vec![i as u8, 0], 1, 1),
                 Arc::new(CachedMsg {
+                    stored: std::time::Instant::now(),
                     rcode: domain::base::iana::Rcode::NOERROR,
                     answers: vec![],
                     authority: vec![],
@@ -980,7 +1072,7 @@ mod tests {
     #[test]
     fn caps_never_fall_below_the_floors() {
         for limit in [0usize, 1, 64, FD_RESERVE, FD_RESERVE + 1] {
-            let c = caps_for(Some(limit), 3);
+            let c = caps_for(Some(limit), 3, 3);
             assert_eq!(c.udp, MIN_CONCURRENT_UDP, "limit={limit}");
             assert_eq!(c.tcp, MIN_CONCURRENT_TCP, "limit={limit}");
             assert_eq!(c.tcp_conns, MIN_TCP_CONNS, "limit={limit}");
@@ -989,9 +1081,9 @@ mod tests {
 
     #[test]
     fn caps_grow_monotonically_with_the_limit() {
-        let mut prev = caps_for(Some(0), 2);
+        let mut prev = caps_for(Some(0), 2, 2);
         for limit in (0..20_000).step_by(97) {
-            let c = caps_for(Some(limit), 2);
+            let c = caps_for(Some(limit), 2, 2);
             assert!(c.udp >= prev.udp && c.tcp >= prev.tcp && c.tcp_conns >= prev.tcp_conns);
             prev = c;
         }

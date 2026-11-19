@@ -8,7 +8,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use domain::base::iana::{OptRcode, Rcode};
@@ -152,16 +152,22 @@ impl Upstream {
     }
 
     async fn dial_tcp(&self) -> std::io::Result<TcpStream> {
-        let Some(dev) = &self.device else {
-            return TcpStream::connect(self.addr).await;
+        let stream = match &self.device {
+            None => TcpStream::connect(self.addr).await?,
+            Some(dev) => {
+                let s = if self.addr.is_ipv4() {
+                    TcpSocket::new_v4()?
+                } else {
+                    TcpSocket::new_v6()?
+                };
+                s.bind_device(Some(dev.as_bytes()))?;
+                s.connect(self.addr).await?
+            }
         };
-        let s = if self.addr.is_ipv4() {
-            TcpSocket::new_v4()?
-        } else {
-            TcpSocket::new_v6()?
-        };
-        s.bind_device(Some(dev.as_bytes()))?;
-        s.connect(self.addr).await
+        // Each query is one complete write the upstream is waiting for:
+        // nothing is gained by holding it back for an outstanding ACK.
+        let _ = stream.set_nodelay(true);
+        Ok(stream)
     }
 
     /// Send `query` and return the raw response bytes, honoring `deadline`
@@ -279,11 +285,13 @@ impl Upstream {
 
     async fn tcp_exchange(&self, mut stream: TcpStream, query: &[u8]) -> Result<Vec<u8>, String> {
         let len = u16::try_from(query.len()).map_err(|_| "query too large".to_string())?;
-        stream
-            .write_all(&len.to_be_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-        stream.write_all(query).await.map_err(|e| e.to_string())?;
+        // Prefix and query in one write: written apart, the query waits for
+        // the upstream's delayed ACK of the prefix on a connection with
+        // Nagle on, and splitting buys nothing on one without it.
+        let mut frame = Vec::with_capacity(2 + query.len());
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(query);
+        stream.write_all(&frame).await.map_err(|e| e.to_string())?;
         stream.flush().await.map_err(|e| e.to_string())?;
 
         let mut len_buf = [0u8; 2];
@@ -574,18 +582,153 @@ enum UpstreamSet {
     Live(Arc<LiveUpstreams>),
 }
 
+/// What one exchange produced, handed to every identical query that joined
+/// it while it was in flight.
+struct Landed {
+    response: Option<Message<Vec<u8>>>,
+    upstream: Arc<str>,
+    had_error: bool,
+}
+
+impl Landed {
+    fn of(out: &ForwardResult) -> Self {
+        Landed {
+            response: out.response.clone(),
+            upstream: out.upstream.clone(),
+            had_error: out.had_error,
+        }
+    }
+}
+
+/// One exchange in flight, as the queries waiting on it see it.
+struct Flight {
+    /// The [`flight_key`], inline: a flight then costs one allocation.
+    key: [u8; FLIGHT_KEY_MAX],
+    key_len: u16,
+    /// Set once, when the flight ends: what it landed, or `None` when its
+    /// leader was cancelled first. Left unset when nobody joined.
+    outcome: OnceLock<Option<Arc<Landed>>>,
+    /// Woken once `outcome` is set.
+    ended: Notify,
+}
+
+impl Flight {
+    fn new(key: &[u8]) -> Self {
+        let mut inline = [0u8; FLIGHT_KEY_MAX];
+        inline[..key.len()].copy_from_slice(key);
+        Flight {
+            key: inline,
+            key_len: key.len() as u16,
+            outcome: OnceLock::new(),
+            ended: Notify::new(),
+        }
+    }
+
+    fn key(&self) -> &[u8] {
+        &self.key[..usize::from(self.key_len)]
+    }
+}
+
+/// Exchanges in flight on one forwarder, keyed by [`flight_key`] under
+/// `util::hash` (seeded, so no client can pick names that collide).
+///
+/// Each entry belongs to the query leading that exchange, which removes it
+/// — by identity, so never another flight's — when the exchange ends.
+/// Entries thus live exactly as long as their exchanges, which caps the
+/// table at the queries the front ends let in flight.
+#[derive(Default)]
+struct Flights(Mutex<hashbrown::HashTable<Arc<Flight>>>);
+
+/// The exchange one query leads. Dropped before [`Leading::land`] — the
+/// leading query was cancelled — it withdraws the flight and tells the
+/// queries waiting on it, which then ask again themselves.
+struct Leading<'a> {
+    flights: &'a Flights,
+    flight: Arc<Flight>,
+    hash: u64,
+    landed: bool,
+}
+
+impl Leading<'_> {
+    fn withdraw(&self) {
+        let mut table = self.flights.0.lock().unwrap();
+        if let Ok(entry) = table.find_entry(self.hash, |f| Arc::ptr_eq(f, &self.flight)) {
+            entry.remove();
+        }
+    }
+
+    fn end(&self, outcome: Option<Arc<Landed>>) {
+        let _ = self.flight.outcome.set(outcome);
+        self.flight.ended.notify_waiters();
+    }
+
+    /// Withdraw the flight, then hand `out` to every query that joined it.
+    fn land(mut self, out: &ForwardResult) {
+        self.withdraw();
+        self.landed = true;
+        // Joining clones the flight out of the table under its lock, so once
+        // the entry is gone nobody else joins: a count of one is this leader
+        // alone, with nobody to hand the outcome to.
+        if Arc::strong_count(&self.flight) > 1 {
+            self.end(Some(Arc::new(Landed::of(out))));
+        }
+    }
+}
+
+impl Drop for Leading<'_> {
+    fn drop(&mut self) {
+        if !self.landed {
+            self.withdraw();
+            self.end(None);
+        }
+    }
+}
+
+/// Which exchange a query rides: one it leads, or one already in flight.
+enum Role<'a> {
+    Lead(Leading<'a>),
+    Follow(Arc<Flight>),
+}
+
+/// Room for the [`flight_key`] of any query the handler builds: a name of
+/// the full 255 bytes, the header, type and class, and an OPT record. A
+/// longer query simply goes out on its own.
+const FLIGHT_KEY_MAX: usize = 320;
+
+/// What identifies a query for sharing an exchange, written into `buf`:
+/// every byte except the transaction ID, with the question name lower-cased,
+/// since names compare case-insensitively (the cache's keys do the same).
+/// `None` for a query whose question cannot be walked or that does not fit;
+/// such a query goes out on its own.
+fn flight_key<'b>(query: &[u8], buf: &'b mut [u8; FLIGHT_KEY_MAX]) -> Option<&'b [u8]> {
+    let end = question_end(query)?;
+    let key = buf.get_mut(..query.len() - 2)?;
+    key.copy_from_slice(&query[2..]);
+    // The name spans query[12..end - 4]. Its length bytes are all below 64,
+    // under b'A', so lower-casing the whole span leaves them intact.
+    key[10..end - 6].make_ascii_lowercase();
+    Some(key)
+}
+
 /// A pool of upstreams queried concurrently with failover.
 pub struct Forwarder {
     upstreams: UpstreamSet,
     timeout: Duration,
+    /// How long an NXDOMAIN from one upstream waits for a NOERROR from the
+    /// others before it stands as the answer (see [`Forwarder::settle_after`]).
+    settle: Duration,
     /// Only the main forwarder gets one: skipping the *fallback* would leave
     /// the query with nowhere to go.
     breaker: Option<Breaker>,
+    /// Per forwarder: the main and fallback groups never share an exchange,
+    /// so neither's answer can reach a query meant for the other.
+    flights: Flights,
 }
 
 /// Outcome of a forward attempt.
 pub struct ForwardResult {
-    /// The chosen response (first NOERROR, else first non-error), if any.
+    /// The chosen response (first NOERROR, else an NXDOMAIN, else the first
+    /// other rcode), if any.
     pub response: Option<Message<Vec<u8>>>,
     /// Label of the upstream that answered, or "timeout/err".
     pub upstream: Arc<str>,
@@ -617,16 +760,17 @@ impl Forwarder {
         Forwarder {
             upstreams: UpstreamSet::Fixed(upstreams),
             timeout,
+            settle: timeout,
             breaker: None,
+            flights: Flights::default(),
         }
     }
 
     /// The main forwarder: adds the fail-fast breaker (see [`Breaker`]).
     pub fn with_breaker(upstreams: Vec<Arc<Upstream>>, timeout: Duration) -> Self {
         Forwarder {
-            upstreams: UpstreamSet::Fixed(upstreams),
-            timeout,
             breaker: Some(Breaker::new()),
+            ..Forwarder::new(upstreams, timeout)
         }
     }
 
@@ -636,15 +780,37 @@ impl Forwarder {
         Forwarder {
             upstreams: UpstreamSet::Live(upstreams),
             timeout,
+            settle: timeout,
             breaker: breaker.then(Breaker::new),
+            flights: Flights::default(),
         }
     }
 
+    /// Let an NXDOMAIN stand once `settle` has passed without a NOERROR from
+    /// another upstream, instead of waiting out every peer's whole deadline.
+    ///
+    /// The upstreams of one group answer for the same names, so one that has
+    /// gone silent must not make every NXDOMAIN its peers return cost the full
+    /// deadline. The wait is still worth having: a peer that caches a name's
+    /// earlier absence answers NXDOMAIN at once while another is still
+    /// resolving the record that now exists.
+    pub fn settle_after(mut self, settle: Duration) -> Self {
+        self.settle = settle;
+        self
+    }
+
     /// Fan `query` out to up to 3 shuffled upstreams; return the first NOERROR
-    /// response (cancelling the rest), else the first non-success response,
-    /// else an error result.
+    /// response (cancelling the rest). Otherwise an NXDOMAIN, once no NOERROR
+    /// arrived within the settle window after it, else the first other
+    /// response, else an error result.
     /// `query` is mutated in place: each attempt stamps its own transaction ID
     /// (see `randomize_id`).
+    ///
+    /// A query identical to one already in flight here waits for that
+    /// exchange's outcome instead of starting another (see
+    /// [`Forwarder::exec_shared`]). Each caller still feeds the outcome it got
+    /// to the breaker, so the breaker counts exactly what it did when every
+    /// query went out on its own.
     pub async fn exec(&self, query: &mut [u8]) -> ForwardResult {
         let probe = match self.breaker.as_ref().map(Breaker::admit) {
             Some(Admit::Open) => {
@@ -673,7 +839,7 @@ impl Forwarder {
                 &live
             }
         };
-        let out = self.exec_inner(upstreams, query).await;
+        let out = self.exec_shared(upstreams, query).await;
         if let Some(b) = &self.breaker {
             b.record(!out.had_error);
         }
@@ -686,7 +852,109 @@ impl Forwarder {
         out
     }
 
-    async fn exec_inner(&self, upstreams: &[Arc<Upstream>], query: &mut [u8]) -> ForwardResult {
+    /// Run `query`, or join the identical exchange already in flight.
+    ///
+    /// A cold name that many clients ask for at once — the moment a popular
+    /// entry expires, or a stub retrying while the first try is still out —
+    /// would otherwise cost one exchange per query, times the fan-out. The
+    /// joiners get the leader's outcome, failures included: it is what their
+    /// own exchange, sent a moment later to the same upstreams, would have
+    /// met.
+    ///
+    /// Every caller keeps its own deadline, `timeout` from its own start. A
+    /// leader that is cancelled (its caller got an answer elsewhere) leaves
+    /// its joiners nothing; one of them then leads a new exchange in the
+    /// time it has left.
+    async fn exec_shared(&self, upstreams: &[Arc<Upstream>], query: &mut [u8]) -> ForwardResult {
+        let mut buf = [0u8; FLIGHT_KEY_MAX];
+        let Some(key) = flight_key(query, &mut buf) else {
+            return self.exec_inner(upstreams, query, self.timeout).await;
+        };
+        let hash = crate::util::hash(key);
+        // When this query started, read only once it has to wait: a query
+        // that leads straight away runs exactly as it would unshared.
+        let mut started: Option<Instant> = None;
+        let timed_out = || ForwardResult {
+            response: None,
+            upstream: Arc::from("timeout/err"),
+            duration: self.timeout,
+            had_error: true,
+        };
+        loop {
+            let role = {
+                let mut table = self.flights.0.lock().unwrap();
+                match table.find_entry(hash, |f| f.key() == key) {
+                    Ok(entry) if entry.get().outcome.get().is_none() => {
+                        Role::Follow(entry.get().clone())
+                    }
+                    found => {
+                        // A flight that has ended but is still listed can
+                        // land nothing more; this query takes its place.
+                        if let Ok(ended) = found {
+                            ended.remove();
+                        }
+                        let flight = Arc::new(Flight::new(key));
+                        table.insert_unique(hash, flight.clone(), |f| crate::util::hash(f.key()));
+                        Role::Lead(Leading {
+                            flights: &self.flights,
+                            flight,
+                            hash,
+                            landed: false,
+                        })
+                    }
+                }
+            };
+            match role {
+                Role::Lead(leading) => {
+                    // A query that waited on a cancelled leader has only what
+                    // is left of its own timeout, and counts the wait.
+                    let waited = started.map_or(Duration::ZERO, |at| at.elapsed());
+                    let remaining = self.timeout.saturating_sub(waited);
+                    if remaining.is_zero() {
+                        return timed_out();
+                    }
+                    let mut out = self.exec_inner(upstreams, query, remaining).await;
+                    leading.land(&out);
+                    out.duration += waited;
+                    return out;
+                }
+                Role::Follow(flight) => {
+                    let start = *started.get_or_insert_with(Instant::now);
+                    let deadline = start + self.timeout;
+                    // Registered before the outcome is read, so an outcome
+                    // set in between still wakes this wait.
+                    let ended = flight.ended.notified();
+                    tokio::pin!(ended);
+                    ended.as_mut().enable();
+                    if flight.outcome.get().is_none()
+                        && tokio::time::timeout_at(deadline.into(), ended)
+                            .await
+                            .is_err()
+                    {
+                        return timed_out();
+                    }
+                    // `None`: the leader was cancelled before it landed.
+                    let Some(Some(landed)) = flight.outcome.get() else {
+                        continue;
+                    };
+                    return ForwardResult {
+                        response: landed.response.clone(),
+                        upstream: landed.upstream.clone(),
+                        duration: start.elapsed(),
+                        had_error: landed.had_error,
+                    };
+                }
+            }
+        }
+    }
+
+    /// One exchange: each upstream it asks gets `per_upstream`.
+    async fn exec_inner(
+        &self,
+        upstreams: &[Arc<Upstream>],
+        query: &mut [u8],
+        per_upstream: Duration,
+    ) -> ForwardResult {
         let start = Instant::now();
         let n = upstreams.len();
         if n == 0 {
@@ -703,7 +971,7 @@ impl Forwarder {
         if n == 1 {
             randomize_id(query);
             let up = &upstreams[0];
-            let parsed = match up.query(query, self.timeout).await {
+            let parsed = match up.query(query, per_upstream).await {
                 Ok(bytes) => dns::parse(bytes).ok_or_else(|| "unpack failed".to_string()),
                 Err(e) => Err(e),
             };
@@ -738,7 +1006,7 @@ impl Forwarder {
             // Each fan-out copy carries its own transaction ID.
             let mut q = query.to_vec();
             randomize_id(&mut q);
-            let to = self.timeout;
+            let to = per_upstream;
             set.spawn(async move {
                 let started = Instant::now();
                 let parsed = match up.query(&q, to).await {
@@ -751,13 +1019,25 @@ impl Forwarder {
 
         let mut fallback: Option<(Arc<str>, Duration, Message<Vec<u8>>)> = None;
         let mut first_err: Option<(Arc<str>, Duration)> = None;
-        while let Some(joined) = set.join_next().await {
+        // Set by the first NXDOMAIN: past it, that answer stands.
+        let mut settle_at: Option<tokio::time::Instant> = None;
+        loop {
+            let next = match settle_at {
+                Some(at) => match tokio::time::timeout_at(at, set.join_next()).await {
+                    Ok(next) => next,
+                    // Dropping `set` aborts the peers still out.
+                    Err(_) => break,
+                },
+                None => set.join_next().await,
+            };
+            let Some(joined) = next else { break };
             let Ok((label, dur, parsed)) = joined else {
                 continue;
             };
             match parsed {
                 Ok(msg) => {
-                    if msg.header().rcode() == Rcode::NOERROR {
+                    let rcode = msg.header().rcode();
+                    if rcode == Rcode::NOERROR {
                         // Winner: dropping `set` aborts the pending queries.
                         return ForwardResult {
                             response: Some(msg),
@@ -766,7 +1046,16 @@ impl Forwarder {
                             had_error: false,
                         };
                     }
-                    if fallback.is_none() {
+                    // A definite "no such name" outranks an error code, which
+                    // only says this upstream could not answer.
+                    let definite = rcode == Rcode::NXDOMAIN;
+                    if definite && settle_at.is_none() {
+                        settle_at = Some(tokio::time::Instant::now() + self.settle);
+                    }
+                    let better = fallback.as_ref().is_none_or(|(_, _, held)| {
+                        definite && held.header().rcode() != Rcode::NXDOMAIN
+                    });
+                    if better {
                         fallback = Some((label, dur, msg));
                     }
                 }
@@ -906,6 +1195,108 @@ mod tests {
         let r = f.exec(&mut query()).await;
         assert!(!r.had_error); // a parsed non-NOERROR is still a response
         assert_eq!(r.response.unwrap().header().rcode(), Rcode::SERVFAIL);
+    }
+
+    /// UDP mock that replies with `rcode` after `delay`.
+    async fn mock_after(rcode: Rcode, delay: Duration) -> String {
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                let Some(msg) = dns::parse(buf[..n].to_vec()) else {
+                    continue;
+                };
+                let sock = sock.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let resp = MessageBuilder::new_vec()
+                        .start_answer(&msg, rcode)
+                        .unwrap()
+                        .finish();
+                    let _ = sock.send_to(&resp, peer).await;
+                });
+            }
+        });
+        format!("udp://{addr}")
+    }
+
+    /// UDP mock that reads every query and never answers.
+    async fn mock_silent() -> String {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while sock.recv_from(&mut buf).await.is_ok() {}
+        });
+        format!("udp://{addr}")
+    }
+
+    /// One peer of a group gone silent must not make every NXDOMAIN the others
+    /// return cost the whole deadline: the answer stands once the settle window
+    /// has passed with no NOERROR.
+    #[tokio::test]
+    async fn an_nxdomain_does_not_wait_out_a_silent_peer() {
+        let up = [mock(Rcode::NXDOMAIN).await, mock_silent().await];
+        let f = fwd(&up, 3000).settle_after(Duration::from_millis(100));
+        let started = Instant::now();
+        let r = f.exec(&mut query()).await;
+        let took = started.elapsed();
+        assert!(!r.had_error);
+        assert_eq!(r.response.unwrap().header().rcode(), Rcode::NXDOMAIN);
+        assert!(
+            took < Duration::from_millis(1000),
+            "an NXDOMAIN waited {took:?} for a peer that never answers"
+        );
+        assert!(
+            took >= Duration::from_millis(90),
+            "the peers get the settle window to contradict it ({took:?})"
+        );
+    }
+
+    /// Inside the window, a peer's NOERROR still beats an NXDOMAIN that came
+    /// first: one upstream remembering a name as absent must not hide the
+    /// record another one has just resolved.
+    #[tokio::test]
+    async fn a_noerror_inside_the_settle_window_beats_an_earlier_nxdomain() {
+        let up = [
+            mock(Rcode::NXDOMAIN).await,
+            mock_after(Rcode::NOERROR, Duration::from_millis(60)).await,
+        ];
+        let f = fwd(&up, 3000).settle_after(Duration::from_millis(400));
+        for _ in 0..3 {
+            let r = f.exec(&mut query()).await;
+            assert_eq!(r.response.unwrap().header().rcode(), Rcode::NOERROR);
+        }
+    }
+
+    /// An error code only says that upstream could not answer; an NXDOMAIN
+    /// from a peer is an answer, whichever arrived first.
+    #[tokio::test]
+    async fn an_nxdomain_outranks_an_earlier_error_code() {
+        let up = [
+            mock(Rcode::SERVFAIL).await,
+            mock_after(Rcode::NXDOMAIN, Duration::from_millis(30)).await,
+            mock_silent().await,
+        ];
+        let f = fwd(&up, 3000).settle_after(Duration::from_millis(100));
+        let started = Instant::now();
+        let r = f.exec(&mut query()).await;
+        assert_eq!(r.response.unwrap().header().rcode(), Rcode::NXDOMAIN);
+        assert!(started.elapsed() < Duration::from_millis(1000));
+    }
+
+    /// Error codes alone start no settle window: another peer may still
+    /// answer, so they wait for it as before.
+    #[tokio::test]
+    async fn an_error_code_still_waits_for_a_slower_answer() {
+        let up = [
+            mock(Rcode::SERVFAIL).await,
+            mock_after(Rcode::NOERROR, Duration::from_millis(300)).await,
+        ];
+        let f = fwd(&up, 3000).settle_after(Duration::from_millis(50));
+        let r = f.exec(&mut query()).await;
+        assert_eq!(r.response.unwrap().header().rcode(), Rcode::NOERROR);
     }
 
     #[tokio::test]
@@ -1441,6 +1832,60 @@ mod tests {
         (format!("tcp://{addr}"), conns)
     }
 
+    /// A TCP upstream that reads each query the way a server does — prefix,
+    /// then exactly that many bytes — and answers in a single write, so any
+    /// stall measured against it is on the querying side.
+    async fn mock_tcp_whole_writes() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                s.set_nodelay(true).unwrap();
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 2];
+                        if s.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut q = vec![0u8; usize::from(u16::from_be_bytes(len))];
+                        if s.read_exact(&mut q).await.is_err() {
+                            return;
+                        }
+                        q[2] |= 0x80;
+                        let mut frame = len.to_vec();
+                        frame.extend_from_slice(&q);
+                        if s.write_all(&frame).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        format!("tcp://{addr}")
+    }
+
+    /// Queries on a reused connection must each cost about a round trip. A
+    /// length prefix written apart from its query leaves the query waiting for
+    /// the upstream's delayed ACK of the prefix, every time.
+    #[tokio::test]
+    async fn pooled_tcp_queries_do_not_wait_for_delayed_acks() {
+        let url = mock_tcp_whole_writes().await;
+        let f = Forwarder::new(
+            vec![Arc::new(Upstream::parse(&url).unwrap())],
+            Duration::from_secs(2),
+        );
+        const ROUNDS: u32 = 40;
+        let started = Instant::now();
+        for _ in 0..ROUNDS {
+            assert!(!f.exec(&mut query()).await.had_error);
+        }
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(400),
+            "{ROUNDS} pooled TCP queries took {took:?}: queries are waiting on delayed ACKs"
+        );
+    }
+
     #[tokio::test]
     async fn a_pooled_connection_past_its_idle_limit_is_not_reused() {
         let (url, conns) = mock_tcp_counting().await;
@@ -1731,5 +2176,350 @@ mod tests {
                 .is_err(),
             "an answered query reports nothing"
         );
+    }
+
+    fn query_for(name: &str, qtype: Rtype) -> Vec<u8> {
+        let mut b = MessageBuilder::new_vec();
+        b.header_mut().set_rd(true);
+        b.header_mut().set_random_id();
+        let mut q = b.question();
+        q.push((Name::<Vec<u8>>::from_str(name).unwrap(), qtype))
+            .unwrap();
+        q.finish()
+    }
+
+    /// UDP mock answering `rcode` after `delay`; counts the queries it got.
+    async fn mock_counting(rcode: Rcode, delay: Duration) -> (String, Arc<AtomicU32>) {
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        let asked = Arc::new(AtomicU32::new(0));
+        let seen = asked.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                seen.fetch_add(1, Ordering::Relaxed);
+                let Some(msg) = dns::parse(buf[..n].to_vec()) else {
+                    continue;
+                };
+                let sock = sock.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let resp = MessageBuilder::new_vec()
+                        .start_answer(&msg, rcode)
+                        .unwrap()
+                        .finish();
+                    let _ = sock.send_to(&resp, peer).await;
+                });
+            }
+        });
+        (format!("udp://{addr}"), asked)
+    }
+
+    /// UDP mock that never answers; counts the queries it got.
+    async fn mock_silent_counting() -> (String, Arc<AtomicU32>) {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let asked = Arc::new(AtomicU32::new(0));
+        let seen = asked.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while sock.recv_from(&mut buf).await.is_ok() {
+                seen.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        (format!("udp://{addr}"), asked)
+    }
+
+    /// Run `queries` concurrently on `f`, each from its own task.
+    async fn exec_all(f: &Arc<Forwarder>, queries: Vec<Vec<u8>>) -> Vec<ForwardResult> {
+        let tasks: Vec<_> = queries
+            .into_iter()
+            .map(|mut q| {
+                let f = f.clone();
+                tokio::spawn(async move { f.exec(&mut q).await })
+            })
+            .collect();
+        let mut out = Vec::new();
+        for t in tasks {
+            out.push(t.await.unwrap());
+        }
+        out
+    }
+
+    fn no_flights_left(f: &Forwarder) -> bool {
+        f.flights.0.lock().unwrap().is_empty()
+    }
+
+    fn key_of(query: &[u8]) -> Option<Vec<u8>> {
+        let mut buf = [0u8; FLIGHT_KEY_MAX];
+        flight_key(query, &mut buf).map(<[u8]>::to_vec)
+    }
+
+    /// A burst of one cold question must cost the upstream one exchange, not
+    /// one per client, and every client still gets the answer.
+    #[tokio::test]
+    async fn identical_queries_in_flight_share_one_exchange() {
+        let (up, asked) = mock_counting(Rcode::NOERROR, Duration::from_millis(150)).await;
+        let f = Arc::new(fwd(&[up], 2000));
+        let queries = (0..32)
+            .map(|_| query_for("example.com.", Rtype::A))
+            .collect();
+        for r in exec_all(&f, queries).await {
+            assert!(!r.had_error);
+            assert_eq!(r.response.unwrap().header().rcode(), Rcode::NOERROR);
+        }
+        assert_eq!(
+            asked.load(Ordering::Relaxed),
+            1,
+            "one exchange for the burst"
+        );
+        assert!(no_flights_left(&f));
+    }
+
+    /// The same holds across a fan-out: each upstream of the group is asked
+    /// once for the whole burst.
+    #[tokio::test]
+    async fn a_fanned_out_exchange_is_shared_too() {
+        let mut ups = Vec::new();
+        let mut counts = Vec::new();
+        for _ in 0..3 {
+            let (up, asked) = mock_counting(Rcode::NOERROR, Duration::from_millis(150)).await;
+            ups.push(up);
+            counts.push(asked);
+        }
+        let f = Arc::new(fwd(&ups, 2000));
+        let queries = (0..16)
+            .map(|_| query_for("example.com.", Rtype::A))
+            .collect();
+        for r in exec_all(&f, queries).await {
+            assert_eq!(r.response.unwrap().header().rcode(), Rcode::NOERROR);
+        }
+        let per_upstream: Vec<u32> = counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        assert_eq!(per_upstream, [1, 1, 1], "each upstream asked once");
+    }
+
+    /// Only the same question shares: names compare case-insensitively, but
+    /// another type or another name is another exchange.
+    #[tokio::test]
+    async fn only_the_same_question_shares_an_exchange() {
+        let (up, asked) = mock_counting(Rcode::NOERROR, Duration::from_millis(150)).await;
+        let f = Arc::new(fwd(&[up], 2000));
+        let queries = vec![
+            query_for("example.com.", Rtype::A),
+            query_for("EXAMPLE.com.", Rtype::A),
+            query_for("Example.Com.", Rtype::A),
+            query_for("example.com.", Rtype::AAAA),
+            query_for("example.org.", Rtype::A),
+            query_for("example.org.", Rtype::A),
+        ];
+        for r in exec_all(&f, queries).await {
+            assert!(!r.had_error);
+        }
+        assert_eq!(
+            asked.load(Ordering::Relaxed),
+            3,
+            "A, AAAA, and the other name"
+        );
+    }
+
+    #[test]
+    fn the_flight_key_ignores_the_id_and_the_name_case_only() {
+        let a = query_for("www.Example.COM.", Rtype::A);
+        let mut b = query_for("WWW.example.com.", Rtype::A);
+        b[0] ^= 0xFF;
+        assert_eq!(key_of(&a), key_of(&b));
+        // The type, and every header byte past the ID, still tell apart.
+        assert_ne!(
+            key_of(&a),
+            key_of(&query_for("www.example.com.", Rtype::AAAA))
+        );
+        let mut cd = a.clone();
+        cd[3] |= 0x10;
+        assert_ne!(key_of(&a), key_of(&cd));
+        // Lower-casing touches the name only, never a label length byte or
+        // the type that follows it.
+        let key = key_of(&a).unwrap();
+        assert_eq!(&key[10..27], b"\x03www\x07example\x03com\x00");
+        assert_eq!(&key[27..31], &a[29..33]);
+        // A question that cannot be walked never shares.
+        assert_eq!(key_of(&a[..20]), None);
+    }
+
+    /// The leader's caller may stop waiting (its client got an answer
+    /// elsewhere). Its waiters must still get an answer, from a new exchange.
+    #[tokio::test]
+    async fn a_cancelled_leader_leaves_its_waiters_a_new_exchange() {
+        let (up, asked) = mock_counting(Rcode::NOERROR, Duration::from_millis(100)).await;
+        let f = Arc::new(fwd(&[up], 2000));
+        let leader = {
+            let f = f.clone();
+            tokio::spawn(async move { f.exec(&mut query_for("example.com.", Rtype::A)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let waiter = {
+            let f = f.clone();
+            tokio::spawn(async move { f.exec(&mut query_for("example.com.", Rtype::A)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        leader.abort();
+        let r = tokio::time::timeout(Duration::from_millis(1000), waiter)
+            .await
+            .expect("the waiter must not hang on a cancelled leader")
+            .unwrap();
+        assert!(!r.had_error);
+        assert_eq!(r.response.unwrap().header().rcode(), Rcode::NOERROR);
+        assert_eq!(asked.load(Ordering::Relaxed), 2);
+        assert!(no_flights_left(&f));
+    }
+
+    /// Cancelled with nobody waiting, a leader still withdraws its flight:
+    /// entries must not outlive their exchanges.
+    #[tokio::test]
+    async fn a_cancelled_leader_leaves_no_flight_behind() {
+        let (up, _) = mock_silent_counting().await;
+        let f = Arc::new(fwd(&[up], 2000));
+        let leader = {
+            let f = f.clone();
+            tokio::spawn(async move { f.exec(&mut query_for("example.com.", Rtype::A)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!no_flights_left(&f), "the leader is listed while in flight");
+        leader.abort();
+        let _ = leader.await;
+        assert!(no_flights_left(&f));
+    }
+
+    /// A flight whose channel closed without being withdrawn can land
+    /// nothing; a query finding one must take its place rather than follow
+    /// it round and round.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closed_flight_left_listed_is_taken_over() {
+        let (up, asked) = mock_counting(Rcode::NOERROR, Duration::from_millis(5)).await;
+        let f = Arc::new(fwd(&[up], 500));
+        let q = query_for("example.com.", Rtype::A);
+        let key = key_of(&q).unwrap();
+        let ended = Arc::new(Flight::new(&key));
+        let _ = ended.outcome.set(None);
+        f.flights
+            .0
+            .lock()
+            .unwrap()
+            .insert_unique(crate::util::hash(&key), ended, |f| {
+                crate::util::hash(f.key())
+            });
+        let task = {
+            let f = f.clone();
+            tokio::spawn(async move { f.exec(&mut q.clone()).await })
+        };
+        let r = tokio::time::timeout(Duration::from_millis(1000), task)
+            .await
+            .expect("the query must not spin on a dead flight")
+            .unwrap();
+        assert!(!r.had_error);
+        assert_eq!(asked.load(Ordering::Relaxed), 1);
+        assert!(no_flights_left(&f));
+    }
+
+    /// A waiter that has to lead after a cancellation only gets the time its
+    /// own deadline leaves, not a fresh one.
+    #[tokio::test]
+    async fn a_waiter_keeps_its_own_deadline_after_a_cancellation() {
+        let (up, _) = mock_silent_counting().await;
+        let f = Arc::new(fwd(&[up], 400));
+        let leader = {
+            let f = f.clone();
+            tokio::spawn(async move { f.exec(&mut query_for("example.com.", Rtype::A)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let started = Instant::now();
+        let waiter = {
+            let f = f.clone();
+            tokio::spawn(async move { f.exec(&mut query_for("example.com.", Rtype::A)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(280)).await;
+        leader.abort();
+        let r = waiter.await.unwrap();
+        let took = started.elapsed();
+        assert!(r.had_error);
+        assert!(
+            took >= Duration::from_millis(350) && took < Duration::from_millis(550),
+            "the waiter's whole wait is its own timeout ({took:?})"
+        );
+    }
+
+    /// Failures are shared like answers: a silent upstream costs one exchange
+    /// for the burst, and nobody goes round again after it.
+    #[tokio::test]
+    async fn a_failed_exchange_fails_its_waiters_without_retrying() {
+        let (up, asked) = mock_silent_counting().await;
+        let f = Arc::new(fwd(&[up], 150));
+        let started = Instant::now();
+        let queries = (0..16)
+            .map(|_| query_for("example.com.", Rtype::A))
+            .collect();
+        for r in exec_all(&f, queries).await {
+            assert!(r.had_error);
+            assert!(r.response.is_none());
+        }
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert_eq!(asked.load(Ordering::Relaxed), 1);
+        assert!(no_flights_left(&f));
+    }
+
+    /// A query that joins late gets the failure the moment its leader meets
+    /// it, not at its own later deadline.
+    #[tokio::test]
+    async fn a_late_waiter_gets_its_leaders_failure_at_once() {
+        let (up, asked) = mock_silent_counting().await;
+        let f = Arc::new(fwd(&[up], 300));
+        let leader = {
+            let f = f.clone();
+            tokio::spawn(async move { f.exec(&mut query_for("example.com.", Rtype::A)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = Instant::now();
+        let r = f.exec(&mut query_for("example.com.", Rtype::A)).await;
+        let took = started.elapsed();
+        assert!(r.had_error);
+        assert!(
+            took < Duration::from_millis(200),
+            "the waiter sat out its own timeout ({took:?})"
+        );
+        assert!(leader.await.unwrap().had_error);
+        assert_eq!(asked.load(Ordering::Relaxed), 1);
+    }
+
+    /// Sharing ends when the exchange lands: the next query asks again
+    /// rather than reusing an outcome (the cache is what keeps answers).
+    #[tokio::test]
+    async fn a_query_after_the_exchange_landed_goes_out_again() {
+        let (up, asked) = mock_counting(Rcode::NOERROR, Duration::from_millis(5)).await;
+        let f = fwd(&[up], 2000);
+        for _ in 0..2 {
+            let r = f.exec(&mut query_for("example.com.", Rtype::A)).await;
+            assert!(!r.had_error);
+            assert!(no_flights_left(&f));
+        }
+        assert_eq!(asked.load(Ordering::Relaxed), 2);
+    }
+
+    /// Every query that waited on a failed exchange counts toward the
+    /// breaker, as it did when each went out alone: a burst of failures still
+    /// trips it.
+    #[tokio::test]
+    async fn every_waiter_counts_toward_the_breaker() {
+        let (up, asked) = mock_silent_counting().await;
+        let f = Arc::new(Forwarder::with_breaker(
+            vec![Arc::new(Upstream::parse(&up).unwrap())],
+            Duration::from_millis(100),
+        ));
+        let queries = (0..BREAKER_FAILS)
+            .map(|_| query_for("example.com.", Rtype::A))
+            .collect();
+        for r in exec_all(&f, queries).await {
+            assert!(r.had_error);
+        }
+        assert_eq!(asked.load(Ordering::Relaxed), 1);
+        assert!(f.breaker_is_open());
     }
 }

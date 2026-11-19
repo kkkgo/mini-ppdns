@@ -306,13 +306,21 @@ fn build_config(raw: &cli::RawArgs, warnings: &mut Vec<String>) -> Result<Config
 
     // Normalize enum-like values (case-insensitive) with fallback.
     cfg.aaaa = cfg.aaaa.trim().to_ascii_lowercase();
+    // Reported with the other warnings, through the logger once it is up:
+    // stdout is /dev/null under -d, and a bare line there has no level.
     if !matches!(cfg.aaaa.as_str(), "no" | "yes" | "noerror") {
-        println!("invalid aaaa value {:?}, falling back to \"no\"", cfg.aaaa);
+        warnings.push(format!(
+            "invalid aaaa value {:?}, falling back to \"no\"",
+            cfg.aaaa
+        ));
         cfg.aaaa = "no".to_string();
     }
     cfg.lite = cfg.lite.trim().to_ascii_lowercase();
     if !matches!(cfg.lite.as_str(), "no" | "yes") {
-        println!("invalid lite value {:?}, falling back to \"yes\"", cfg.lite);
+        warnings.push(format!(
+            "invalid lite value {:?}, falling back to \"yes\"",
+            cfg.lite
+        ));
         cfg.lite = "yes".to_string();
     }
 
@@ -393,20 +401,17 @@ fn resolve_listen(cfg: &Config) -> Vec<String> {
 }
 
 fn build_force_fall(cfg: &Config) -> Result<ForceFallMatcher, Fatal> {
-    let mut matcher = ForceFallMatcher::default();
+    let (mut include, mut negate) = (Vec::new(), Vec::new());
     for s in &cfg.force_fall {
         let entry = forcefall::parse_force_fall_entry(s)
             .map_err(|e| Fatal::Config(format!("invalid force_fall entry {s:?}: {e}")))?;
-        if entry.prefixes.is_empty() {
-            continue;
-        }
         if entry.negated {
-            matcher.negate.extend(entry.prefixes);
+            negate.extend(entry.prefixes);
         } else {
-            matcher.include.extend(entry.prefixes);
+            include.extend(entry.prefixes);
         }
     }
-    Ok(matcher)
+    Ok(ForceFallMatcher::new(&include, &negate))
 }
 
 fn nonempty(o: Option<&str>) -> Option<&str> {
@@ -457,6 +462,36 @@ mod tests {
         assert_eq!(cfg.qtime, 100, "CLI qtime wins over file");
         assert_eq!(cfg.aaaa, "yes", "CLI aaaa wins over file");
         assert_eq!(cfg.lite, "no", "file value kept when CLI absent");
+    }
+
+    /// A value that falls back to its default is reported as a warning, the
+    /// channel every other configuration complaint goes through.
+    #[test]
+    fn invalid_enum_values_fall_back_with_a_warning() {
+        let raw = cli::parse(
+            ["-aaaa", "maybe", "-lite", "sometimes"]
+                .iter()
+                .map(|s| s.to_string()),
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let Ok(cfg) = build_config(&raw, &mut warnings) else {
+            panic!("build_config failed");
+        };
+        assert_eq!(cfg.aaaa, "no");
+        assert_eq!(cfg.lite, "yes");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("aaaa") && w.contains("maybe")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("lite") && w.contains("sometimes")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

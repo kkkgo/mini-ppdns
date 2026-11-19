@@ -14,8 +14,8 @@ use std::net::{IpAddr, Ipv6Addr};
 // Two properties the rest of the crate leans on:
 //
 // 1. The output is well distributed enough to index a hash table directly, so
-//    the cache's shard maps take it as their bucket hash (`cache::PreHashed`)
-//    instead of hashing the key a second time.
+//    the cache's shard index files entries under it (`cache::Shard`) instead
+//    of hashing the key a second time.
 // 2. It is seeded per process from `getrandom`, so which shard a name lands in
 //    is not attacker-predictable.
 

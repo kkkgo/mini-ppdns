@@ -537,14 +537,38 @@ pub struct PtrResolver {
 }
 
 impl PtrResolver {
+    /// [`PtrResolver::with_static_ptr`] with no reverse names named: each
+    /// static address answers PTR with the smallest name it carries.
+    #[cfg(test)]
+    pub fn new(
+        lease_files: Vec<String>,
+        hosts_files: Vec<String>,
+        auto: AutoDetect,
+        static_hosts: &HashMap<String, Vec<IpAddr>>,
+    ) -> Option<PtrResolver> {
+        Self::with_static_ptr(
+            lease_files,
+            hosts_files,
+            auto,
+            static_hosts,
+            &HashMap::new(),
+        )
+    }
+
     /// Build a resolver, auto-detecting default lease/hosts paths when neither
     /// lease nor hosts files were explicitly configured. Returns None when
     /// there is nothing to resolve.
-    pub fn new(
+    ///
+    /// `static_ptr_names` picks the name each static address answers reverse
+    /// lookups with (see `Config::hosts_ptr`). An address it does not name, or
+    /// names with something that is not one of the address's usable names,
+    /// gets the smallest of them, so the answer never depends on hash order.
+    pub fn with_static_ptr(
         mut lease_files: Vec<String>,
         hosts_files: Vec<String>,
         auto: AutoDetect,
         static_hosts: &HashMap<String, Vec<IpAddr>>,
+        static_ptr_names: &HashMap<IpAddr, String>,
     ) -> Option<PtrResolver> {
         let mut auto_hosts_files = Vec::new();
         if auto.lease {
@@ -570,15 +594,29 @@ impl PtrResolver {
         }
 
         let mut static_fwd = HashMap::new();
-        let mut static_ptr = HashMap::new();
+        // Every usable name each address carries, so the reverse answer can be
+        // chosen by rule rather than by which name the map yields last.
+        let mut names_of: HashMap<IpAddr, Vec<&str>> = HashMap::new();
         for (domain, ips) in static_hosts {
-            if let Some(k) = name_to_wire(domain, true) {
-                static_fwd.insert(k, ips.clone());
-            }
+            let Some(k) = name_to_wire(domain, true) else {
+                continue;
+            };
+            static_fwd.insert(k, ips.clone());
             for ip in ips {
-                if let Some(k) = name_to_wire(&ip_to_ptr_name(*ip), true) {
-                    static_ptr.insert(k, domain.trim_end_matches('.').to_string());
-                }
+                names_of.entry(*ip).or_default().push(domain);
+            }
+        }
+        let mut static_ptr = HashMap::new();
+        for (ip, names) in names_of {
+            let named = static_ptr_names
+                .get(&ip)
+                .map(String::as_str)
+                .filter(|n| names.contains(n));
+            let Some(name) = named.or_else(|| names.iter().copied().min()) else {
+                continue;
+            };
+            if let Some(k) = name_to_wire(&ip_to_ptr_name(ip), true) {
+                static_ptr.insert(k, name.trim_end_matches('.').to_string());
             }
         }
 
@@ -1267,6 +1305,52 @@ mod tests {
             .active()
             .expect("published")
             .may_contain_hash(crate::util::hash(&wire)));
+    }
+
+    /// One address under three static names. Which name its PTR answers with
+    /// is a rule — the configured canonical name, else the smallest — and
+    /// must not change from one start to the next with hash order.
+    #[test]
+    fn a_static_address_with_aliases_has_one_stable_reverse_name() {
+        // Built afresh each round, as each start parses the config anew: the
+        // map's iteration order changes with it and must not pick the name.
+        let statics = || {
+            let mut statics = HashMap::new();
+            for name in ["nas.lan.", "files.lan.", "zz-backup.lan."] {
+                statics.insert(name.to_string(), vec![ip("10.0.0.5")]);
+            }
+            // A second address carrying one of the same names.
+            statics.get_mut("files.lan.").unwrap().push(ip("10.0.0.6"));
+            statics
+        };
+        let rev = |r: &PtrResolver, addr: &str| {
+            r.lookup(&name_to_wire(&ip_to_ptr_name_str(addr), true).unwrap())
+        };
+        let mut canonical = HashMap::new();
+        canonical.insert(ip("10.0.0.5"), "nas.lan.".to_string());
+        canonical.insert(ip("10.0.0.6"), "files.lan.".to_string());
+        // A canonical name the address does not carry is ignored.
+        canonical.insert(ip("10.0.0.7"), "ghost.lan.".to_string());
+        for _ in 0..200 {
+            let r = PtrResolver::with_static_ptr(
+                vec![],
+                vec![],
+                AutoDetect::none(),
+                &statics(),
+                &canonical,
+            )
+            .unwrap();
+            assert_eq!(rev(&r, "10.0.0.5").as_deref(), Some("nas.lan"));
+            assert_eq!(rev(&r, "10.0.0.6").as_deref(), Some("files.lan"));
+            assert_eq!(rev(&r, "10.0.0.7"), None);
+
+            let r = PtrResolver::new(vec![], vec![], AutoDetect::none(), &statics()).unwrap();
+            assert_eq!(
+                rev(&r, "10.0.0.5").as_deref(),
+                Some("files.lan"),
+                "without a canonical name, the smallest one answers"
+            );
+        }
     }
 
     #[test]

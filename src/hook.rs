@@ -18,6 +18,7 @@ use tokio::sync::watch;
 
 use crate::cache::Cache;
 use crate::config::HookConfig;
+use crate::log;
 use crate::pplog::{Reporter, SEVERITY_INFO, SEVERITY_WARN};
 
 const HOOK_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -50,7 +51,7 @@ impl HookMonitor {
                 if was_down {
                     self.failed.store(false, Ordering::Relaxed);
                     was_down = false;
-                    eprintln!("[hook] main DNS recovered, switching back to main DNS");
+                    log::info("[hook] main DNS recovered, switching back to main DNS");
                     if let Some(rep) = &self.pplog {
                         rep.report_event(SEVERITY_INFO, "[hook] main DNS recovered");
                     }
@@ -71,9 +72,9 @@ impl HookMonitor {
                     // Nothing needs clearing on recovery either: clients go back
                     // to reading this (now empty) cache and re-query the main DNS.
                     self.cache.flush();
-                    eprintln!(
+                    log::warn(&format!(
                         "[hook] main DNS marked DOWN ({fail_count} failures), switching to fallback; cache flushed"
-                    );
+                    ));
                     if let Some(rep) = &self.pplog {
                         rep.report_event(
                             SEVERITY_WARN,
@@ -189,6 +190,13 @@ async fn run_shell(cmd_str: &str, timeout: Duration) -> Option<(i32, Vec<u8>)> {
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
+    // SAFETY: the closure only calls `setrlimit`, which is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            crate::app::restore_child_fd_limit();
+            Ok(())
+        });
+    }
     let child = cmd.spawn().ok()?;
     let mut process = ShellProcess {
         group: child.id().map(|pid| pid as libc::pid_t),
@@ -244,11 +252,13 @@ async fn run_exec_cmd(cmd_str: &str) {
     }
     match run_shell(cmd_str, HOOK_CMD_TIMEOUT).await {
         Some((0, _)) => {}
-        Some((code, out)) => eprintln!(
+        Some((code, out)) => log::warn(&format!(
             "[hook] switch exec failed (exit {code}): {}",
             String::from_utf8_lossy(&out)
-        ),
-        None => eprintln!("[hook] switch exec failed to run or timed out: {cmd_str}"),
+        )),
+        None => log::warn(&format!(
+            "[hook] switch exec failed to run or timed out: {cmd_str}"
+        )),
     }
 }
 

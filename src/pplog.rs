@@ -182,11 +182,11 @@ impl Reporter {
             return None;
         }
         if !(1..=5).contains(&cfg.level) {
-            eprintln!("pplog: level must be 1-5, got {}", cfg.level);
+            crate::log::error(&format!("pplog: level must be 1-5, got {}", cfg.level));
             return None;
         }
         let uuid = parse_uuid(&cfg.uuid).or_else(|| {
-            eprintln!("pplog: invalid UUID");
+            crate::log::error("pplog: invalid UUID");
             None
         })?;
         let hash = Sha256::digest(uuid);
@@ -239,6 +239,12 @@ impl Reporter {
         if self.last_report.load(Ordering::Relaxed) != ts {
             self.last_report.store(ts, Ordering::Relaxed);
         }
+        // The queue slot is claimed before encoding: with the sender behind,
+        // every entry would otherwise be encoded on the query path only to be
+        // thrown away.
+        let Ok(slot) = self.tx.try_reserve() else {
+            return;
+        };
         // Query entries max out at level 4 even when configured level is 5.
         let level = self.level.min(4);
         let (level, payload) = if level >= 3 {
@@ -246,23 +252,21 @@ impl Reporter {
         } else {
             (level, encode::encode_query(entry, level, ts))
         };
-        self.queue(level, payload);
+        slot.send(Outgoing { level, payload });
     }
 
     /// Report a level-5 event (heartbeat, hook transitions, …). Sent only when
-    /// the configured level is >= 2.
+    /// the configured level is >= 2. Dropped when the queue is full, like a
+    /// query entry: telemetry never stalls anything.
     pub fn report_event(&self, severity: u8, msg: &str) {
         if self.level < 2 {
             return;
         }
+        let Ok(slot) = self.tx.try_reserve() else {
+            return;
+        };
         let payload = encode::encode_event(severity, msg, now_secs());
-        self.queue(5, payload);
-    }
-
-    /// Hand a payload to the sender task, which frames and seals it. Dropped
-    /// when the queue is full: telemetry never stalls a query.
-    fn queue(&self, level: u8, payload: Vec<u8>) {
-        let _ = self.tx.try_send(Outgoing { level, payload });
+        slot.send(Outgoing { level: 5, payload });
     }
     async fn heartbeat_loop(self: Arc<Self>) {
         let interval = Duration::from_secs(self.heartbeat_secs as u64);
@@ -305,6 +309,11 @@ mod encode {
         encode_query_with(e, &ans, &add, level, ts)
     }
 
+    #[cfg(test)]
+    thread_local! {
+        pub static ENCODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     fn encode_query_with(
         e: &QueryEntry,
         answers: &[&OwnedRecord],
@@ -312,6 +321,8 @@ mod encode {
         level: u8,
         ts: u32,
     ) -> Vec<u8> {
+        #[cfg(test)]
+        ENCODED.with(|n| n.set(n.get() + 1));
         let mut b = Vec::with_capacity(64);
         b.extend_from_slice(&ts.to_be_bytes());
 
@@ -505,6 +516,65 @@ mod tests {
     use domain::base::{Name, Ttl};
     use domain::rdata::{AllRecordData, Txt, A};
     use std::str::FromStr;
+
+    /// A reporter whose sender never drains its queue of `depth` slots.
+    fn stalled_reporter(level: u8, depth: usize) -> (Reporter, mpsc::Receiver<Outgoing>) {
+        let (tx, rx) = mpsc::channel(depth);
+        let rep = Reporter {
+            level,
+            tx,
+            last_report: AtomicU32::new(0),
+            heartbeat_secs: 0,
+        };
+        (rep, rx)
+    }
+
+    /// With the queue full, an entry is dropped before it is encoded: the
+    /// encoding — RR serialization and trimming, several passes for a large
+    /// answer — runs on the query path, and doing it for an entry that cannot
+    /// be queued is pure waste exactly when the reporter is already behind.
+    #[test]
+    fn a_full_queue_drops_entries_without_encoding_them() {
+        let (rep, mut rx) = stalled_reporter(4, 1);
+        let answers = vec![large_txt_record(), a_record()];
+        let entry = QueryEntry {
+            client: "10.0.0.2".parse().unwrap(),
+            qtype: 16,
+            rcode: 0,
+            route: ROUTE_LOCAL,
+            duration_ms: 3,
+            qname_wire: b"\x07example\x03com\x00",
+            upstream: "udp://10.0.0.1:53",
+            answers: &answers,
+            additional: &[],
+        };
+        let encoded = || encode::ENCODED.with(|n| n.get());
+
+        rep.report(&entry);
+        assert!(
+            encoded() > 0,
+            "the first entry fits the queue and is encoded"
+        );
+        let before = encoded();
+        for _ in 0..100 {
+            rep.report(&entry);
+        }
+        assert_eq!(
+            encoded(),
+            before,
+            "entries that cannot be queued were encoded"
+        );
+        rep.report_event(SEVERITY_INFO, "dropped too");
+
+        // Exactly the one that fit was queued: the query entry, not the event.
+        let queued = rx.try_recv().expect("the first entry");
+        assert!(queued.level < 5, "level {}", queued.level);
+        assert!(rx.try_recv().is_err());
+
+        // Room again: the next one goes through.
+        rep.report(&entry);
+        assert!(rx.try_recv().is_ok());
+    }
 
     fn a_record() -> OwnedRecord {
         OwnedRecord::new(

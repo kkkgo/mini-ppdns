@@ -16,15 +16,28 @@ pub type OwnedName = Name<Bytes>;
 pub type OwnedData = AllRecordData<Bytes, OwnedName>;
 pub type OwnedRecord = domain::base::Record<OwnedName, OwnedData>;
 
-/// The client's EDNS0 state we care about echoing (just the advertised UDP
-/// size). The DO bit is deliberately not tracked: DNSSEC is out of scope for
-/// this forwarder (lite mode strips RRSIGs and the cache is not DO-aware), so
-/// we never request DNSSEC records upstream and never claim support
-/// downstream.
+/// The client's EDNS state we care about: the advertised UDP size we echo,
+/// and the EDNS version, which decides whether we answer at all (only version
+/// 0 is implemented; anything else gets BADVERS, RFC 6891 §6.1.3). The DO bit
+/// is deliberately not tracked: DNSSEC is out of scope for this forwarder
+/// (lite mode strips RRSIGs and the cache is not DO-aware), so we never
+/// request DNSSEC records upstream and never claim support downstream.
 #[derive(Debug, Clone, Copy)]
 pub struct ClientEdns {
     pub udp_size: u16,
+    pub version: u8,
 }
+
+/// The one EDNS version this server implements, and so the version every OPT
+/// it sends carries.
+pub const EDNS_VERSION: u8 = 0;
+
+/// BADVERS, split the way RFC 6891 §6.1.3 carries an extended rcode: the low
+/// four bits in the header's RCODE field, the upper eight in the OPT's
+/// extended-RCODE byte.
+const BADVERS: u16 = 16;
+const BADVERS_HEADER_RCODE: u8 = (BADVERS & 0x0f) as u8;
+const BADVERS_EXT_RCODE: u8 = (BADVERS >> 4) as u8;
 
 /// Advertised EDNS0 UDP payload size we use on *outgoing upstream queries*
 /// (DNS Flag Day 2020 recommendation).
@@ -364,9 +377,11 @@ fn opt_after_question(src: &[u8], qend: Option<usize>) -> Option<Option<ClientEd
     if i + 11 + rdlen > src.len() {
         return None;
     }
-    // The class field of an OPT carries the advertised UDP payload size.
+    // The class field of an OPT carries the advertised UDP payload size; the
+    // TTL field is extended rcode, version, then flags.
     Some(Some(ClientEdns {
         udp_size: u16::from_be_bytes([rr[3], rr[4]]),
+        version: rr[6],
     }))
 }
 
@@ -397,6 +412,7 @@ fn edns_of_slow<Octs: domain::dep::octseq::Octets + ?Sized>(
 ) -> Option<ClientEdns> {
     msg.opt().map(|opt| ClientEdns {
         udp_size: opt.udp_payload_size(),
+        version: opt.version(),
     })
 }
 
@@ -461,8 +477,15 @@ pub struct ResponseData<'a> {
     pub authority: &'a [OwnedRecord],
     pub additional: &'a [OwnedRecord],
     /// Per-record TTL override (seconds). When Some, every record is emitted
-    /// with this TTL; when None, each record keeps its own TTL.
+    /// with this TTL; when None, each record keeps its own TTL. With `age`
+    /// set it only caps the authority and additional records.
     pub ttl_override: Option<u32>,
+    /// Seconds a cached answer's records have been held. The answers take
+    /// `ttl_override` (the entry's remaining life, which no answer outlives);
+    /// authority and additional records count down from their own TTLs,
+    /// since the entry's lifetime is not theirs to extend, and one whose TTL
+    /// has run out is left out.
+    pub age: Option<u32>,
     pub edns: Option<ClientEdns>,
     /// When Some and there is more than one answer, answers are emitted in a
     /// three-tier order (CNAMEs, then shuffled qtype matches, then the rest)
@@ -637,20 +660,37 @@ fn push_opt<T: Composer>(add: &mut AdditionalBuilder<T>, edns: ClientEdns) {
     });
 }
 
+/// The TTL an answer record goes out with.
+fn answer_ttl(r: &OwnedRecord, data: &ResponseData<'_>) -> u32 {
+    data.ttl_override.unwrap_or_else(|| r.ttl().as_secs())
+}
+
+/// The TTL an authority or additional record goes out with, or `None` when
+/// it has expired and must be left out (see [`ResponseData::age`]).
+fn section_ttl(r: &OwnedRecord, data: &ResponseData<'_>) -> Option<u32> {
+    let own = r.ttl().as_secs();
+    let Some(age) = data.age else {
+        return Some(data.ttl_override.unwrap_or(own));
+    };
+    let left = own.checked_sub(age)?;
+    Some(data.ttl_override.map_or(left, |cap| cap.min(left)))
+}
+
 /// Fill every section with no size limit, shared by the plain and compressed
 /// builds — they differ only in the octets target they compose into.
 fn fill<T: Composer>(mut ans: AnswerBuilder<T>, data: &ResponseData<'_>) -> T {
     match data.shuffle_qtype {
         Some(qtype) if data.answers.len() > 1 => {
             for &i in AnswerOrder::new(data.answers, qtype).as_slice() {
-                if push_record(&mut ans, &data.answers[i], data.ttl_override).is_err() {
+                let r = &data.answers[i];
+                if push_record(&mut ans, r, answer_ttl(r, data)).is_err() {
                     break;
                 }
             }
         }
         _ => {
             for r in data.answers {
-                if push_record(&mut ans, r, data.ttl_override).is_err() {
+                if push_record(&mut ans, r, answer_ttl(r, data)).is_err() {
                     break;
                 }
             }
@@ -658,13 +698,19 @@ fn fill<T: Composer>(mut ans: AnswerBuilder<T>, data: &ResponseData<'_>) -> T {
     }
     let mut auth = ans.authority();
     for r in data.authority {
-        if push_record(&mut auth, r, data.ttl_override).is_err() {
+        let Some(ttl) = section_ttl(r, data) else {
+            continue;
+        };
+        if push_record(&mut auth, r, ttl).is_err() {
             break;
         }
     }
     let mut add = auth.additional();
     for r in data.additional {
-        if push_record(&mut add, r, data.ttl_override).is_err() {
+        let Some(ttl) = section_ttl(r, data) else {
+            continue;
+        };
+        if push_record(&mut add, r, ttl).is_err() {
             break;
         }
     }
@@ -689,12 +735,11 @@ fn start<Octs: domain::dep::octseq::Octets + ?Sized, T: Composer>(
 ///
 /// A `Name<Vec<u8>>` already holds its uncompressed wire encoding, so the owner
 /// is a straight copy.
-fn write_record(out: &mut Vec<u8>, r: &OwnedRecord, ttl_override: Option<u32>) -> bool {
+fn write_record(out: &mut Vec<u8>, r: &OwnedRecord, ttl: u32) -> bool {
     let start = out.len();
     out.extend_from_slice(r.owner().as_slice());
     out.extend_from_slice(&r.rtype().to_int().to_be_bytes());
     out.extend_from_slice(&r.class().to_int().to_be_bytes());
-    let ttl = ttl_override.unwrap_or_else(|| r.ttl().as_secs());
     out.extend_from_slice(&ttl.to_be_bytes());
     let len_at = out.len();
     out.extend_from_slice(&[0, 0]);
@@ -719,13 +764,48 @@ fn write_record(out: &mut Vec<u8>, r: &OwnedRecord, ttl_override: Option<u32>) -
 /// no flags — DO is never echoed, see [`ClientEdns`]). Exactly [`OPT_WIRE_LEN`]
 /// bytes.
 fn write_opt(out: &mut Vec<u8>, edns: ClientEdns) {
-    // Root owner(1) + type(2) + advertised size(2) + ttl(4, all zero: rcode
-    // extension, version and flags) + rdlen(2, no options), staged in one
+    write_opt_with_rcode(out, edns, 0);
+}
+
+/// [`write_opt`] with the upper eight bits of an extended rcode in place.
+fn write_opt_with_rcode(out: &mut Vec<u8>, edns: ClientEdns, ext_rcode: u8) {
+    // Root owner(1) + type(2) + advertised size(2) + ttl(4: rcode extension,
+    // version, flags — DO never set) + rdlen(2, no options), staged in one
     // stack buffer like a record's fixed fields.
     let mut opt = [0u8; 11];
     opt[1..3].copy_from_slice(&Rtype::OPT.to_int().to_be_bytes());
     opt[3..5].copy_from_slice(&edns.udp_size.clamp(512, MAX_UDP_RESPONSE).to_be_bytes());
+    opt[5] = ext_rcode;
+    opt[6] = EDNS_VERSION;
     out.extend_from_slice(&opt);
+}
+
+/// Answer a query whose EDNS version this server does not implement: RCODE
+/// BADVERS, no records, and an OPT stating the version we do speak (RFC 6891
+/// §6.1.3), so the client can retry at that version. The question is echoed
+/// when it can be copied verbatim and left out otherwise; either way the
+/// reply is under 300 bytes, inside any UDP budget.
+pub fn build_badvers_into<Octs: domain::dep::octseq::Octets + ?Sized>(
+    req: &Message<Octs>,
+    edns: ClientEdns,
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    let src = req.as_slice();
+    // `Message` guarantees at least a full header.
+    let qend = match u16::from_be_bytes([src[4], src[5]]) {
+        1 => question_end(src).unwrap_or(12),
+        _ => 12,
+    };
+    out.extend_from_slice(&src[..qend]);
+    // QR=1, opcode and RD copied from the request, AA/TC cleared.
+    out[2] = 0x80 | (src[2] & 0x79);
+    // RA=1, Z/AD/CD cleared, and BADVERS's share of the header rcode.
+    out[3] = 0x80 | BADVERS_HEADER_RCODE;
+    out[4..12].fill(0);
+    out[5] = u8::from(qend > 12);
+    out[11] = 1; // ARCOUNT: the OPT
+    write_opt_with_rcode(out, edns, BADVERS_EXT_RCODE);
 }
 
 /// Full build, no name compression — the fast, common path.
@@ -775,20 +855,25 @@ fn assemble_into<Octs: domain::dep::octseq::Octets + ?Sized>(
     match data.shuffle_qtype {
         Some(qtype) if data.answers.len() > 1 => {
             for &i in AnswerOrder::new(data.answers, qtype).as_slice() {
-                counts[0] += u16::from(write_record(out, &data.answers[i], data.ttl_override));
+                let r = &data.answers[i];
+                counts[0] += u16::from(write_record(out, r, answer_ttl(r, data)));
             }
         }
         _ => {
             for r in data.answers {
-                counts[0] += u16::from(write_record(out, r, data.ttl_override));
+                counts[0] += u16::from(write_record(out, r, answer_ttl(r, data)));
             }
         }
     }
-    for r in data.authority {
-        counts[1] += u16::from(write_record(out, r, data.ttl_override));
-    }
-    for r in data.additional {
-        counts[2] += u16::from(write_record(out, r, data.ttl_override));
+    for (count, section) in counts[1..]
+        .iter_mut()
+        .zip([data.authority, data.additional])
+    {
+        for r in section {
+            if let Some(ttl) = section_ttl(r, data) {
+                *count += u16::from(write_record(out, r, ttl));
+            }
+        }
     }
     if let Some(edns) = data.edns {
         write_opt(out, edns);
@@ -851,27 +936,33 @@ fn assemble_fitted<Octs: domain::dep::octseq::Octets + ?Sized>(
         if ans.as_slice().len() + rr_upper_bound(r) + opt_reserve > limit {
             break;
         }
-        if push_record(&mut ans, r, data.ttl_override).is_err() {
+        if push_record(&mut ans, r, answer_ttl(r, data)).is_err() {
             break;
         }
     }
 
     let mut auth = ans.authority();
     for r in data.authority {
+        let Some(ttl) = section_ttl(r, data) else {
+            continue;
+        };
         if auth.as_slice().len() + rr_upper_bound(r) + opt_reserve > limit {
             break;
         }
-        if push_record(&mut auth, r, data.ttl_override).is_err() {
+        if push_record(&mut auth, r, ttl).is_err() {
             break;
         }
     }
 
     let mut add = auth.additional();
     for r in data.additional {
+        let Some(ttl) = section_ttl(r, data) else {
+            continue;
+        };
         if add.as_slice().len() + rr_upper_bound(r) + opt_reserve > limit {
             break;
         }
-        if push_record(&mut add, r, data.ttl_override).is_err() {
+        if push_record(&mut add, r, ttl).is_err() {
             break;
         }
     }
@@ -965,13 +1056,9 @@ impl AnswerOrder {
 fn push_record<T: Composer, B: domain::base::message_builder::RecordSectionBuilder<T>>(
     builder: &mut B,
     r: &OwnedRecord,
-    ttl_override: Option<u32>,
+    ttl: u32,
 ) -> Result<(), domain::base::message_builder::PushError> {
-    let ttl = match ttl_override {
-        Some(secs) => Ttl::from_secs(secs),
-        None => r.ttl(),
-    };
-    builder.push((r.owner(), r.class(), ttl, r.data()))
+    builder.push((r.owner(), r.class(), Ttl::from_secs(ttl), r.data()))
 }
 
 /// Build a normalized upstream query: fresh random ID, RD set, EDNS0 OPT with
@@ -1047,6 +1134,7 @@ mod tests {
         assert_eq!(min_ttl(&answers), Some(3600));
 
         let data = ResponseData {
+            age: None,
             rcode: Rcode::NOERROR,
             answers: &answers,
             authority: &[],
@@ -1103,6 +1191,7 @@ mod tests {
         assert!(!upq.opt().unwrap().dnssec_ok(), "DO must not go upstream");
 
         let data = ResponseData {
+            age: None,
             rcode: Rcode::NOERROR,
             answers: &[],
             authority: &[],
@@ -1160,6 +1249,7 @@ mod tests {
         let req = Message::from_octets(make_query("example.com.", Rtype::A)).unwrap();
         let answers: Vec<OwnedRecord> = (0..100u8).map(|i| a_record("example.com.", i)).collect();
         let data = ResponseData {
+            age: None,
             rcode: Rcode::NOERROR,
             answers: &answers,
             authority: &[],
@@ -1208,7 +1298,10 @@ mod tests {
             (250, Some(MAX_UDP_RESPONSE)),
             (250, Some(u16::MAX)),
         ] {
-            let edns = advertised.map(|udp_size| ClientEdns { udp_size });
+            let edns = advertised.map(|udp_size| ClientEdns {
+                udp_size,
+                version: 0,
+            });
             let limit = udp_response_limit(edns);
             let mut req_bytes = multi_question_query(count, edns);
             // Non-query opcode, RD, and flags that a response must clear.
@@ -1217,6 +1310,7 @@ mod tests {
             let req = Message::from_octets(req_bytes).unwrap();
             for rcode in [Rcode::FORMERR, Rcode::NOTIMP] {
                 let data = ResponseData {
+                    age: None,
                     rcode,
                     answers: &[],
                     authority: &[],
@@ -1263,10 +1357,14 @@ mod tests {
     #[test]
     fn error_responses_retain_questions_that_fit_udp_budget() {
         for (count, advertised) in [(100, None), (97, Some(512)), (200, Some(1200))] {
-            let edns = advertised.map(|udp_size| ClientEdns { udp_size });
+            let edns = advertised.map(|udp_size| ClientEdns {
+                udp_size,
+                version: 0,
+            });
             let req_bytes = multi_question_query(count, edns);
             let req = Message::from_octets(req_bytes.clone()).unwrap();
             let data = ResponseData {
+                age: None,
                 rcode: Rcode::FORMERR,
                 answers: &[],
                 authority: &[],
@@ -1290,6 +1388,7 @@ mod tests {
         let req = Message::from_octets(make_query("example.com.", Rtype::A)).unwrap();
         let answers = vec![a_record("example.com.", 1)];
         let data = ResponseData {
+            age: None,
             rcode: Rcode::NOERROR,
             answers: &answers,
             authority: &[],
@@ -1325,6 +1424,64 @@ mod tests {
         add.finish()
     }
 
+    /// RFC 6891 §6.1.3 wire shape: BADVERS split between the header and the
+    /// OPT, the OPT naming version 0, the question echoed, nothing else.
+    #[test]
+    fn a_badvers_reply_carries_the_split_rcode_and_our_version() {
+        for (version, size) in [(1u8, 4096u16), (255, 512), (7, 100)] {
+            let mut q = query_with_edns(size);
+            let qend = question_end(&q).unwrap();
+            q[qend + 6] = version;
+            let req = Message::from_octets(q.clone()).unwrap();
+            let edns = edns_of(&req).expect("an OPT");
+            assert_eq!(edns.version, version);
+            let mut out = vec![0xAA; 600]; // replaced, not appended to
+            build_badvers_into(&req, edns, &mut out);
+            assert_eq!(out[..2], q[..2], "id");
+            assert_eq!(out[2], 0x80 | (q[2] & 0x79), "QR, opcode and RD");
+            assert_eq!(out[3], 0x80, "RA, header rcode bits zero");
+            assert_eq!(
+                out[4..12],
+                [0, 1, 0, 0, 0, 0, 0, 1],
+                "one question, one OPT"
+            );
+            assert_eq!(out[12..qend], q[12..qend], "question verbatim");
+            let echoed = size.clamp(512, MAX_UDP_RESPONSE).to_be_bytes();
+            assert_eq!(
+                out[qend..],
+                [0, 0, 41, echoed[0], echoed[1], 1, 0, 0, 0, 0, 0],
+                "OPT: extended rcode 1, version 0, no flags, no options"
+            );
+            let m = Message::from_octets(out).unwrap();
+            assert_eq!(m.opt_rcode(), domain::base::iana::OptRcode::BADVERS);
+            assert_eq!(m.opt().unwrap().version(), 0);
+        }
+    }
+
+    /// A question that cannot be copied verbatim is left out rather than
+    /// rebuilt: the reply must still be a well-formed BADVERS.
+    #[test]
+    fn a_badvers_reply_without_an_echoable_question_is_still_well_formed() {
+        let one = query_with_edns(1232);
+        let qend = question_end(&one).unwrap();
+        // Two copies of the question, so the count says 2.
+        let mut two = one[..qend].to_vec();
+        two.extend_from_slice(&one[12..qend]);
+        two.extend_from_slice(&one[qend..]);
+        two[5] = 2;
+        let req = Message::from_octets(two).unwrap();
+        let edns = ClientEdns {
+            udp_size: 1232,
+            version: 3,
+        };
+        let mut out = Vec::new();
+        build_badvers_into(&req, edns, &mut out);
+        assert_eq!(out.len(), 12 + OPT_WIRE_LEN);
+        assert_eq!(out[4..12], [0, 0, 0, 0, 0, 0, 0, 1]);
+        let m = Message::from_octets(out).unwrap();
+        assert_eq!(m.opt_rcode(), domain::base::iana::OptRcode::BADVERS);
+    }
+
     #[test]
     fn response_opt_echoes_clamped_client_size() {
         for (advertised, want) in [
@@ -1337,6 +1494,7 @@ mod tests {
             let mut scratch = QueryScratch::new();
             let info = extract_query(&req, &mut scratch).unwrap();
             let data = ResponseData {
+                age: None,
                 rcode: Rcode::NOERROR,
                 answers: &[],
                 authority: &[],
@@ -1413,6 +1571,7 @@ mod tests {
             .map(|i| a_record(LONG_NAME, (i % 256) as u8))
             .collect();
         let data = ResponseData {
+            age: None,
             rcode: Rcode::NOERROR,
             answers: &answers,
             authority: &[],
@@ -1542,6 +1701,7 @@ mod tests {
             ),
         ];
         let data = ResponseData {
+            age: None,
             rcode: Rcode::NOERROR,
             answers: &answers,
             authority: &[],
@@ -1688,11 +1848,29 @@ mod tests {
             ] {
                 for edns in [
                     None,
-                    Some(ClientEdns { udp_size: 1232 }),
-                    Some(ClientEdns { udp_size: 200 }),
-                    Some(ClientEdns { udp_size: 9000 }),
+                    Some(ClientEdns {
+                        udp_size: 1232,
+                        version: 0,
+                    }),
+                    Some(ClientEdns {
+                        udp_size: 200,
+                        version: 0,
+                    }),
+                    Some(ClientEdns {
+                        udp_size: 9000,
+                        version: 0,
+                    }),
                 ] {
-                    for ttl_override in [None, Some(1), Some(86400)] {
+                    for (ttl_override, age) in [
+                        (None, None),
+                        (Some(1), None),
+                        (Some(86400), None),
+                        // Cached answers: some optional records still live,
+                        // and every one of them expired.
+                        (Some(30), Some(0)),
+                        (Some(30), Some(200)),
+                        (Some(1), Some(5000)),
+                    ] {
                         for (ans, auth, add) in [
                             (&answers[..], &authority[..], &additional[..]),
                             (&answers[..1], &[][..], &[][..]),
@@ -1700,6 +1878,7 @@ mod tests {
                             (&[][..], &[][..], &[][..]),
                         ] {
                             let data = ResponseData {
+                                age,
                                 rcode,
                                 answers: ans,
                                 authority: auth,
@@ -1721,7 +1900,7 @@ mod tests {
                                 fast,
                                 slow,
                                 "mismatch: rcode={rcode:?} edns={edns:?} ttl={ttl_override:?} \
-                                 an={} ns={} ar={} req={raw:?}",
+                                 age={age:?} an={} ns={} ar={} req={raw:?}",
                                 ans.len(),
                                 auth.len(),
                                 add.len()
@@ -1737,6 +1916,94 @@ mod tests {
         assert!(checked >= 300, "only {checked} combinations checked");
     }
 
+    /// A cached answer goes out with the entry's remaining life on its
+    /// answers, but the records beside them keep their own clocks: the entry
+    /// lives as long as its shortest *answer*, so an authority or additional
+    /// record with a shorter TTL would otherwise be handed out for longer than
+    /// the upstream allowed — even after it expired.
+    #[test]
+    fn cached_records_beside_the_answers_count_down_on_their_own() {
+        use domain::rdata::Ns;
+        let n = |s: &str| Name::<Vec<u8>>::from_str(s).unwrap();
+        let rec = |owner: &str, data: OwnedData, ttl: u32| {
+            OwnedRecord::new(n(owner), Class::IN, Ttl::from_secs(ttl), data)
+        };
+        let answers = [rec(
+            "www.example.com.",
+            OwnedData::A(A::from_octets(1, 2, 3, 4)),
+            300,
+        )];
+        let authority = [rec(
+            "example.com.",
+            OwnedData::Ns(Ns::new(n("ns.example.com."))),
+            30,
+        )];
+        let additional = [
+            rec(
+                "ns.example.com.",
+                OwnedData::A(A::from_octets(9, 9, 9, 9)),
+                5,
+            ),
+            rec(
+                "ns2.example.com.",
+                OwnedData::A(A::from_octets(8, 8, 8, 8)),
+                100,
+            ),
+        ];
+        let req = Message::from_octets(make_query("www.example.com.", Rtype::A)).unwrap();
+        // Six seconds after the upstream answered.
+        let data = ResponseData {
+            age: Some(6),
+            rcode: Rcode::NOERROR,
+            answers: &answers,
+            authority: &authority,
+            additional: &additional,
+            ttl_override: Some(294),
+            edns: None,
+            shuffle_qtype: Some(Rtype::A),
+        };
+        let ttls = |msg: &Message<Vec<u8>>| -> [Vec<(String, u32)>; 3] {
+            let section = |s: domain::base::message::RecordSection<'_, Vec<u8>>| {
+                s.limit_to::<AllRecordData<_, _>>()
+                    .map(|r| {
+                        let r = r.unwrap();
+                        (r.owner().to_string(), r.ttl().as_secs())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            [
+                section(msg.answer().unwrap()),
+                section(msg.authority().unwrap()),
+                section(msg.additional().unwrap()),
+            ]
+        };
+        let expected = [
+            vec![("www.example.com".to_string(), 294)],
+            vec![("example.com".to_string(), 24)],
+            vec![("ns2.example.com".to_string(), 94)],
+        ];
+        // The plain build, and the size-bounded one a small UDP budget forces.
+        let plain = parse(build_response(&req, &data, None)).unwrap();
+        assert_eq!(ttls(&plain), expected);
+        let fitted = assemble_fitted(&req, &data, 512);
+        assert_eq!(ttls(&parse(fitted).unwrap()), expected);
+
+        // Once the entry's clock passes every optional record, only the
+        // answers are left — and the counts say so.
+        let late = ResponseData {
+            age: Some(150),
+            ttl_override: Some(150),
+            ..data
+        };
+        let msg = parse(build_response(&req, &late, None)).unwrap();
+        assert_eq!(ttls(&msg)[0], vec![("www.example.com".to_string(), 150)]);
+        assert!(ttls(&msg)[1].is_empty() && ttls(&msg)[2].is_empty());
+        assert_eq!(
+            (msg.header_counts().nscount(), msg.header_counts().arcount()),
+            (0, 0)
+        );
+    }
+
     /// With the shuffle on, the two builds legitimately differ in record order,
     /// so compare content instead: same header, same record multiset.
     #[test]
@@ -1744,12 +2011,16 @@ mod tests {
         let req = Message::from_octets(make_query("example.com.", Rtype::A)).unwrap();
         let answers: Vec<OwnedRecord> = (0..6u8).map(|i| a_record("example.com.", i)).collect();
         let data = ResponseData {
+            age: None,
             rcode: Rcode::NOERROR,
             answers: &answers,
             authority: &[],
             additional: &[],
             ttl_override: None,
-            edns: Some(ClientEdns { udp_size: 1232 }),
+            edns: Some(ClientEdns {
+                udp_size: 1232,
+                version: 0,
+            }),
             shuffle_qtype: Some(Rtype::A),
         };
         let sorted = |bytes: Vec<u8>| -> (Vec<u8>, Vec<String>) {
@@ -1793,8 +2064,8 @@ mod tests {
                 if opt_after_question(&bytes, None).is_some() {
                     fast_used += 1;
                 }
-                let fast = edns_of(&msg).map(|e| e.udp_size);
-                let slow = edns_of_slow(&msg).map(|e| e.udp_size);
+                let fast = edns_of(&msg).map(|e| (e.udp_size, e.version));
+                let slow = edns_of_slow(&msg).map(|e| (e.udp_size, e.version));
                 assert_eq!(fast, slow, "disagreement on {bytes:?}");
                 agreed += 1;
             }
@@ -1886,6 +2157,7 @@ mod tests {
         let info = extract_query(&req, &mut scratch).unwrap();
         let answers: Vec<OwnedRecord> = (0..200).map(|i| a_record(LONG_NAME, i as u8)).collect();
         let data = ResponseData {
+            age: None,
             rcode: Rcode::NOERROR,
             answers: &answers,
             authority: &[],
@@ -2219,7 +2491,13 @@ mod tests {
                 (Rtype::AAAA, &v6),
             ] {
                 for count in [1usize, 2, 5, 8, 32] {
-                    for edns in [None, Some(ClientEdns { udp_size: 1232 })] {
+                    for edns in [
+                        None,
+                        Some(ClientEdns {
+                            udp_size: 1232,
+                            version: 0,
+                        }),
+                    ] {
                         let req = Message::from_octets(make_query(name, qtype)).unwrap();
                         let ips: Vec<std::net::IpAddr> = (0..count).map(mk).collect();
                         let owner_name = req.first_question().unwrap().qname().to_vec();
@@ -2245,6 +2523,7 @@ mod tests {
                             })
                             .collect();
                         let data = ResponseData {
+                            age: None,
                             rcode: Rcode::NOERROR,
                             answers: &answers,
                             authority: &[],
@@ -2345,6 +2624,7 @@ mod tests {
             OwnedData::A(A::from_octets(10, 0, 0, 1)),
         )];
         let data = ResponseData {
+            age: None,
             rcode: Rcode::NOERROR,
             answers: &answers,
             authority: &[],
@@ -2366,12 +2646,16 @@ mod tests {
                 .collect();
             for limit in [Some(512u16), None] {
                 let data = ResponseData {
+                    age: None,
                     rcode: Rcode::NOERROR,
                     answers: &answers,
                     authority: &[],
                     additional: &[],
                     ttl_override: None,
-                    edns: Some(ClientEdns { udp_size: 1232 }),
+                    edns: Some(ClientEdns {
+                        udp_size: 1232,
+                        version: 0,
+                    }),
                     shuffle_qtype: None,
                 };
                 build_response_into(&req, &data, limit, &mut reused);

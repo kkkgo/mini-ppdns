@@ -41,6 +41,10 @@ pub struct Config {
     pub pplog_heart_beat: i64,
 
     pub hosts: HashMap<String, Vec<IpAddr>>,
+    /// The name a `[hosts]` address answers reverse lookups with: the first
+    /// name on its line, as in a hosts file, and the latest line naming the
+    /// address wins, as it does across a hosts file's lines.
+    pub hosts_ptr: HashMap<IpAddr, String>,
     pub hook: Option<HookConfig>,
 }
 
@@ -69,6 +73,7 @@ impl Default for Config {
             pplog_level: 0,
             pplog_heart_beat: 0,
             hosts: HashMap::new(),
+            hosts_ptr: HashMap::new(),
             hook: None,
         }
     }
@@ -209,6 +214,7 @@ fn parse_hosts(line: &str, cfg: &mut Config, warnings: &mut Vec<String>) {
             return;
         }
     };
+    let mut canonical = true;
     for domain in &fields[1..] {
         if *domain == "*" || domain.is_empty() {
             continue;
@@ -218,6 +224,9 @@ fn parse_hosts(line: &str, cfg: &mut Config, warnings: &mut Vec<String>) {
             .unwrap_or(domain)
             .to_ascii_lowercase();
         let key = format!("{base}.");
+        if std::mem::take(&mut canonical) {
+            cfg.hosts_ptr.insert(ip, key.clone());
+        }
         // Same reason as the hosts-file loader: no duplicate RRs.
         let ips = cfg.hosts.entry(key).or_default();
         if !ips.contains(&ip) {
@@ -282,6 +291,29 @@ fn parse_hook(line: &str, cfg: &mut Config, warnings: &mut Vec<String>) {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A `[hosts]` line's first name is the one its address answers reverse
+    /// lookups with, like a hosts file's; a later line for the same address
+    /// takes over, also like a hosts file's.
+    #[test]
+    fn a_hosts_line_records_its_first_name_as_the_reverse_name() {
+        let (cfg, _) = parse_str(
+            "[hosts]\n10.0.0.5 NAS.lan files.lan\n10.0.0.6 * Printer.lan. scan.lan\n\
+             10.0.0.7 old.lan\n10.0.0.7 new.lan\n",
+        );
+        let ptr = |a: &str| cfg.hosts_ptr.get(&a.parse::<IpAddr>().unwrap()).cloned();
+        assert_eq!(ptr("10.0.0.5").as_deref(), Some("nas.lan."));
+        assert_eq!(
+            ptr("10.0.0.6").as_deref(),
+            Some("printer.lan."),
+            "`*` is not a name"
+        );
+        assert_eq!(ptr("10.0.0.7").as_deref(), Some("new.lan."));
+        assert!(
+            cfg.hosts.contains_key("old.lan."),
+            "the forward entry stays"
+        );
+    }
 
     #[test]
     fn a_hosts_entry_repeated_in_the_config_is_kept_once() {

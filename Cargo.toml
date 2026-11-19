@@ -14,6 +14,9 @@ path = "src/main.rs"
 chacha20poly1305 = "0.11.0"
 domain = "0.12.1"
 getrandom = "0.4.3"
+# Already in the tree through `domain`. The cache's `HashTable` exposes its
+# buckets, which is what uniform eviction sampling draws from.
+hashbrown = { version = "0.17", default-features = false }
 if-addrs = "0.13"
 libc = "0.2.186"
 socket2 = "0.6"

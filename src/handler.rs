@@ -182,15 +182,13 @@ struct RouteDecision {
     fallback_ttl1: bool,
 }
 
-/// Human-readable rcode label for logs. Borrowed for every label known
-/// statically: labels are built on the cache-hit and upstream-response paths
-/// *before* `dlog` gets to check whether debug logging is on (arguments are
-/// evaluated first), so an owned `String` here would allocate on every query
-/// whether or not the line is ever emitted.
-/// Main queries still running after the client was answered from the fallback.
-/// Each holds an upstream socket, so the number that may linger is capped.
+/// How many main queries may keep running after their client was answered
+/// from the fallback. Each holds the main fan-out's sockets with no front-end
+/// permit to account for them, so the descriptor budget reserves room for
+/// this many (see `app::caps_for`).
+pub const MAX_LINGERING_MAIN: usize = 64;
 static HEDGE_TASKS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
-    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(64)));
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_LINGERING_MAIN)));
 /// What the main stage reports when it never produced an answer of its own:
 /// the fallback won the race, or the query was dropped.
 fn lost_race() -> crate::upstream::ForwardResult {
@@ -209,6 +207,18 @@ fn is_upstream_error(rcode: Rcode) -> bool {
         Rcode::SERVFAIL | Rcode::REFUSED | Rcode::NOTIMP | Rcode::FORMERR
     )
 }
+/// Whether a fallback result is no answer at all: nothing came back, or only
+/// an error code. NXDOMAIN and NODATA are answers.
+fn fallback_failed(r: &crate::upstream::ForwardResult) -> bool {
+    r.response
+        .as_ref()
+        .is_none_or(|m| is_upstream_error(m.header().rcode()))
+}
+/// Human-readable rcode label for logs. Borrowed for every label known
+/// statically: labels are built on the cache-hit and upstream-response paths
+/// *before* `dlog` gets to check whether debug logging is on (arguments are
+/// evaluated first), so an owned `String` here would allocate on every query
+/// whether or not the line is ever emitted.
 fn rcode_label(rcode: Rcode, empty_answer: bool) -> Cow<'static, str> {
     match rcode {
         Rcode::NOERROR if empty_answer => Cow::Borrowed("NODATA"),
@@ -261,12 +271,12 @@ fn seal(info: &QueryInfo<'_>, mut parts: Parts) -> (CacheKey, Arc<CachedMsg>) {
     parts.answers.shrink_to_fit();
     parts.authority.shrink_to_fit();
     parts.additional.shrink_to_fit();
-    let cached = Arc::new(CachedMsg {
-        rcode: parts.rcode,
-        answers: parts.answers,
-        authority: parts.authority,
-        additional: parts.additional,
-    });
+    let cached = Arc::new(CachedMsg::new(
+        parts.rcode,
+        parts.answers,
+        parts.authority,
+        parts.additional,
+    ));
     let key = CacheKey::with_hash(
         info.lower().to_vec(),
         info.qtype.to_int(),
@@ -334,6 +344,15 @@ impl Handler {
             return FastOutcome::Reply;
         };
 
+        // An EDNS version we do not implement gets BADVERS before anything
+        // else looks at the query (RFC 6891 §6.1.3): an answer composed under
+        // version 0 rules is not an answer to a version-1 query.
+        if let Some(edns) = info.client_edns.filter(|e| e.version != dns::EDNS_VERSION) {
+            self.dlog("badvers", &info, client, None, "BADVERS", None, None);
+            dns::build_badvers_into(&msg, edns, out);
+            return FastOutcome::Reply;
+        }
+
         let udp_limit = if is_udp {
             Some(dns::udp_response_limit(info.client_edns))
         } else {
@@ -353,7 +372,8 @@ impl Handler {
             (&self.cache, "cache")
         };
         {
-            if let Some((cached, ttl_left)) = cache.get(&key_of(&info)) {
+            if let Some(hit) = cache.hit(&key_of(&info)) {
+                let cached = &hit.msg;
                 // The stored TTL is always the upstream's own. Only what the
                 // client sees is capped, and only for failover — so a hook-down
                 // hit still serves TTL=1 and the client re-asks (and lands back
@@ -361,7 +381,7 @@ impl Handler {
                 let ttl_left = if route.force && route.fallback_ttl1 {
                     1
                 } else {
-                    ttl_left
+                    hit.ttl_left
                 };
                 let empty = cached.rcode == Rcode::NOERROR && cached.answers.is_empty();
                 self.dlog(
@@ -388,7 +408,7 @@ impl Handler {
                     &info,
                     client,
                 );
-                self.build_cached(&msg, &info, &cached, ttl_left, udp_limit, out);
+                self.build_cached(&msg, &info, cached, ttl_left, hit.age, udp_limit, out);
                 return FastOutcome::Reply;
             }
         }
@@ -857,7 +877,9 @@ impl Handler {
 
     /// Ask the main DNS, and once [`Handler::hedge_after`] has passed with no
     /// answer, start the fallback *alongside* it rather than giving up on it.
-    /// Whichever answers first wins the race.
+    /// The first to answer wins the race; a fallback that only fails — no
+    /// reply, or an error code — leaves the main to finish within its own
+    /// deadline, and the fallback stage still gets that failure to fall back on.
     ///
     /// Not cancelling the main query is the point: a self-hosted recursive
     /// resolver often needs longer than `qtime` for a cold name, and its
@@ -911,9 +933,19 @@ impl Handler {
                     // The main came through after all: its answer is the one
                     // this client wanted. The fallback query is dropped.
                     result = &mut main_fut => (result, None),
-                    // The fallback got there first. Dropping `main_fut` detaches
-                    // the spawned query rather than cancelling it.
-                    fall = &mut fall_fut => (lost_race(), Some(Hedged::Fresh(fall))),
+                    // The fallback finished first but could not answer: that
+                    // ends nothing. The main may still answer within its own
+                    // deadline, which bounds this wait; once its breaker is
+                    // open, it fails at once and there is nothing to wait for.
+                    fall = &mut fall_fut => {
+                        if fallback_failed(&fall) {
+                            (main_fut.await, Some(Hedged::Fresh(fall)))
+                        } else {
+                            // A real answer wins. Dropping `main_fut` detaches
+                            // the spawned query rather than cancelling it.
+                            (lost_race(), Some(Hedged::Fresh(fall)))
+                        }
+                    }
                 }
             }
         }
@@ -1397,16 +1429,22 @@ impl Handler {
         cache.store(key, cached, ttl);
     }
 
+    /// Answer from a cache entry: the answers with `ttl_left`, every other
+    /// record counted down by `age` from its own TTL (see
+    /// [`ResponseData::age`]).
+    #[allow(clippy::too_many_arguments)]
     fn build_cached<Octs: domain::dep::octseq::Octets + ?Sized>(
         &self,
         msg: &Message<Octs>,
         info: &QueryInfo<'_>,
         cached: &CachedMsg,
         ttl_left: u32,
+        age: u32,
         udp_limit: Option<u16>,
         out: &mut Vec<u8>,
     ) {
         let data = ResponseData {
+            age: Some(age),
             rcode: cached.rcode,
             answers: &cached.answers,
             authority: &cached.authority,
@@ -1457,6 +1495,7 @@ impl Handler {
         out: &mut Vec<u8>,
     ) {
         let data = ResponseData {
+            age: None,
             rcode,
             answers: &parts.answers,
             authority: &parts.authority,
@@ -1715,6 +1754,107 @@ mod tests {
         b.finish()
     }
 
+    /// An answer with an NS authority record and two glue records, TTLs 30,
+    /// 5 and 100 against the answer's 300.
+    fn answer_with_sections(q: &Message<Vec<u8>>) -> Vec<u8> {
+        use domain::rdata::Ns;
+        let name = q.sole_question().unwrap().qname().to_vec();
+        let n = |s: &str| Name::<Vec<u8>>::from_str(s).unwrap();
+        let mut b = MessageBuilder::new_vec()
+            .start_answer(q, Rcode::NOERROR)
+            .unwrap();
+        b.push((
+            &name,
+            Class::IN,
+            Ttl::from_secs(300),
+            A::from_octets(10, 0, 0, 1),
+        ))
+        .unwrap();
+        let mut b = b.authority();
+        b.push((
+            n("example.com."),
+            Class::IN,
+            Ttl::from_secs(30),
+            Ns::new(n("ns.example.com.")),
+        ))
+        .unwrap();
+        let mut b = b.additional();
+        b.push((
+            n("ns.example.com."),
+            Class::IN,
+            Ttl::from_secs(5),
+            A::from_octets(10, 9, 9, 9),
+        ))
+        .unwrap();
+        b.push((
+            n("ns2.example.com."),
+            Class::IN,
+            Ttl::from_secs(100),
+            A::from_octets(10, 9, 9, 8),
+        ))
+        .unwrap();
+        b.finish()
+    }
+
+    /// With lite off, a cached answer keeps the upstream's authority and
+    /// additional records, and each must expire on its own clock. The entry
+    /// lives as long as its answer: serving a 5-second glue record or a
+    /// 30-second NS record for the answer's 300 seconds hands clients data
+    /// the upstream told them to drop long ago.
+    #[tokio::test]
+    async fn a_cache_hit_never_extends_the_records_beside_the_answer() {
+        let up = spawn_mock(answer_with_sections).await;
+        let mut h = mk(vec![up], dead());
+        h.lite = false;
+        let fresh = ask(&h, "www.example.com.", Rtype::A, "10.0.0.1").await;
+        let sections = |bytes: &[u8]| -> [Vec<(String, u32)>; 3] {
+            let m = parse_resp(bytes);
+            let read = |s: domain::base::message::RecordSection<'_, Vec<u8>>| {
+                s.limit_to::<AllRecordData<_, _>>()
+                    .map(|r| {
+                        let r = r.unwrap();
+                        (r.owner().to_string(), r.ttl().as_secs())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            [
+                read(m.answer().unwrap()),
+                read(m.authority().unwrap()),
+                read(m.additional().unwrap()),
+            ]
+        };
+        assert_eq!(sections(&fresh)[1], vec![("example.com".to_string(), 30)]);
+
+        h.cache.age_entry(
+            &cache_key("www.example.com.", Rtype::A),
+            Duration::from_secs(10),
+        );
+        let hit = sections(&ask(&h, "www.example.com.", Rtype::A, "10.0.0.1").await);
+        // The entry's own remaining life, rounded down: 290 or a hair under.
+        assert!(matches!(hit[0][..], [(_, 289..=290)]), "{:?}", hit[0]);
+        assert_eq!(
+            hit[1],
+            vec![("example.com".to_string(), 20)],
+            "the NS record counts down from its own TTL"
+        );
+        assert_eq!(
+            hit[2],
+            vec![("ns2.example.com".to_string(), 90)],
+            "expired glue is dropped, live glue counts down"
+        );
+
+        h.cache.age_entry(
+            &cache_key("www.example.com.", Rtype::A),
+            Duration::from_secs(100),
+        );
+        let late = sections(&ask(&h, "www.example.com.", Rtype::A, "10.0.0.1").await);
+        assert!(matches!(late[0][..], [(_, 189..=190)]), "{:?}", late[0]);
+        assert!(
+            late[1].is_empty() && late[2].is_empty(),
+            "nothing but the answer outlives its TTL: {late:?}"
+        );
+    }
+
     /// Spawn a UDP mock upstream; returns its `udp://ip:port` label.
     async fn spawn_mock<F>(f: F) -> String
     where
@@ -1803,6 +1943,7 @@ mod tests {
         let (_, ttl) = cache.get(&key).expect("negative entry cached");
         cache.age_entry(&key, Duration::from_secs(u64::from(ttl) + 1));
         let msg = Arc::new(CachedMsg {
+            stored: std::time::Instant::now(),
             rcode: Rcode::NXDOMAIN,
             answers: vec![],
             authority: vec![],
@@ -2040,13 +2181,7 @@ mod tests {
         let main = spawn_mock(|q| answer(q, Rcode::NOERROR, &[([1, 2, 3, 4], 300)])).await;
         let fall = spawn_mock(|q| negative(q, Rcode::NXDOMAIN, 86_400, 86_400)).await;
         let mut h = mk(vec![main], vec![fall]);
-        h.force_fall = ForceFallMatcher {
-            include: vec![crate::forcefall::IpPrefix::new(
-                "127.0.0.1".parse().unwrap(),
-                32,
-            )],
-            negate: vec![],
-        };
+        h.force_fall = ForceFallMatcher::new(&[parse_prefix("127.0.0.1/32").unwrap()], &[]);
         let out = ask(&h, "gone.example.com.", Rtype::A, "127.0.0.1").await;
         assert_eq!(parse_resp(&out).header().rcode(), Rcode::NXDOMAIN);
         assert!(
@@ -2225,6 +2360,124 @@ mod tests {
             h.main.breaker_is_open(),
             "a main that never answers must still be recognised as down"
         );
+    }
+
+    /// A UDP mock answering every query with an empty response of `rcode`.
+    async fn spawn_rcode_mock(rcode: Rcode) -> String {
+        spawn_mock(move |q| {
+            MessageBuilder::new_vec()
+                .start_answer(q, rcode)
+                .unwrap()
+                .finish()
+        })
+        .await
+    }
+
+    /// A fallback that fails fast must not cost the client an answer the main
+    /// DNS is still on its way to giving: the race goes to the first real
+    /// answer, not the first reply.
+    #[tokio::test]
+    async fn a_fast_failing_fallback_does_not_beat_a_slow_main_answer() {
+        for fall in [
+            spawn_rcode_mock(Rcode::SERVFAIL).await,
+            spawn_rcode_mock(Rcode::REFUSED).await,
+            // Nothing listens there: the send is refused at once.
+            "udp://127.0.0.1:1".to_string(),
+        ] {
+            let (main, _) = spawn_delayed_mock(Duration::from_millis(150), [1, 1, 1, 1]).await;
+            let h = mk_timed(vec![main], vec![fall.clone()], 20, 1500, 1200);
+            let out = ask(&h, "coldname.example.com.", Rtype::A, "127.0.0.1").await;
+            assert_eq!(
+                parse_resp(&out).header().rcode(),
+                Rcode::NOERROR,
+                "fallback {fall}: the main's late answer must be served"
+            );
+            assert_eq!(first_addr(&out), Some([1, 1, 1, 1]), "fallback {fall}");
+            // It is a main answer like any other: own TTL, main cache.
+            assert_eq!(first_ttl(&out), Some(300), "fallback {fall}");
+            assert!(
+                !h.cache.is_empty(),
+                "fallback {fall}: cached as a main answer"
+            );
+        }
+    }
+
+    /// The wait for the main is bounded by the main's own deadline; when the
+    /// main never answers, the fallback's failure is what the client gets.
+    #[tokio::test]
+    async fn a_failing_fallback_waits_only_for_the_mains_deadline() {
+        let (main, _) = spawn_silent_mock().await;
+        let fall = spawn_rcode_mock(Rcode::SERVFAIL).await;
+        let h = mk_timed(vec![main], vec![fall], 20, 300, 1200);
+        let started = std::time::Instant::now();
+        let out = ask(&h, "bothdown.example.com.", Rtype::A, "127.0.0.1").await;
+        let took = started.elapsed();
+        assert_eq!(parse_resp(&out).header().rcode(), Rcode::SERVFAIL);
+        assert!(
+            took >= Duration::from_millis(250),
+            "the main still had time left when the fallback failed ({took:?})"
+        );
+        assert!(
+            took < Duration::from_millis(900),
+            "nothing may wait past the main's deadline ({took:?})"
+        );
+        assert!(h.fall_cache.is_empty(), "an error code is not cached");
+    }
+
+    /// A main that answers a definite negative after the fallback failed still
+    /// wins over that failure, under the same rule as when it answers first.
+    #[tokio::test]
+    async fn a_late_main_negative_beats_a_fallback_that_failed_first() {
+        let main_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let main = format!("udp://{}", main_sock.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, peer)) = main_sock.recv_from(&mut buf).await {
+                let q = crate::dns::parse(buf[..n].to_vec()).unwrap();
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let _ = main_sock
+                    .send_to(&negative(&q, Rcode::NXDOMAIN, 900, 900), peer)
+                    .await;
+            }
+        });
+        let fall_asked = Arc::new(AtomicU32::new(0));
+        let seen = fall_asked.clone();
+        let fall = spawn_mock(move |q| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            MessageBuilder::new_vec()
+                .start_answer(q, Rcode::SERVFAIL)
+                .unwrap()
+                .finish()
+        })
+        .await;
+        let h = mk_timed(vec![main], vec![fall], 20, 1500, 1200);
+        let out = ask(&h, "absent.example.com.", Rtype::A, "127.0.0.1").await;
+        assert_eq!(parse_resp(&out).header().rcode(), Rcode::NXDOMAIN);
+        assert_eq!(
+            fall_asked.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the failure the hedge already has is reused, not asked for again"
+        );
+    }
+
+    /// The rule is only about failures: a fallback that does answer — NXDOMAIN
+    /// included — still ends the race at once.
+    #[tokio::test]
+    async fn a_fallback_that_answers_first_still_wins() {
+        let fall_nx = spawn_mock(|q| negative(q, Rcode::NXDOMAIN, 900, 900)).await;
+        let (fall_a, _) = spawn_delayed_mock(Duration::from_millis(1), [2, 2, 2, 2]).await;
+        for (fall, rcode) in [(fall_a, Rcode::NOERROR), (fall_nx, Rcode::NXDOMAIN)] {
+            let (main, _) = spawn_delayed_mock(Duration::from_millis(600), [1, 1, 1, 1]).await;
+            let h = mk_timed(vec![main], vec![fall], 20, 1500, 1200);
+            let started = std::time::Instant::now();
+            let out = ask(&h, "race.example.com.", Rtype::A, "127.0.0.1").await;
+            let took = started.elapsed();
+            assert_eq!(parse_resp(&out).header().rcode(), rcode);
+            assert!(
+                took < Duration::from_millis(400),
+                "a {rcode} fallback answer must not wait for the main ({took:?})"
+            );
+        }
     }
 
     /// The other half of that bargain: a main that is merely slower than the
@@ -2478,6 +2731,7 @@ mod tests {
         h.cache.store(
             key,
             Arc::new(CachedMsg {
+                stored: std::time::Instant::now(),
                 rcode: Rcode::NOERROR,
                 answers: vec![a_rec("example.com.", [9, 9, 9, 9], 200)],
                 authority: vec![],
@@ -2496,9 +2750,7 @@ mod tests {
         let main = spawn_mock(|q| answer(q, Rcode::NOERROR, &[([1, 1, 1, 1], 60)])).await;
         let fall = spawn_mock(|q| answer(q, Rcode::NOERROR, &[([2, 2, 2, 2], 60)])).await;
         let mut h = mk(vec![main], vec![fall]);
-        h.force_fall
-            .include
-            .push(parse_prefix("127.0.0.1/32").unwrap());
+        h.force_fall = ForceFallMatcher::new(&[parse_prefix("127.0.0.1/32").unwrap()], &[]);
         let out = ask(&h, "example.com.", Rtype::A, "127.0.0.1").await;
         // Policy-routed clients keep the upstream TTL (only failover gets 1).
         assert_eq!(first_ttl(&out), Some(60));
@@ -2558,9 +2810,7 @@ mod tests {
         let main = spawn_mock(|q| answer(q, Rcode::NOERROR, &[([1, 1, 1, 1], 60)])).await;
         let fall = spawn_mock(|q| answer(q, Rcode::NOERROR, &[([2, 2, 2, 2], 60)])).await;
         let mut h = mk(vec![main], vec![fall]);
-        h.force_fall
-            .include
-            .push(parse_prefix("127.0.0.1/32").unwrap());
+        h.force_fall = ForceFallMatcher::new(&[parse_prefix("127.0.0.1/32").unwrap()], &[]);
         let out = ask(&h, "paopao.dns.", Rtype::A, "127.0.0.1").await;
         // Main is used, so the TTL is preserved (not the fallback's forced 1).
         assert_eq!(first_ttl(&out), Some(60));
@@ -2918,9 +3168,7 @@ mod tests {
         let main = spawn_mock(|q| answer(q, Rcode::NOERROR, &[([1, 1, 1, 1], 60)])).await;
         let fall = spawn_mock(|q| answer(q, Rcode::NOERROR, &[([2, 2, 2, 2], 60)])).await;
         let mut h = mk(vec![main], vec![fall]);
-        h.force_fall
-            .include
-            .push(parse_prefix("127.0.0.2/32").unwrap());
+        h.force_fall = ForceFallMatcher::new(&[parse_prefix("127.0.0.2/32").unwrap()], &[]);
 
         // Policy-routed client primes the fallback cache…
         assert_eq!(
@@ -3026,6 +3274,7 @@ mod tests {
         h.fall_cache.store(
             key.clone(),
             Arc::new(CachedMsg {
+                stored: std::time::Instant::now(),
                 rcode: Rcode::NOERROR,
                 answers: vec![a_rec("example.com.", [2, 2, 2, 2], 300)],
                 authority: vec![],
@@ -3117,6 +3366,127 @@ mod tests {
         add.finish()
     }
 
+    /// A query carrying an OPT of EDNS `version`, optionally behind another
+    /// additional record so the OPT is not where the fast reader looks.
+    fn query_with_edns_version(name: &str, qtype: Rtype, version: u8, opt_second: bool) -> Vec<u8> {
+        let mut b = MessageBuilder::new_vec();
+        b.header_mut().set_rd(true);
+        b.header_mut().set_id(0x5a5a);
+        let mut q = b.question();
+        q.push((Name::<Vec<u8>>::from_str(name).unwrap(), qtype))
+            .unwrap();
+        let mut add = q.additional();
+        if opt_second {
+            add.push((
+                Name::<Vec<u8>>::from_str("pad.example.").unwrap(),
+                Class::IN,
+                Ttl::from_secs(1),
+                A::from_octets(10, 0, 0, 1),
+            ))
+            .unwrap();
+        }
+        add.opt(|opt| {
+            opt.set_udp_payload_size(1232);
+            opt.set_version(version);
+            Ok(())
+        })
+        .unwrap();
+        add.finish()
+    }
+
+    fn assert_badvers(out: &[u8], name: &str, qtype: Rtype, what: &str) {
+        let m = parse_resp(out);
+        assert_eq!(m.header().id(), 0x5a5a, "{what}");
+        assert!(m.header().qr(), "{what}");
+        assert_eq!(
+            m.opt_rcode(),
+            domain::base::iana::OptRcode::BADVERS,
+            "{what}: the extended rcode must be BADVERS"
+        );
+        let opt = m.opt().expect("an OPT");
+        assert_eq!(
+            opt.version(),
+            0,
+            "{what}: the OPT names the version we speak"
+        );
+        assert_eq!(m.header_counts().ancount(), 0, "{what}: no answers");
+        assert_eq!(m.header_counts().nscount(), 0, "{what}");
+        let q = m.sole_question().expect("the question is echoed");
+        assert_eq!(q.qname().to_string(), name.trim_end_matches('.'), "{what}");
+        assert_eq!(q.qtype(), qtype, "{what}");
+    }
+
+    /// RFC 6891 §6.1.3: a responder that does not implement the requested
+    /// EDNS version answers BADVERS — on every path, before any local
+    /// rewrite, cache or upstream gets a say.
+    #[tokio::test]
+    async fn an_unsupported_edns_version_gets_badvers_on_every_path() {
+        let asked = Arc::new(AtomicU32::new(0));
+        let seen = asked.clone();
+        let main = spawn_mock(move |q| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            answer(q, Rcode::NOERROR, &[([1, 2, 3, 4], 300)])
+        })
+        .await;
+        let mut h = mk(vec![main], dead());
+        let mut hosts = HashMap::new();
+        hosts.insert(
+            "printer.lan.".to_string(),
+            vec!["10.0.0.9".parse().unwrap()],
+        );
+        h.resolver = PtrResolver::new(
+            vec![],
+            vec![],
+            AutoDetect {
+                lease: false,
+                hosts: false,
+            },
+            &hosts,
+        )
+        .map(Arc::new);
+        // A cached name: version 0 fills the cache first.
+        let warm = ask(&h, "cached.example.com.", Rtype::A, "127.0.0.1").await;
+        assert_eq!(answer_count(&warm), 1);
+        let before = asked.load(std::sync::atomic::Ordering::Relaxed);
+
+        let cases = [
+            ("blocked.example.com.", Rtype::AAAA, "blocked AAAA"),
+            ("any.example.com.", Rtype::ANY, "ANY"),
+            ("printer.lan.", Rtype::A, "hosts"),
+            ("1.168.192.in-addr.arpa.", Rtype::PTR, "bogus-priv PTR"),
+            ("cached.example.com.", Rtype::A, "cache hit"),
+            ("fresh.example.com.", Rtype::A, "would forward"),
+        ];
+        for (name, qtype, what) in cases {
+            for udp in [true, false] {
+                for opt_second in [false, true] {
+                    let q = query_with_edns_version(name, qtype, 1, opt_second);
+                    let out = h
+                        .process(q, "127.0.0.1".parse().unwrap(), udp)
+                        .await
+                        .expect("an answer");
+                    let what = format!("{what} udp={udp} opt_second={opt_second}");
+                    assert_badvers(&out, name, qtype, &what);
+                }
+            }
+        }
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "a BADVERS query must not reach an upstream"
+        );
+
+        // Version 0 is unaffected.
+        let q = query_with_edns_version("fresh.example.com.", Rtype::A, 0, false);
+        let out = h
+            .process(q, "127.0.0.1".parse().unwrap(), true)
+            .await
+            .unwrap();
+        let m = parse_resp(&out);
+        assert_eq!(m.opt_rcode(), domain::base::iana::OptRcode::NOERROR);
+        assert_eq!(answer_count(&out), 1);
+    }
+
     /// The paths answered inline in the UDP receive loop must not touch the
     /// heap: with one reply buffer kept by the loop, every allocation there is
     /// one more trip through the process-wide allocator for every datagram,
@@ -3140,6 +3510,7 @@ mod tests {
             h.cache.store(
                 CacheKey::new(lower, Rtype::A.to_int(), Class::IN.to_int()),
                 Arc::new(CachedMsg {
+                    stored: std::time::Instant::now(),
                     rcode: Rcode::NOERROR,
                     answers: (0..answers)
                         .map(|i| a_rec(name, [10, 0, 0, i as u8], 300))
@@ -3285,5 +3656,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A burst of clients asking one cold name costs the main DNS a single
+    /// exchange, and each client still gets a reply to its own query: its own
+    /// ID and its own spelling of the question.
+    #[tokio::test]
+    async fn a_burst_for_one_cold_name_reaches_the_main_dns_once() {
+        let (main, main_asked) = spawn_delayed_mock(Duration::from_millis(150), [1, 1, 1, 1]).await;
+        let (fall, fall_asked) = spawn_delayed_mock(Duration::ZERO, [2, 2, 2, 2]).await;
+        let h = Arc::new(mk_timed(vec![main], vec![fall], 1000, 2000, 1000));
+        let spellings = [
+            "burst.example.com.",
+            "BURST.example.com.",
+            "Burst.Example.Com.",
+        ];
+        let mut tasks = Vec::new();
+        for i in 0..24u16 {
+            let mut req = client_query(spellings[usize::from(i) % 3], Rtype::A);
+            req[0..2].copy_from_slice(&(0x4000 + i).to_be_bytes());
+            let h = h.clone();
+            tasks.push(tokio::spawn(async move {
+                let out = h
+                    .process(req.clone(), "127.0.0.1".parse().unwrap(), true)
+                    .await
+                    .expect("a response");
+                (req, out)
+            }));
+        }
+        for t in tasks {
+            let (req, out) = t.await.unwrap();
+            assert_eq!(out[0..2], req[0..2], "the client's own ID");
+            assert_eq!(
+                out[12..req.len()],
+                req[12..],
+                "the client's own question, as it spelled it"
+            );
+            assert_eq!(first_addr(&out), Some([1, 1, 1, 1]));
+        }
+        assert_eq!(main_asked.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(fall_asked.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// Sharing never crosses between the main DNS and the fallback: a forced
+    /// client asking for a name the main DNS is still resolving for someone
+    /// else gets the fallback's answer, at the fallback's speed.
+    #[tokio::test]
+    async fn a_forced_client_never_joins_a_main_exchange() {
+        let (main, main_asked) = spawn_delayed_mock(Duration::from_millis(300), [1, 1, 1, 1]).await;
+        let (fall, fall_asked) = spawn_delayed_mock(Duration::ZERO, [2, 2, 2, 2]).await;
+        let mut h = mk_timed(vec![main], vec![fall], 1000, 2000, 1000);
+        h.force_fall = ForceFallMatcher::new(&[parse_prefix("127.0.0.2/32").unwrap()], &[]);
+        let h = Arc::new(h);
+        let normal = {
+            let h = h.clone();
+            tokio::spawn(async move { ask(&h, "split.example.com.", Rtype::A, "127.0.0.1").await })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let started = std::time::Instant::now();
+        let forced = ask(&h, "split.example.com.", Rtype::A, "127.0.0.2").await;
+        assert_eq!(first_addr(&forced), Some([2, 2, 2, 2]));
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "the forced client waited on the main DNS ({:?})",
+            started.elapsed()
+        );
+        assert_eq!(first_addr(&normal.await.unwrap()), Some([1, 1, 1, 1]));
+        assert_eq!(main_asked.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(fall_asked.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }
